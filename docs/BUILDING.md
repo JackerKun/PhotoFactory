@@ -66,7 +66,7 @@ RUN_TESTS=1 ./build.sh macos
 
 ```text
 src-tauri/target/release/bundle/macos/PhotoFactory.app
-src-tauri/target/release/bundle/dmg/PhotoFactory_0.1.1_aarch64.dmg
+src-tauri/target/release/bundle/dmg/PhotoFactory_0.1.2_aarch64.dmg
 ```
 
 脚本会给本地构建做 ad-hoc 资源签名，保证 `.app` 内置 AI Worker 后的资源封装完整；它不等同于 Apple Developer ID。复制到其他 Mac 仍可能触发 Gatekeeper，正式发布应配置 Developer ID 签名和公证。
@@ -134,20 +134,20 @@ Windows ARM64 主程序为原生 ARM64。AI 依赖中的 OpenCV 没有 Windows A
 
 提交项目源码、`.github/workflows/`、打包脚本、`package-lock.json` 和 `src-tauri/Cargo.lock`。依赖、模型、虚拟环境与构建产物由 `.gitignore` 排除，在 runner 中重建。请在仓库 Settings → Actions 中启用 GitHub Actions；仅最终发布 job 申请 `contents: write`，不需要另设个人 Token。
 
-当前所有版本文件均为 `0.1.1`，首次发布示例：
+当前所有版本文件均为 `0.1.2`，首次发布示例：
 
 ```bash
 git add .
 git commit -m "Configure desktop builds and releases"
 git push origin HEAD
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 推标签前先提交并推送文件，标签必须指向包含工作流和源码的提交。后续新版本需同时更新：`package.json`、`package-lock.json`（含根包版本）、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 的主包版本；依赖版本不随意修改。可先执行：
 
 ```bash
-python3 scripts/release.py version --tag v0.1.1
+python3 scripts/release.py version --tag v0.1.2
 python3 -m unittest discover -s scripts -p test_release.py
 ```
 
@@ -162,12 +162,12 @@ CI 只使用匹配平台的 Python 二进制依赖，缺少 wheel 时直接失�
 ### 发布检查与下载
 
 1. 校验标签和六处版本记录，运行前端测试与构建。
-2. 四路先安装 GPS 写回集成测试需要的 ExifTool，再运行 Rust 测试，构建独立 Worker、模型和安装包。Windows 使用官方 x64 ZIP 和固定 SHA-256（ARM64 runner 通过兼容层运行）。此工具仅用于 CI，安装包仍不内置 ExifTool。
+2. 四路先安装 GPS 写回集成测试需要的 ExifTool，再运行 Rust 测试，构建独立 Worker、模型和安装包。Windows 使用官方 GitHub 的固定源码提交及 runner 自带 Perl，通过测试专用的原生启动器调用，不经过 shell 拼接。此工具仅用于 CI，安装包仍不内置 ExifTool。
 3. 在无开发导入路径的临时目录启动 Worker，检查 `/health`（不等于模型推理或安装后完整验收）。
 4. 汇总五个安装包，核对四架构齐全、版本和提交一致、安装包非空、文件 SHA-256 未变化。
 5. 创建草稿 Release，上传全部安装包、`SHA256SUMS.txt` 和 `build-manifest.json`，上传成功后公开发布。失败时最多留下草稿，可修复后重新运行失败任务；不会发布缺架构的成功结果。
 
-文件名示例：`PhotoFactory_0.1.1_macOS_arm64.dmg`、`PhotoFactory_0.1.1_macOS_x64.dmg`、`PhotoFactory_0.1.1_Windows_x64.msi` / `.exe`、`PhotoFactory_0.1.1_Windows_arm64.exe`。公开安装包从仓库 **Releases** 下载；手动分支构建和各架构调试产物位于 Actions → 对应运行 → Artifacts（保留 14 天）。
+文件名示例：`PhotoFactory_0.1.2_macOS_arm64.dmg`、`PhotoFactory_0.1.2_macOS_x64.dmg`、`PhotoFactory_0.1.2_Windows_x64.msi` / `.exe`、`PhotoFactory_0.1.2_Windows_arm64.exe`。公开安装包从仓库 **Releases** 下载；手动分支构建和各架构调试产物位于 Actions → 对应运行 → Artifacts（保留 14 天）。
 
 公开发布后的同一标签不覆盖；发布修复请使用新版本和新标签。工作流使用并发组阻止同标签重复发布互相干扰。
 
