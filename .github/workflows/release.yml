@@ -1,0 +1,160 @@
+name: Build desktop installers
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Validate manifest versions and release tag
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: python scripts/release.py version --tag "$RELEASE_TAG"
+      - run: python -m unittest discover -s scripts -p 'test_release.py'
+      - run: npm ci
+      - run: npm test -- --run
+      - run: npm run build
+
+  build:
+    needs: validate
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macOS
+            arch: arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            worker: arm64
+          - platform: macOS
+            arch: x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            worker: x64
+          - platform: Windows
+            arch: x64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            worker: x64
+          - platform: Windows
+            arch: arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            # OpenCV has no Windows ARM64 wheel: bundle a complete x64 Worker.
+            # Windows 11 ARM runs that child process under x64 emulation.
+            worker: x64
+    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.platform }} ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: ${{ matrix.worker }}
+          cache: pip
+          cache-dependency-path: ai_worker/requirements.txt
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}
+      - uses: actions/cache@v4
+        with:
+          path: ai_worker/models
+          key: ai-models-${{ runner.os }}-${{ hashFiles('ai_worker/download_models.py') }}
+      - run: npm ci
+      - name: Native Rust tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --target ${{ matrix.target }}
+      - name: Remove cached installers before packaging
+        # Rust caches must never supply a stale app bundle to a new release.
+        run: python -c "import shutil; shutil.rmtree('src-tauri/target/${{ matrix.target }}/release/bundle', ignore_errors=True); shutil.rmtree('artifacts', ignore_errors=True)"
+      - name: Build macOS installer and bundled Worker
+        if: runner.os == 'macOS'
+        env:
+          TAURI_TARGET: ${{ matrix.target }}
+          PHOTOFACTORY_BINARY_DEPS: '1'
+        run: bash build.sh macos
+      - name: Build Windows installers and bundled Worker
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./build-windows.ps1 -SkipTests -Target '${{ matrix.target }}'
+      - name: Verify standalone Worker starts without Python
+        shell: bash
+        run: python scripts/check-worker.py
+      - name: Collect installers, checksums and architecture manifest
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: python scripts/release.py collect --version "${{ needs.validate.outputs.version }}" --platform ${{ matrix.platform }} --arch ${{ matrix.arch }} --worker ${{ matrix.worker }} --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhotoFactory-${{ matrix.platform }}-${{ matrix.arch }}
+          path: artifacts/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    # A manual branch build only uploads Actions artifacts. Tag runs publish.
+    if: github.ref_type == 'tag'
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: PhotoFactory-*
+          path: artifacts
+          merge-multiple: true
+      - name: Verify all four builds and assemble release
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: python scripts/release.py assemble --version "$RELEASE_VERSION"
+      - name: Upload complete release, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Never overwrite an already published release on a rerun.
+          if gh release view "$RELEASE_TAG" --json isDraft > release-state.json 2>/dev/null; then
+            python -c 'import json; assert json.load(open("release-state.json"))["isDraft"], "Release already published; use a new version tag"'
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "PhotoFactory $RELEASE_TAG" --notes-file release/NOTES.md
+          fi
+          gh release upload "$RELEASE_TAG" release/PhotoFactory_* release/SHA256SUMS.txt release/build-manifest.json --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --notes-file release/NOTES.md

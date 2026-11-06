@@ -1,0 +1,11 @@
+pub mod ai_task_dao;
+pub mod classification_dao;
+pub mod connection;
+pub mod constraint_dao;
+pub mod custom_attr_dao;
+pub mod diagnostics;
+pub mod face_dao;
+pub mod manual_tag_dao;
+pub mod photo_dao;
+pub mod schema;
+pub mod smart_album_dao;

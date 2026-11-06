@@ -1,0 +1,13 @@
+pub mod ai;
+pub mod diagnostics;
+pub mod faces;
+pub mod geo_tags;
+pub mod library;
+pub mod map;
+pub mod photos;
+pub mod project;
+pub mod shell;
+pub mod smart_albums;
+pub mod tag_rules;
+pub mod tags;
+pub mod time_tags;

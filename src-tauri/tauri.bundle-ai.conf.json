@@ -1,0 +1,16 @@
+{
+  "bundle": {
+    "macOS": {
+      "signingIdentity": "-"
+    },
+    "resources": {
+      "../ai_worker/dist/photofactory-ai/": "ai_worker/",
+      "../ai_worker/models/retinaface.onnx": "ai_worker/models/retinaface.onnx",
+      "../ai_worker/models/arcface.onnx": "ai_worker/models/arcface.onnx",
+      "../ai_worker/models/resnet50_places365.onnx": "ai_worker/models/resnet50_places365.onnx",
+      "../ai_worker/models/clip_vision_int8.onnx": "ai_worker/models/clip_vision_int8.onnx",
+      "../ai_worker/models/clip_text_int8.onnx": "ai_worker/models/clip_text_int8.onnx",
+      "../ai_worker/models/clip_tokenizer.json": "ai_worker/models/clip_tokenizer.json"
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "mode": "real-react-components-with-mocked-tauri-commands",
+  "synthetic": true,
+  "photos": 36,
+  "aiResults": "pre-seeded demonstration, not model inference",
+  "nativeBackendValidated": false,
+  "errors": []
+}

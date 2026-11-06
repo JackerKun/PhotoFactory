@@ -1,0 +1,93 @@
+# JavaScript dependencies and generated frontend output (including nested tools)
+node_modules/
+/dist/
+coverage/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Rust / Tauri build output; retain Cargo.lock, icons and bundle configuration
+/src-tauri/target/
+/src-tauri/gen/
+
+# Python environments, bytecode and test/tool caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Downloaded AI weights and generated PyInstaller output
+# build.sh / build-windows.ps1 recreate these on the build runner
+/ai_worker/models/
+/ai_worker/build/
+/ai_worker/dist/
+/ai_worker/*.spec
+/ai_worker/.pyinstaller*/
+
+# Local photo projects, databases and analysis output (never upload a user library)
+.pf/
+/backups/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite*-wal
+*.sqlite*-shm
+*.npy
+*.npz
+
+# Local release/export and temporary output
+/build/
+/release/
+/releases/
+/artifacts/
+/output/
+/tmp/
+/temp/
+*.log
+
+# Optional documentation browser captures; keep final docs/screenshots and fixtures
+/tools/screenshots/.capture/
+playwright-report/
+test-results/
+
+# Local environment and signing credentials; keep sample environment files
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.p12
+*.pfx
+*.key
+*.pem
+
+# Operating-system and editor state
+.DS_Store
+.AppleDouble
+._*
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local assistant analysis and isolated checkouts
+.bemad/
+.claude/
+.worktrees/
+
+# Keep package-lock.json, Cargo.lock, requirements.txt, .github/workflows/,
+# build scripts, app icons and Tauri configuration available for GitHub builds.
