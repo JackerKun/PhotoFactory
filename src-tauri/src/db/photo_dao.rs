@@ -143,8 +143,20 @@ fn append_photo_filters(
     include_time: bool,
 ) {
     if let Some(ref dir) = filter.directory {
-        sql.push_str(" AND path LIKE ?");
-        args.push(Box::new(format!("{}/%", dir)));
+        // Stored paths use the scanner's native separator. The UI or an
+        // imported directory can use either form; match both, with a directory
+        // boundary and literal SQL wildcard characters in folder names.
+        sql.push_str(" AND (path LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\')");
+        let normalized = dir.replace('\\', "/");
+        let normalized = normalized.trim_end_matches('/');
+        for separator in ["/", "\\"] {
+            let prefix = format!("{}{}", normalized.replace('/', separator), separator);
+            let escaped = prefix
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            args.push(Box::new(format!("{}%", escaped)));
+        }
     }
     if filter.has_gps == Some(true) {
         sql.push_str(" AND latitude IS NOT NULL");
@@ -832,6 +844,48 @@ mod tests {
                 count: 2
             }]
         );
+    }
+
+    #[test]
+    fn directory_filters_handle_windows_paths_and_literal_wildcards() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(CREATE_TABLES).unwrap();
+        let timestamp = Utc
+            .with_ymd_and_hms(2026, 8, 2, 10, 0, 0)
+            .unwrap()
+            .timestamp();
+        for (index, path) in [
+            r"C:\photos\trip_100%\one.jpg",
+            "C:/photos/trip_100%/nested/two.jpg",
+            r"C:\photos\tripX100other\wrong.jpg",
+            r"C:\photos\trip_100%extra\wrong.jpg",
+        ]
+        .iter()
+        .enumerate()
+        {
+            insert_test_photo(&conn, index as i64 + 1, Path::new(path), timestamp, false);
+        }
+        for directory in [
+            r"C:\photos\trip_100%",
+            "C:/photos/trip_100%/",
+            r"C:\photos\trip_100%\",
+        ] {
+            let filter = PhotoFilter {
+                directory: Some(directory.to_string()),
+                ..PhotoFilter::default()
+            };
+            let timeline = get_photo_timeline(&conn, &filter).unwrap();
+            assert_eq!(
+                timeline,
+                vec![PhotoTimelineBucket {
+                    year: 2026,
+                    month: 8,
+                    count: 2
+                }]
+            );
+            let page = get_photos_page(&conn, None, 20, &filter).unwrap();
+            assert_eq!(page.total_count, 2);
+        }
     }
 
     #[test]

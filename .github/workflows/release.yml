@@ -18,12 +18,12 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: npm
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
       - name: Validate manifest versions and release tag
@@ -68,12 +68,12 @@ jobs:
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.platform }} ${{ matrix.arch }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: npm
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           architecture: ${{ matrix.worker }}
@@ -91,6 +91,17 @@ jobs:
           path: ai_worker/models
           key: ai-models-${{ runner.os }}-${{ hashFiles('ai_worker/download_models.py') }}
       - run: npm ci
+      - name: Install EXIF integration test dependency (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+        run: |
+          command -v exiftool >/dev/null || brew install exiftool
+          exiftool -ver
+      - name: Install EXIF integration test dependency (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/install-exiftool.ps1
       - name: Native Rust tests
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --target ${{ matrix.target }}
       - name: Remove cached installers before packaging
@@ -129,8 +140,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
       - uses: actions/download-artifact@v4
