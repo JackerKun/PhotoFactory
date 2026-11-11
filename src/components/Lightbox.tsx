@@ -22,6 +22,7 @@ interface Props { photoId: number; onClose: () => void }
 
 export default React.memo(function Lightbox({ photoId, onClose }: Props) {
   const { photos: storePhotos, setLightboxPhotoId, selectedPhotoId, setSelectedPhotoId, updatePhotoInList } = useStore();
+  const faceDataRevision = useStore((state) => state.faceDataRevision);
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [currentPhoto, setCurrentPhotoState] = useState<Photo | null>(null);
   const currentIndex = useMemo(() => photos.findIndex((p) => p.id === photoId), [photos, photoId]);
@@ -118,9 +119,12 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
   }, [showFaceBoxes]);
 
   useEffect(() => {
-    let cancelled = false;
     setFaces([]);
     setEditingFaceId(null);
+  }, [photoId]);
+
+  useEffect(() => {
+    let cancelled = false;
     Promise.all([api.getPhotoFaces(photoId), api.getClusters()])
       .then(([photoFaces, clusters]) => {
         if (cancelled) return;
@@ -131,7 +135,7 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
         if (!cancelled) console.error("Failed to load lightbox faces:", error);
       });
     return () => { cancelled = true; };
-  }, [photoId]);
+  }, [photoId, faceDataRevision]);
 
   useEffect(() => {
     let live = true;

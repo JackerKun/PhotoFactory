@@ -19,6 +19,8 @@ interface AppState {
   photoGridScrollOffsets: Record<"square" | "proportional", number>;
   lightboxPhotoId: number | null;
   selectedPhotoId: number | null;
+  faceDataRevision: number;
+  markFaceDataChanged: () => void;
   ratingSelectionMode: boolean;
   ratingSelection: number[];
   setRatingSelectionMode: (enabled: boolean) => void;
@@ -79,6 +81,8 @@ export const useStore = create<AppState>((set, get) => ({
   photoGridScrollOffsets: { square: 0, proportional: 0 },
   lightboxPhotoId: null,
   selectedPhotoId: null,
+  faceDataRevision: 0,
+  markFaceDataChanged: () => set((state) => ({ faceDataRevision: state.faceDataRevision + 1 })),
   ratingSelectionMode: false,
   ratingSelection: [],
   setRatingSelectionMode: (enabled) => set({ ratingSelectionMode: enabled, ratingSelection: [] }),

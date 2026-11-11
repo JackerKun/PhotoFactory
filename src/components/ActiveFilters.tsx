@@ -7,6 +7,7 @@ export default function ActiveFilters() {
   const filter = useStore((state) => state.filter);
   const setFilter = useStore((state) => state.setFilter);
   const clear = useStore((state) => state.clearPhotoFilters);
+  const faceDataRevision = useStore((state) => state.faceDataRevision);
   const [person, setPerson] = useState<{ id: number; name: string } | null>(null);
   useEffect(() => {
     if (filter.person_id == null) return;
@@ -16,7 +17,7 @@ export default function ActiveFilters() {
       if (live) setPerson({ id, name: clusters.find((item) => item.id === id)?.name || "未命名人物" });
     }).catch(() => { if (live) setPerson({ id, name: "指定人物" }); });
     return () => { live = false; };
-  }, [filter.person_id]);
+  }, [filter.person_id, faceDataRevision]);
   const chips: { label: string; keys: (keyof PhotoFilter)[] }[] = [];
   const add = (label: string, ...keys: (keyof PhotoFilter)[]) => chips.push({ label, keys });
   if (filter.directory) add(`文件夹：${filter.directory.split(/[\\/]/).filter(Boolean).pop()}`, "directory");

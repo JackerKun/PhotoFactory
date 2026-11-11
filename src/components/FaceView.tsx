@@ -3,6 +3,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { listen } from "@tauri-apps/api/event";
 import type { FaceCluster } from "../types";
 import * as api from "../api/tauri";
+import { useStore } from "../hooks/usePhotos";
 import GroupPhotosView from "./GroupPhotosView";
 
 interface Props {}
@@ -112,6 +113,8 @@ export default React.memo(function FaceView(_props: Props) {
   const [clusters, setClusters] = useState<FaceCluster[]>([]);
   const [activeTab, setActiveTab] = useState<TabKey>(initialTab);
   const activeTabRef = useRef<TabKey>(initialTab);
+  const pageRequest = useRef(0);
+  const faceDataRevision = useStore((state) => state.faceDataRevision);
   const [pageTotal, setPageTotal] = useState(0);
   const [pageLoading, setPageLoading] = useState(false);
   const [tabCounts, setTabCounts] = useState({ named: 0, unnamed: 0, review: 0 });
@@ -161,6 +164,8 @@ export default React.memo(function FaceView(_props: Props) {
 
   const refreshData = useCallback(async () => {
     const requestedTab = activeTab;
+    const requestId = ++pageRequest.current;
+    const isCurrent = () => pageRequest.current === requestId && activeTabRef.current === requestedTab;
     setPageLoading(true);
     try {
       const [page, nextFaceCount, nextUnassignedCount] = await Promise.all([
@@ -168,7 +173,7 @@ export default React.memo(function FaceView(_props: Props) {
         api.getFaceDetectionCount().catch(() => 0),
         api.getUnassignedFaceCount().catch(() => 0),
       ]);
-      if (activeTabRef.current === requestedTab) {
+      if (isCurrent()) {
         setClusters(page.items);
         setPageTotal(page.total);
         setTabCounts({ named: page.named_count, unnamed: page.unnamed_count, review: page.review_count });
@@ -176,11 +181,11 @@ export default React.memo(function FaceView(_props: Props) {
         setUnassignedCount(nextUnassignedCount);
       }
     } catch (error) {
-      if (activeTabRef.current === requestedTab) {
+      if (isCurrent()) {
         setOperationMessage(`读取人物列表失败：${String(error)}`);
       }
     } finally {
-      if (activeTabRef.current === requestedTab) setPageLoading(false);
+      if (isCurrent()) setPageLoading(false);
     }
     api.hasAutomaticFaceMergeToUndo().then(setHasMergeUndo).catch(() => setHasMergeUndo(false));
     api.getSuspectedFaceCount().then(setSuspectedFaceCount).catch(() => setSuspectedFaceCount(0));
@@ -191,10 +196,12 @@ export default React.memo(function FaceView(_props: Props) {
   const loadMoreClusters = useCallback(async () => {
     if (pageLoading || clusters.length >= pageTotal) return;
     const requestedTab = activeTab;
+    const requestId = ++pageRequest.current;
+    const isCurrent = () => pageRequest.current === requestId && activeTabRef.current === requestedTab;
     setPageLoading(true);
     try {
       const page = await api.getClusterPage(requestedTab, clusters.length, FACE_PAGE_SIZE);
-      if (activeTabRef.current !== requestedTab) return;
+      if (!isCurrent()) return;
       setClusters((current) => {
         const known = new Set(current.map((cluster) => cluster.id));
         return [...current, ...page.items.filter((cluster) => !known.has(cluster.id))];
@@ -202,12 +209,15 @@ export default React.memo(function FaceView(_props: Props) {
       setPageTotal(page.total);
       setTabCounts({ named: page.named_count, unnamed: page.unnamed_count, review: page.review_count });
     } finally {
-      if (activeTabRef.current === requestedTab) setPageLoading(false);
+      if (isCurrent()) setPageLoading(false);
     }
   }, [activeTab, clusters.length, pageLoading, pageTotal]);
 
   useEffect(() => {
-    refreshData();
+    void refreshData();
+  }, [refreshData, faceDataRevision]);
+
+  useEffect(() => {
     api.workerHealth().then(setWorkerHealthy).catch(() => setWorkerHealthy(false));
     // Poll worker health every 3s — worker may start after component mounts
     const interval = setInterval(() => {

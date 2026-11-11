@@ -27,6 +27,7 @@ export default function GroupPhotosView({ onBack }: { onBack: () => void }) {
   const request = useRef(0);
   const list = useRef<HTMLDivElement>(null);
   const selectedPhotoId = useStore((s) => s.selectedPhotoId);
+  const faceDataRevision = useStore((s) => s.faceDataRevision);
   const setSelectedPhotoId = useStore((s) => s.setSelectedPhotoId);
   const setLightboxPhotoId = useStore((s) => s.setLightboxPhotoId);
 
@@ -39,7 +40,7 @@ export default function GroupPhotosView({ onBack }: { onBack: () => void }) {
       setPeopleError("");
     }).catch(() => { if (live) setPeopleError("无法载入已命名人物，请刷新重试。"); });
     return () => { live = false; };
-  }, [revision]);
+  }, [revision, faceDataRevision]);
 
   useEffect(() => {
     const unlisten = listen<{ stage?: string }>("ai_status_changed", ({ payload }) => {
@@ -59,7 +60,7 @@ export default function GroupPhotosView({ onBack }: { onBack: () => void }) {
       if (id === request.current) setError(String(reason));
     }).finally(() => { if (id === request.current) setLoading(false); });
     return () => { ++request.current; };
-  }, [size, personIds, exact, revision]);
+  }, [size, personIds, exact, revision, faceDataRevision]);
 
   const loadMore = async () => {
     const cursor = items[items.length - 1]?.photo.id;

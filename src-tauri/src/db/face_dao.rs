@@ -414,14 +414,21 @@ pub fn reset_automatic_clusters(conn: &rusqlite::Connection) -> AppResult<usize>
 }
 
 pub fn rename_cluster(conn: &rusqlite::Connection, cluster_id: i64, name: &str) -> AppResult<()> {
-    conn.execute(
-        "UPDATE face_detections SET review_status = 'active' WHERE person_id = ?1 AND review_status = 'identity_review'",
-        [cluster_id],
-    )?;
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    let updated = tx.execute(
         "UPDATE face_clusters SET name = ? WHERE id = ?",
         params![name, cluster_id],
     )?;
+    if updated == 0 {
+        return Err(crate::error::AppError::NotFound(format!(
+            "Person {cluster_id} not found"
+        )));
+    }
+    tx.execute(
+        "UPDATE face_detections SET review_status = 'active' WHERE person_id = ?1 AND review_status = 'identity_review'",
+        [cluster_id],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -1284,6 +1291,33 @@ mod merge_tests {
     use super::*;
 
     #[test]
+    fn renaming_a_person_keeps_faces_from_all_photos_in_the_same_group() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::db::schema::CREATE_TABLES)
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO photos (id,path,filename,file_size,file_mtime,imported_at)
+             VALUES (1,'/1.jpg','1.jpg',0,0,0), (2,'/2.jpg','2.jpg',0,0,0);
+             INSERT INTO face_clusters (id,face_count,created_at) VALUES (41,2,0), (42,1,0);
+             INSERT INTO face_detections (id,photo_id,person_id,created_at,bbox_x,bbox_y,bbox_w,bbox_h)
+             VALUES (101,1,41,0,0,0,30,30), (102,2,41,0,0,0,30,30), (103,2,42,0,40,40,30,30);",
+        ).unwrap();
+
+        rename_cluster(&conn, 41, "张三").unwrap();
+
+        let named = get_cluster_page(&conn, "named", 0, 10).unwrap();
+        assert_eq!(named.items.len(), 1);
+        let person = &named.items[0];
+        assert_eq!(person.id, Some(41));
+        assert_eq!(person.name.as_deref(), Some("张三"));
+        assert_eq!(person.photo_count, 2);
+        assert_eq!(get_faces_for_photo(&conn, 1).unwrap()[0].person_id, Some(41));
+        let faces = get_faces_for_photo(&conn, 2).unwrap();
+        assert!(faces.iter().any(|face| face.id == Some(102) && face.person_id == Some(41)));
+        assert!(faces.iter().any(|face| face.id == Some(103) && face.person_id == Some(42)));
+    }
+
+    #[test]
     fn manual_face_move_remembers_both_identities() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(crate::db::schema::CREATE_TABLES)
@@ -1477,23 +1511,27 @@ mod merge_tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(crate::db::schema::CREATE_TABLES)
             .unwrap();
-        for id in 1..=2 {
+        for id in 1..=9 {
             conn.execute(
                 "INSERT INTO photos (id, path, filename, file_size, file_mtime, imported_at) VALUES (?1, ?2, ?3, 1, 1, 1)",
                 params![id, format!("/{id}.jpg"), format!("{id}.jpg")],
             ).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO face_clusters (id, name, face_count, created_at)
+             VALUES (1, '已有姓名', 1, 1), (41, NULL, 8, 1);",
+        )
+        .unwrap();
+        for id in 1..=9 {
             conn.execute(
-                "INSERT INTO face_clusters (id, name, face_count, created_at) VALUES (?1, ?2, 1, 1)",
-                params![id, if id == 1 { Some("已有姓名") } else { None }],
-            ).unwrap();
-            conn.execute(
-                "INSERT INTO face_detections (photo_id, person_id, created_at) VALUES (?1, ?1, 1)",
-                params![id],
+                "INSERT INTO face_detections (photo_id, person_id, created_at, bbox_x, bbox_y, bbox_w, bbox_h)
+                 VALUES (?1, ?2, 1, 0, 0, 30, 30)",
+                params![id, if id == 1 { 1 } else { 41 }],
             )
             .unwrap();
         }
 
-        merge_clusters_batch(&conn, 1, &[2], None).unwrap();
+        merge_clusters_batch(&conn, 1, &[41], None).unwrap();
 
         let (name, count): (String, i64) = conn
             .query_row(
@@ -1504,14 +1542,19 @@ mod merge_tests {
             .unwrap();
         let source_exists: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM face_clusters WHERE id = 2",
+                "SELECT COUNT(*) FROM face_clusters WHERE id = 41",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(name, "已有姓名");
-        assert_eq!(count, 2);
+        assert_eq!(count, 9);
         assert_eq!(source_exists, 0);
+        for id in 1..=9 {
+            let faces = get_faces_for_photo(&conn, id).unwrap();
+            assert_eq!(faces.len(), 1);
+            assert_eq!(faces[0].person_id, Some(1));
+        }
     }
 
     #[test]

@@ -197,6 +197,7 @@ function TagHeader({ label, onBack, onClear }: { label: string; onBack: () => vo
 
 /** Header shown when viewing a specific person's photos, with back button and photo count. */
 function PersonHeader({ personId, onBack, onClear }: { personId: number; onBack: () => void; onClear: () => void }) {
+  const faceDataRevision = useStore((state) => state.faceDataRevision);
   const [personName, setPersonName] = useState<string | null>(null);
   const [photoCount, setPhotoCount] = useState<number>(0);
 
@@ -206,8 +207,8 @@ function PersonHeader({ personId, onBack, onClear }: { personId: number; onBack:
       .then((clusters) => {
         if (cancelled) return;
         const cluster = clusters.find((c) => c.id === personId);
-        if (cluster?.name) {
-          setPersonName(cluster.name);
+        if (cluster) {
+          setPersonName(cluster.name?.trim() || `人物 ${personId}`);
           setPhotoCount(cluster.photo_count);
           return;
         }
@@ -226,7 +227,7 @@ function PersonHeader({ personId, onBack, onClear }: { personId: number; onBack:
         if (!cancelled) setPersonName(`Person #${personId}`);
       });
     return () => { cancelled = true; };
-  }, [personId]);
+  }, [personId, faceDataRevision]);
 
   return (
     <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-secondary bg-bg-secondary">

@@ -815,7 +815,7 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
   const [faceClusters, setFaceClusters] = useState<FaceCluster[]>([]);
   const [editingFaceId, setEditingFaceId] = useState<number | null>(null);
   const [faceTargetId, setFaceTargetId] = useState<number | null>(null);
-  const [newFacePersonName, setNewFacePersonName] = useState("");
+  const [facePersonName, setFacePersonName] = useState("");
   const [faceSaving, setFaceSaving] = useState(false);
   const [faceError, setFaceError] = useState<string | null>(null);
   const [attributes, setAttributes] = useState<CustomAttribute[]>([]);
@@ -837,6 +837,8 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
   const { setLightboxPhotoId } = useStore();
   const requestMapFocus = useStore((state) => state.requestMapFocus);
+  const faceDataRevision = useStore((state) => state.faceDataRevision);
+  const markFaceDataChanged = useStore((state) => state.markFaceDataChanged);
   const updatePhotoInList = useStore((s) => s.updatePhotoInList);
   const listPhoto = useStore((state) => state.photos.find((item) => item.id === photoId));
   const navigate = useNavigate();
@@ -854,6 +856,7 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
   useEffect(() => {
     let cancelled = false;
     setPhoto(null);
+    setFaces([]);
     setPreviewUrl(null);
     setPreviewError(false);
     previewDecodeRetriesRef.current = 0;
@@ -862,20 +865,16 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
     setFaceError(null);
     setEditingFaceId(null);
     setFaceTargetId(null);
-    setNewFacePersonName("");
+    setFacePersonName("");
     setMenuPos(null);
     Promise.all([
       api.getPhoto(photoId),
-      api.getPhotoFaces(photoId),
-      api.getClusters(),
       api.getPhotoAttributes(photoId),
       api.getManualTags().catch(() => []),
       api.getPhotoManualTags(photoId).catch(() => []),
-    ]).then(([nextPhoto, nextFaces, nextFaceClusters, nextAttributes, nextAllManualTags, nextManualTags]) => {
+    ]).then(([nextPhoto, nextAttributes, nextAllManualTags, nextManualTags]) => {
       if (cancelled) return;
       setPhoto(nextPhoto);
-      setFaces(nextFaces);
-      setFaceClusters(nextFaceClusters);
       setAttributes(nextAttributes);
       setAllManualTags(nextAllManualTags);
       setManualTags(nextManualTags);
@@ -888,6 +887,20 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
       }
     };
   }, [photoId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([api.getPhotoFaces(photoId), api.getClusters()])
+      .then(([nextFaces, nextClusters]) => {
+        if (cancelled) return;
+        setFaces(nextFaces);
+        setFaceClusters(nextClusters);
+      })
+      .catch((error) => {
+        if (!cancelled) setFaceError(`读取人脸失败：${String(error)}`);
+      });
+    return () => { cancelled = true; };
+  }, [photoId, faceDataRevision]);
 
   // Keyboard shortcuts and card actions update the shared list first. Keep an
   // already-open detail drawer visually in sync with those optimistic changes.
@@ -960,22 +973,13 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
     setNewValue("");
   };
 
-  const refreshFaces = useCallback(async () => {
-    const [nextFaces, nextClusters] = await Promise.all([
-      api.getPhotoFaces(photoId),
-      api.getClusters(),
-    ]);
-    setFaces(nextFaces);
-    setFaceClusters(nextClusters);
-  }, [photoId]);
-
   const handleReassignFace = async (faceId: number) => {
     if (faceSaving || faceTargetId == null) return;
     setFaceSaving(true);
     setFaceError(null);
     try {
       await api.reassignPhotoFace(faceId, faceTargetId);
-      await refreshFaces();
+      markFaceDataChanged();
       setEditingFaceId(null);
       setFaceTargetId(null);
     } catch (error) {
@@ -985,19 +989,48 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
     }
   };
 
-  const handleCreatePersonForFace = async (faceId: number) => {
-    const name = newFacePersonName.trim();
-    if (faceSaving || !name) return;
+  const handleMergeFaceGroup = async (sourceId: number) => {
+    const targetId = faceTargetId;
+    if (faceSaving || targetId == null || targetId === sourceId) return;
+    const projectPath = useStore.getState().project?.root_path;
     setFaceSaving(true);
     setFaceError(null);
     try {
-      await api.createNamedPersonForFace(faceId, name);
-      await refreshFaces();
+      const mergedId = await api.mergeClustersBatch([sourceId], undefined, targetId);
+      const state = useStore.getState();
+      if (state.project?.root_path !== projectPath) return;
+      if (state.filter.person_id === sourceId) {
+        state.setFilter({ person_id: mergedId });
+      } else if (state.filter.person_id === mergedId) {
+        void state.loadPhotos();
+      }
+      markFaceDataChanged();
       setEditingFaceId(null);
       setFaceTargetId(null);
-      setNewFacePersonName("");
     } catch (error) {
-      setFaceError(`新建人物失败：${String(error)}`);
+      setFaceError(`合并人物组失败：${String(error)}`);
+    } finally {
+      setFaceSaving(false);
+    }
+  };
+
+  const handleSaveFaceName = async (face: FaceDetection, separatePerson = false) => {
+    const name = facePersonName.trim();
+    if (faceSaving || !name || face.id == null) return;
+    setFaceSaving(true);
+    setFaceError(null);
+    try {
+      if (face.person_id != null && !separatePerson) {
+        await api.renameCluster(face.person_id, name);
+      } else {
+        await api.createNamedPersonForFace(face.id, name);
+      }
+      markFaceDataChanged();
+      setEditingFaceId(null);
+      setFaceTargetId(null);
+      setFacePersonName("");
+    } catch (error) {
+      setFaceError(`保存姓名失败：${String(error)}`);
     } finally {
       setFaceSaving(false);
     }
@@ -1011,7 +1044,7 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
     setFaceError(null);
     try {
       await api.deletePhotoFace(face.id);
-      await refreshFaces();
+      markFaceDataChanged();
       setEditingFaceId(null);
       setFaceTargetId(null);
     } catch (error) {
@@ -1225,7 +1258,8 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
             <div className="space-y-2">
               {faces.map((face) => {
                 const person = faceClusters.find((cluster) => cluster.id === face.person_id);
-                const personName = person?.name?.trim() || (face.person_id == null ? "待整理人脸" : "未命名人物");
+                const personName = person?.name?.trim() || (face.person_id == null ? "待整理人脸" : `人物 ${face.person_id}`);
+                const grouped = face.person_id != null;
                 const editing = editingFaceId === face.id;
                 return (
                   <div
@@ -1242,7 +1276,12 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
                         <button
                           type="button"
                           disabled={faceSaving || face.id == null}
-                          onClick={() => { setEditingFaceId(editing ? null : face.id); setFaceTargetId(face.person_id); setNewFacePersonName(""); setFaceError(null); }}
+                          onClick={() => {
+                            setEditingFaceId(editing ? null : face.id);
+                            setFaceTargetId(null);
+                            setFacePersonName(person?.name ?? "");
+                            setFaceError(null);
+                          }}
                           className="text-accent-link hover:underline disabled:opacity-50"
                         >{editing ? "收起" : "修改"}</button>
                         <button type="button" disabled={faceSaving || face.id == null} onClick={() => void handleDeleteFace(face)} className="text-red-500 hover:underline disabled:opacity-50">取消识别</button>
@@ -1250,38 +1289,69 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
                     </div>
                     {editing && face.id != null && (
                       <div className="mt-2 space-y-2">
+                        {grouped && <p className="text-xs text-text-secondary">
+                          {person?.photo_count ? `组名将应用于该组的 ${person.photo_count} 张照片。` : "组名将应用于该组的所有照片。"}
+                        </p>}
+                        <div className="flex items-center gap-2">
+                          <input
+                            value={facePersonName}
+                            onChange={(event) => setFacePersonName(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" && !event.nativeEvent.isComposing) void handleSaveFaceName(face);
+                            }}
+                            aria-label={grouped ? "人物组姓名" : "新人物姓名"}
+                            placeholder={grouped ? "输入人物组姓名…" : "输入新人物姓名…"}
+                            className="min-w-0 flex-1 rounded-lg border border-text-primary/10 bg-bg-secondary px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-accent-primary/25"
+                          />
+                          <button type="button" disabled={faceSaving || !facePersonName.trim()}
+                            onClick={() => void handleSaveFaceName(face)}
+                            className="rounded-lg bg-accent-primary px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40">
+                            {grouped ? "保存组名" : "新建人物"}
+                          </button>
+                        </div>
                         <div className="flex items-center gap-2">
                           <select
+                            aria-label={grouped ? "选择整组合并到的人物" : "为这张脸选择已有姓名"}
                             value={faceTargetId ?? ""}
+                            disabled={faceSaving}
                             onChange={(event) => setFaceTargetId(event.target.value ? Number(event.target.value) : null)}
                             className="min-w-0 flex-1 rounded-lg border border-text-primary/10 bg-bg-secondary px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-accent-primary/25"
                           >
                             <option value="">选择已有姓名…</option>
-                            {faceClusters.filter((cluster) => cluster.name?.trim()).map((cluster) => (
+                            {faceClusters.filter((cluster) => cluster.name?.trim() && cluster.id != null && cluster.id !== face.person_id).map((cluster) => (
                               <option key={cluster.id} value={cluster.id!}>{cluster.name}</option>
                             ))}
                           </select>
-                          <button type="button" disabled={faceSaving || faceTargetId == null || faceTargetId === face.person_id} onClick={() => void handleReassignFace(face.id!)} className="rounded-lg bg-accent-primary px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40">使用</button>
+                          <button type="button" disabled={faceSaving || faceTargetId == null}
+                            onClick={() => {
+                              if (face.person_id == null) void handleReassignFace(face.id!);
+                              else void handleMergeFaceGroup(face.person_id);
+                            }}
+                            className="shrink-0 rounded-lg bg-accent-primary px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40">
+                            {grouped ? "整组合并" : "仅更正这张脸"}
+                          </button>
                         </div>
-                        <div className="flex items-center gap-2">
-                          <input
-                            value={newFacePersonName}
-                            onChange={(event) => setNewFacePersonName(event.target.value)}
-                            onKeyDown={(event) => { if (event.key === "Enter") void handleCreatePersonForFace(face.id!); }}
-                            placeholder="或输入新人物姓名…"
-                            className="min-w-0 flex-1 rounded-lg border border-text-primary/10 bg-bg-secondary px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-accent-primary/25"
-                          />
-                          <button type="button" disabled={faceSaving || !newFacePersonName.trim()} onClick={() => void handleCreatePersonForFace(face.id!)} className="rounded-lg border border-accent-primary px-3 py-1.5 text-xs font-medium text-accent-link disabled:opacity-40">新建</button>
-                        </div>
+                        {grouped && <div className="flex flex-wrap gap-x-3 gap-y-1">
+                          <button type="button" disabled={faceSaving || faceTargetId == null}
+                            onClick={() => void handleReassignFace(face.id!)}
+                            className="text-xs text-text-secondary hover:text-accent-link hover:underline disabled:opacity-40">
+                            仅更正这张脸
+                          </button>
+                          <button type="button" disabled={faceSaving || !facePersonName.trim()}
+                            onClick={() => void handleSaveFaceName(face, true)}
+                            className="text-xs text-text-secondary hover:text-accent-link hover:underline disabled:opacity-40">
+                            用输入的姓名仅为这张脸新建人物
+                          </button>
+                        </div>}
                       </div>
                     )}
                   </div>
                 );
               })}
             </div>
-            {faceError && <p className="mt-2 text-xs text-red-500">{faceError}</p>}
           </div>
         )}
+        {faceError && <p role="alert" className="text-xs text-red-500">{faceError}</p>}
 
         {/* Custom Attributes */}
         <details className="rounded-xl border border-surface-secondary p-3">
