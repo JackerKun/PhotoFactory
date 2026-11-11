@@ -4,11 +4,30 @@
 
 :root {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  color: #1d1d1f;
-  background: #f5f5f7;
+  color: rgb(var(--text-primary));
+  background: rgb(var(--bg-primary));
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
+}
+
+:root {
+  --bg-primary: 245 245 247; --bg-secondary: 255 255 255; --bg-tertiary: 232 232 237;
+  --surface-primary: 242 242 247; --surface-secondary: 212 214 222;
+  --text-primary: 29 29 31; --text-secondary: 90 93 103; --text-muted: 107 112 124;
+  --accent-primary: 0 106 230; --accent-link: 0 106 230;
+  --gray-50: 249 250 251; --gray-100: 243 244 246; --gray-200: 229 231 235;
+  --gray-300: 209 213 219; --gray-400: 156 163 175; --gray-500: 107 114 128;
+  --gray-600: 75 85 99; --gray-700: 55 65 81; --gray-800: 31 41 55; --gray-900: 17 24 39; --gray-950: 3 7 18;
+}
+:root[data-theme="dark"] {
+  --bg-primary: 20 23 29; --bg-secondary: 30 34 42; --bg-tertiary: 43 48 59;
+  --surface-primary: 38 43 53; --surface-secondary: 67 74 89;
+  --text-primary: 237 240 247; --text-secondary: 190 197 211; --text-muted: 159 169 187;
+  --accent-primary: 38 108 211; --accent-link: 108 178 255;
+  --gray-50: 34 39 48; --gray-100: 40 45 56; --gray-200: 54 61 74;
+  --gray-300: 77 86 102; --gray-400: 150 161 181; --gray-500: 164 175 193;
+  --gray-600: 183 193 210; --gray-700: 203 211 226; --gray-800: 222 229 240; --gray-900: 239 243 250; --gray-950: 248 250 255;
 }
 
 body {
@@ -27,28 +46,23 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .app-shell {
   background:
     radial-gradient(circle at 75% -20%, rgba(0, 122, 255, 0.09), transparent 34rem),
-    #f5f5f7;
+    rgb(var(--bg-primary));
 }
 
 .mac-sidebar {
-  background: rgba(247, 247, 249, 0.88);
-  border-color: rgba(60, 60, 67, 0.14);
-  box-shadow: inset -1px 0 rgba(255, 255, 255, 0.7);
+  background: rgb(var(--bg-secondary) / 0.88);
+  border-color: rgb(var(--surface-secondary));
+  box-shadow: inset -1px 0 rgb(var(--surface-primary));
   backdrop-filter: saturate(180%) blur(24px);
   -webkit-backdrop-filter: saturate(180%) blur(24px);
 }
 
-.mac-traffic-dot {
-  width: 11px;
-  height: 11px;
-  border-radius: 999px;
-  box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.16);
-}
 
-.leaflet-container { background: #e9eef5; }
+
+.leaflet-container { background: rgb(var(--bg-tertiary)); }
 .leaflet-popup-content-wrapper, .leaflet-popup-tip {
-  color: #1d1d1f;
-  background: rgba(255, 255, 255, 0.96);
+  color: rgb(var(--text-primary));
+  background: rgb(var(--bg-secondary) / 0.96);
 }
 .leaflet-popup-content-wrapper {
   border-radius: 12px;
@@ -69,3 +83,11 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   from { transform: translateX(0); }
   to { transform: translateX(100%); }
 }
+
+@layer components {
+  .ui-button { @apply inline-flex min-h-8 items-center justify-center gap-1.5 rounded-lg border border-surface-secondary bg-bg-secondary px-3 py-1.5 text-sm font-medium text-text-primary hover:bg-surface-primary disabled:cursor-not-allowed disabled:opacity-50; }
+  .ui-button-primary { @apply ui-button border-transparent bg-accent-primary text-white hover:bg-accent-primary/90; }
+}
+
+.map-load-status { display: flex; align-items: center; gap: 8px; max-width: min(460px, 70vw); padding: 7px 10px; border: 1px solid rgb(var(--surface-secondary)); border-radius: 10px; background: rgb(var(--bg-secondary) / 0.96); color: rgb(var(--text-secondary)); font: 13px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; box-shadow: 0 2px 8px #0001; }
+.map-load-status button[hidden] { display: none; }

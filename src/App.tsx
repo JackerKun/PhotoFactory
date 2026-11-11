@@ -66,7 +66,7 @@ function FilterSync() {
       // changing Zustand so the stale store value cannot immediately erase the
       // just-opened URL and start an infinite navigation loop.
       syncingFromUrl.current = true;
-      setFilter(urlFilter);
+      setFilter(urlFilter, true);
       loadPhotos();
     } else {
       const state = useStore.getState();
@@ -203,11 +203,6 @@ function AppLayout({ children, viewMode }: { children: React.ReactNode; viewMode
     listen("ai_status_changed", (event) => {
       const payload = event.payload as any;
       const stage = payload.stage as AiProcessingStatus["stage"];
-      if (stage === "done" && !(payload.failed > 0)) {
-        useStore.getState().setAiPipelineComplete(true);
-      } else if (stage) {
-        useStore.getState().setAiPipelineComplete(false);
-      }
       useStore.getState().setAiProcessingStatus({
         status: payload.status,
         stage,

@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import { imageErrorMessage } from "../utils/imageError";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useStore } from "../hooks/usePhotos";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -91,6 +92,8 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
     }
   }, [currentIndex, virtualizer]);
 
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewRetry, setPreviewRetry] = useState(0);
   const [preview, setPreview] = useState<{ url: string; original: boolean } | null>(null);
   const [zoom, setZoom] = useState(1);
   const [panOffset, setPanOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
@@ -143,6 +146,7 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
 
   useEffect(() => {
     setPreview(null);
+    setPreviewError(null);
     setDecodedDimensions(null);
     setZoom(1);
     setPanOffset({ x: 0, y: 0 });
@@ -162,7 +166,7 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
           setPreview((value) => value?.original ? value : { url, original: false });
         }
       })
-      .catch(() => {});
+      .catch((error) => { if (!cancelled) setPreviewError(imageErrorMessage(error)); });
 
     const originalUrl = convertFileSrc(currentPhoto.path);
     const original = new Image();
@@ -178,7 +182,7 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
       original.onerror = null;
       original.src = "";
     };
-  }, [photoId, currentPhoto?.path]);
+  }, [photoId, currentPhoto?.path, previewRetry]);
 
   // Zoom around the mouse position so inspecting a detail does not make it
   // jump away from the pointer. The fitted image is the minimum zoom level.
@@ -381,7 +385,7 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
       <button
         type="button"
         onClick={() => setShowShortcuts(true)}
-        className="absolute top-4 z-10 flex h-8 w-8 items-center justify-center rounded-full bg-black/30 text-sm text-white/70 hover:bg-black/60 hover:text-white"
+        className="absolute top-4 z-10 flex h-8 w-8 items-center justify-center rounded-full bg-black/30 text-sm text-white/70 hover:bg-text-primary/60 hover:text-white"
         style={{ right: detailsOpen ? DETAIL_WIDTH + 56 : 56 }}
         title="键盘快捷键 (?)"
         aria-label="查看键盘快捷键"
@@ -437,7 +441,7 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
             className={`absolute left-4 top-20 z-10 flex h-9 w-9 items-center justify-center rounded-full border backdrop-blur-sm transition-colors ${
               showFaceBoxes
                 ? "border-accent-primary bg-accent-primary/85 text-white"
-                : "border-white/20 bg-black/45 text-white/75 hover:bg-black/65"
+                : "border-white/20 bg-black/45 text-white/75 hover:bg-text-primary/65"
             }`}
             aria-pressed={showFaceBoxes}
             aria-label={showFaceBoxes ? "隐藏人脸框" : "显示人脸框"}
@@ -468,6 +472,7 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
               alt={currentPhoto?.filename}
               draggable={false}
               onDragStart={(event) => event.preventDefault()}
+              onError={() => { setPreview(null); setPreviewError("图片无法显示"); }}
               onLoad={(event) => setDecodedDimensions({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })}
               className="block max-w-full object-contain select-none pointer-events-none"
               style={{
@@ -499,7 +504,7 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
                         height: `${box.height}%`,
                       }}
                     >
-                      <span className={`absolute left-[-2px] max-w-40 truncate rounded-t px-1.5 py-1 text-[11px] leading-none text-white shadow ${
+                      <span className={`absolute left-[-2px] max-w-40 truncate rounded-t px-1.5 py-1 text-xs leading-none text-white shadow ${
                         isEditing ? "-top-7 bg-emerald-500 font-semibold" : "-top-6 bg-red-500"
                       }`}>
                         {label}
@@ -511,7 +516,7 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
             )}
           </div>
         ) : (
-          <div className="text-white/50 text-lg">Loading...</div>
+          <div className="flex flex-col items-center gap-3 text-base text-white/80" role="status"><span>{previewError ?? "正在加载大图…"}</span>{previewError && <button type="button" className="rounded-lg bg-white/15 px-4 py-2 text-sm text-white hover:bg-white/25" onClick={(event) => { event.stopPropagation(); setPreviewRetry((value) => value + 1); }}>重新加载</button>}</div>
         )}
 
         {/* Right arrow */}
@@ -548,8 +553,8 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
           data-lightbox-control
           onPointerDown={(event) => event.stopPropagation()}
           onClick={() => setSelectedPhotoId(selectedPhotoId === photoId ? null : photoId)}
-          className="absolute bottom-4 right-4 z-10 w-8 h-8 rounded-full bg-black/40 hover:bg-black/60 text-white/70 hover:text-white flex items-center justify-center transition-colors"
-          title="Photo details"
+          className="absolute bottom-4 right-4 z-10 w-8 h-8 rounded-full bg-black/40 hover:bg-text-primary/60 text-white/70 hover:text-white flex items-center justify-center transition-colors"
+          title="照片详情"
         >
           <span className="text-sm font-semibold">i</span>
         </button>

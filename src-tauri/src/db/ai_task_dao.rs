@@ -124,6 +124,27 @@ pub fn retry_failed(conn: &Connection) -> AppResult<usize> {
     )?)
 }
 
+/// Retry JPEGs rejected by the old Pillow path when scaled decoding is available.
+pub fn requeue_oversized_jpeg_failures(conn: &Connection) -> AppResult<usize> {
+    Ok(conn.execute(
+        "UPDATE ai_photo_tasks SET status='pending',attempts=0,lease_until=NULL,error=NULL,updated_at=?1
+         WHERE status IN ('pending','failed') AND stage IN (?2,?3)
+           AND error LIKE 'Image size (% pixels) exceeds limit of % pixels, could be decompression bomb DOS attack.'
+           AND EXISTS (SELECT 1 FROM photos p WHERE p.id=photo_id AND p.deleted=0
+             AND (LOWER(p.path) LIKE '%.jpg' OR LOWER(p.path) LIKE '%.jpeg'))",
+        params![now(), FACE_STAGE, CLASSIFICATION_STAGE],
+    )?)
+}
+
+pub fn has_pending_tasks(conn: &Connection, stage: &str) -> AppResult<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM ai_photo_tasks t JOIN photos p ON p.id=t.photo_id
+         WHERE t.stage=?1 AND t.status='pending' AND t.attempts<3 AND p.deleted=0)",
+        [stage],
+        |row| row.get(0),
+    )?)
+}
+
 pub fn stage_counts(conn: &Connection, stage: &str) -> AppResult<(i64, i64, i64)> {
     conn.query_row(
         "SELECT COUNT(*),SUM(CASE WHEN status='done' THEN 1 ELSE 0 END),SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END)
@@ -144,7 +165,7 @@ pub fn set_pipeline_state(
 ) -> AppResult<()> {
     let ts = now();
     conn.execute(
-        "UPDATE ai_pipeline_state SET status=CASE WHEN status IN('paused','canceled') AND ?1='running' THEN status ELSE ?1 END,stage=?2,total=?3,processed=?4,failed=?5,
+        "UPDATE ai_pipeline_state SET status=CASE WHEN status IN('paused','canceled') AND ?1 IN ('running','done','error') THEN status ELSE ?1 END,stage=?2,total=?3,processed=?4,failed=?5,
          started_at=CASE WHEN status IN('idle','done','canceled') AND ?1='running' THEN ?6 ELSE started_at END,
          stage_started_at=CASE WHEN stage!=?2 OR (status!='running' AND ?1='running') THEN ?6 ELSE stage_started_at END,
          stage_base_processed=CASE WHEN stage!=?2 OR (status!='running' AND ?1='running') THEN ?4 ELSE stage_base_processed END,
@@ -152,6 +173,15 @@ pub fn set_pipeline_state(
         params![status, stage, total, processed, failed, ts, error],
     )?;
     Ok(())
+}
+
+pub fn needs_ai_finalization(conn: &Connection) -> AppResult<bool> {
+    conn.query_row(
+        "SELECT status <> 'done' AND stage IN ('clustering','clustering_done','geo_tagging','finishing_tags')
+         FROM ai_pipeline_state WHERE id=1",
+        [],
+        |row| row.get(0),
+    ).map_err(Into::into)
 }
 
 pub fn pipeline_control_status(conn: &Connection) -> AppResult<String> {
@@ -178,6 +208,23 @@ pub fn set_pipeline_control(conn: &Connection, status: &str) -> AppResult<()> {
 mod tests {
     use super::*;
     use crate::db::schema::CREATE_TABLES;
+
+    #[test]
+    fn interrupted_post_processing_remains_resumable_without_photo_tasks() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(CREATE_TABLES).unwrap();
+        assert!(!needs_ai_finalization(&conn).unwrap());
+        set_pipeline_state(&conn, "running", "clustering", 230, 0, 0, None).unwrap();
+        assert!(needs_ai_finalization(&conn).unwrap());
+        set_pipeline_state(&conn, "running", "geo_tagging", 100, 20, 0, None).unwrap();
+        set_pipeline_control(&conn, "paused").unwrap();
+        set_pipeline_state(&conn, "running", "geo_tagging", 100, 21, 0, None).unwrap();
+        assert_eq!(pipeline_control_status(&conn).unwrap(), "paused");
+        assert!(needs_ai_finalization(&conn).unwrap());
+        set_pipeline_control(&conn, "running").unwrap();
+        set_pipeline_state(&conn, "done", "done", 0, 0, 0, None).unwrap();
+        assert!(!needs_ai_finalization(&conn).unwrap());
+    }
 
     #[test]
     fn tasks_resume_from_persisted_photo_status() {
@@ -236,13 +283,34 @@ mod tests {
             [],
         ).unwrap();
         sync_stage_tasks(&conn, FACE_STAGE, "v1", "face_status").unwrap();
-        for _ in 0..3 {
+        for attempt in 1..=3 {
             assert_eq!(claim_tasks(&conn, FACE_STAGE, 1).unwrap(), vec![1]);
             mark_task_failed(&conn, 1, FACE_STAGE, "bad image").unwrap();
+            assert_eq!(has_pending_tasks(&conn, FACE_STAGE).unwrap(), attempt < 3);
         }
         assert!(claim_tasks(&conn, FACE_STAGE, 1).unwrap().is_empty());
         assert_eq!(stage_counts(&conn, FACE_STAGE).unwrap(), (1, 0, 1));
         assert_eq!(retry_failed(&conn).unwrap(), 1);
         assert_eq!(claim_tasks(&conn, FACE_STAGE, 1).unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn requeues_only_legacy_jpeg_size_failures() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(CREATE_TABLES).unwrap();
+        conn.execute_batch(
+            "INSERT INTO photos(id,path,filename,file_size,file_mtime,imported_at)
+             VALUES (1,'/1.JPG','1.JPG',10,20,1),(2,'/2.png','2.png',10,20,1),(3,'/3.jpg','3.jpg',10,20,1);",
+        ).unwrap();
+        sync_stage_tasks(&conn, FACE_STAGE, "v1", "face_status").unwrap();
+        sync_stage_tasks(&conn, CLASSIFICATION_STAGE, "v1", "classification_status").unwrap();
+        conn.execute(
+            "UPDATE ai_photo_tasks SET status='failed',attempts=3,error=CASE WHEN photo_id<3 THEN ?1 ELSE 'corrupt image' END",
+            ["Image size (201326592 pixels) exceeds limit of 178956970 pixels, could be decompression bomb DOS attack."],
+        ).unwrap();
+        assert_eq!(requeue_oversized_jpeg_failures(&conn).unwrap(), 2);
+        assert_eq!(requeue_oversized_jpeg_failures(&conn).unwrap(), 0);
+        assert_eq!(claim_tasks(&conn, FACE_STAGE, 10).unwrap(), vec![1]);
+        assert_eq!(claim_tasks(&conn, CLASSIFICATION_STAGE, 10).unwrap(), vec![1]);
     }
 }

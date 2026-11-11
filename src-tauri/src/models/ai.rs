@@ -83,6 +83,7 @@ pub struct ClassifyResponse {
 pub struct DetectFacesRequest {
     pub paths: Vec<String>,
     pub cache_dir: String,
+    pub previews: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,12 +165,16 @@ pub struct ClusterFaceV2Request {
     pub must_links: Option<Vec<(i64, i64)>>,
     pub cannot_links: Option<Vec<(i64, i64)>>,
     pub candidate_files: Option<Vec<String>>,
+    pub memberships: std::collections::HashMap<String, i64>,
+    pub qualities: std::collections::HashMap<String, f64>,
 }
 
 /// Response from v2 clustering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterFaceV2Response {
     pub clusters: std::collections::HashMap<String, i64>,
+    #[serde(default)]
+    pub review_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

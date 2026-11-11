@@ -1,8 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
+import { queueFaceThumbnail } from "../utils/photoRequests";
 import type {
   Photo, PhotoPage, PhotoCursor, PhotoFilter, AiClassification,
   FaceDetection, FaceCluster, CustomAttribute, Project,
-  ThumbnailProcessingStatus, PersonDetail, LabelNode,
+  ThumbnailProcessingStatus, ThumbnailPerformance, PersonDetail, LabelNode,
   ManualTag, PhotoTimelineBucket, PhotoFilterOptions, ScanResult,
   LibraryJob, LibraryPhoto, DuplicateGroup, StoryEvent, ModelPlugin,
   StorageSource, IgnoredFace, PhotoEdit,
@@ -172,10 +173,75 @@ export async function getPhotosWithGps(
   return invoke<Photo[]>("cmd_get_photos_with_gps", { minLat, maxLat, minLng, maxLng, limit });
 }
 
+export type TrackBounds = [west: number, south: number, east: number, north: number];
+export type TrackPhoto = Pick<Photo, "filename"> & {
+  id: number;
+  taken_at: number;
+  latitude: number;
+  longitude: number;
+};
+
+export function getTrackPhotos(bounds: TrackBounds, startAt: number | null, endBefore: number | null) {
+  return invoke<TrackPhoto[]>("cmd_get_track_photos", { bounds, startAt, endBefore });
+}
+
+export interface TrackSettings {
+  bounds: TrackBounds;
+  start_date: string;
+  end_date: string;
+  joined_gaps: string[];
+}
+
+export interface SavedTrack {
+  id: number;
+  name: string;
+  settings: TrackSettings;
+}
+
+export function listPhotoTracks() {
+  return invoke<SavedTrack[]>("cmd_list_photo_tracks");
+}
+
+export function savePhotoTrack(id: number | null, name: string, settings: TrackSettings) {
+  return invoke<SavedTrack>("cmd_save_photo_track", { id, name, settings });
+}
+
+export function deletePhotoTrack(id: number) {
+  return invoke<void>("cmd_delete_photo_track", { id });
+}
+
 export type MapLayerStyle = "standard" | "satellite";
 
-export async function getMapTile(z: number, x: number, y: number, layer: MapLayerStyle = "standard"): Promise<string> {
-  return invoke<string>("cmd_get_map_tile", { z, x, y, layer });
+export interface OfflineMapPackage {
+  id: string;
+  name: string;
+  layer: MapLayerStyle;
+  min_zoom: number;
+  max_zoom: number;
+  bounds: [west: number, south: number, east: number, north: number] | null;
+  attribution: string | null;
+  bytes: number;
+}
+
+export function listOfflineMaps(): Promise<OfflineMapPackage[]> {
+  return invoke("cmd_list_offline_maps");
+}
+
+export function importOfflineMap(paths: string[]): Promise<OfflineMapPackage[]> {
+  return invoke("cmd_import_offline_map", { paths });
+}
+
+export function exportOfflineMap(path: string, layer: MapLayerStyle | "both"): Promise<{ tile_count: number; bytes: number }> {
+  return invoke("cmd_export_offline_map", { path, layer });
+}
+
+export function getMapTile(z: number, x: number, y: number, layer: MapLayerStyle = "standard"): Promise<string | null> {
+  return invoke("cmd_get_map_tile", { z, x, y, layer });
+}
+
+export interface MapTileResult { url: string; source: "package" | "cache" | "network" }
+export function getMapTileStatus(z: number, x: number, y: number, layer: MapLayerStyle = "standard"): Promise<MapTileResult> {
+  return invoke("cmd_get_map_tile_status", { z, x, y, layer });
 }
 
 export async function hasMapTile(z: number, x: number, y: number, layer: MapLayerStyle = "standard"): Promise<boolean> {
@@ -188,6 +254,14 @@ export async function getPhotoDirectories(): Promise<string[]> {
 
 export async function startThumbnailBatch(): Promise<string> {
   return invoke<string>("cmd_start_thumbnail_batch");
+}
+
+export function getThumbnailPerformance(): Promise<ThumbnailPerformance> {
+  return invoke("cmd_get_thumbnail_performance");
+}
+
+export function setThumbnailPerformance(mode: ThumbnailPerformance): Promise<void> {
+  return invoke("cmd_set_thumbnail_performance", { mode });
 }
 
 export async function getThumbnailProcessingStatus(): Promise<ThumbnailProcessingStatus> {
@@ -294,8 +368,8 @@ export async function hasAutomaticFaceMergeToUndo(): Promise<boolean> {
   return invoke<boolean>("cmd_has_automatic_face_merge_to_undo");
 }
 
-export async function getClusterFaceThumbnail(clusterId: number): Promise<string> {
-  return invoke<string>("cmd_get_cluster_face_thumbnail", { clusterId });
+export async function getClusterFaceThumbnail(clusterId: number, signal?: AbortSignal): Promise<string> {
+  return queueFaceThumbnail(() => invoke<string>("cmd_get_cluster_face_thumbnail", { clusterId }), signal);
 }
 
 export interface SuspectedFace {
@@ -325,8 +399,8 @@ export async function restoreAllIgnoredFaces(): Promise<string> {
   return invoke<string>("cmd_restore_all_ignored_faces");
 }
 
-export async function getFaceThumbnail(faceId: number): Promise<string> {
-  return invoke<string>("cmd_get_face_thumbnail", { faceId });
+export async function getFaceThumbnail(faceId: number, signal?: AbortSignal): Promise<string> {
+  return queueFaceThumbnail(() => invoke<string>("cmd_get_face_thumbnail", { faceId }), signal);
 }
 
 export async function keepSuspectedFace(faceId: number): Promise<void> {
@@ -385,6 +459,17 @@ export async function incrementalScan(): Promise<ScanResult> {
 
 export async function triggerAutoAi(): Promise<string> {
   return invoke<string>("cmd_trigger_auto_ai");
+}
+
+export interface AiRuntimeInfo {
+  available: string[];
+  models: Record<string, string>;
+  face_batch: { photos?: number; preview_hits?: number; elapsed_ms?: number; decode_ms?: number; detect_ms?: number; embed_ms?: number };
+  cluster_ms?: number | null;
+}
+
+export function getAiRuntime(): Promise<AiRuntimeInfo | null> {
+  return invoke("cmd_get_ai_runtime");
 }
 
 export async function getAiPipelineStatus(): Promise<import("../types").AiProcessingStatus> {
@@ -531,3 +616,18 @@ export const getLibrarySettings = () => invoke<Record<string,string>>("cmd_get_l
 export const setLibrarySetting = (key:string, value:string) => invoke<void>("cmd_set_library_setting", { key, value });
 export const getIgnoredFaces = (offset=0, limit=40) => invoke<Paged<IgnoredFace>>("cmd_get_ignored_faces", { offset, limit });
 export const restoreIgnoredFaces = (faceIds:number[]) => invoke<number>("cmd_restore_ignored_faces", { faceIds });
+
+
+export interface GroupPhotoItem {
+  photo: Photo;
+  people_count: number;
+  unconfirmed_count: number;
+}
+
+export function getGroupPhotos(size: number, personIds: number[], exact: boolean, cursor?: number): Promise<GroupPhotoItem[]> {
+  return invoke("cmd_get_group_photos", { size, personIds, exact, cursor });
+}
+
+export function createPersonCombination(name: string, personIds: number[], exact: boolean): Promise<number> {
+  return invoke("cmd_create_person_combination", { name, personIds, exact });
+}

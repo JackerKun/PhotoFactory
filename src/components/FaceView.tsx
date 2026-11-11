@@ -3,7 +3,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { listen } from "@tauri-apps/api/event";
 import type { FaceCluster } from "../types";
 import * as api from "../api/tauri";
-import AiStatusIndicator from "./AiStatusIndicator";
+import GroupPhotosView from "./GroupPhotosView";
 
 interface Props {}
 
@@ -27,7 +27,6 @@ const FaceThumb: React.FC<{ clusterId: number }> = React.memo(function FaceThumb
   const [thumb, setThumb] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const ref = useRef<HTMLDivElement>(null);
-  const cancelledRef = useRef(false);
 
   useEffect(() => {
     // Check cache synchronously
@@ -39,23 +38,23 @@ const FaceThumb: React.FC<{ clusterId: number }> = React.memo(function FaceThumb
 
     const node = ref.current;
     if (!node) return;
-    cancelledRef.current = false;
+    const controller = new AbortController();
 
     const observer = new IntersectionObserver(
       (entries) => {
         for (const entry of entries) {
           if (entry.isIntersecting && !thumb) {
             observer.unobserve(entry.target);
-            if (cancelledRef.current) return;
-            api.getClusterFaceThumbnail(clusterId)
+            if (controller.signal.aborted) return;
+            api.getClusterFaceThumbnail(clusterId, controller.signal)
               .then((dataUrl) => {
-                if (!cancelledRef.current && dataUrl) {
+                if (!controller.signal.aborted && dataUrl) {
                   cacheSet(clusterId, dataUrl);
                   setThumb(dataUrl);
                 }
               })
               .catch((err) => {
-                if (!cancelledRef.current) {
+                if (!controller.signal.aborted) {
                   setError(err instanceof Error ? err.message : String(err));
                 }
               });
@@ -67,7 +66,7 @@ const FaceThumb: React.FC<{ clusterId: number }> = React.memo(function FaceThumb
     );
 
     observer.observe(node);
-    return () => { cancelledRef.current = true; observer.disconnect(); };
+    return () => { controller.abort(); observer.disconnect(); };
   }, [clusterId, thumb]);
 
   if (thumb) {
@@ -94,9 +93,11 @@ const FaceThumb: React.FC<{ clusterId: number }> = React.memo(function FaceThumb
 const SuspectedFaceThumb: React.FC<{ faceId: number }> = React.memo(function SuspectedFaceThumb({ faceId }) {
   const [thumb, setThumb] = useState<string | null>(null);
   useEffect(() => {
-    let cancelled = false;
-    api.getFaceThumbnail(faceId).then((value) => { if (!cancelled) setThumb(value); }).catch(() => {});
-    return () => { cancelled = true; };
+    const controller = new AbortController();
+    api.getFaceThumbnail(faceId, controller.signal).then((value) => {
+      if (!controller.signal.aborted) setThumb(value);
+    }).catch(() => {});
+    return () => controller.abort();
   }, [faceId]);
   return thumb
     ? <img src={thumb} alt="" className="w-full h-full object-cover" />
@@ -270,7 +271,7 @@ export default React.memo(function FaceView(_props: Props) {
   };
 
   const handleFullRecluster = async () => {
-    if (!window.confirm("将重新生成所有未命名人物分组；已经命名的人物会保留。继续吗？")) return;
+    if (!window.confirm("将重新生成所有未命名人物分组；已命名及人工确认的人物会保留。继续吗？")) return;
     setClustering(true);
     setOperationMessage("正在用更严格的规则完整重建未命名人物分组…");
     try {
@@ -394,7 +395,7 @@ export default React.memo(function FaceView(_props: Props) {
   };
 
   const handleFaceAiUpgrade = async () => {
-    if (!window.confirm("将使用新版人脸算法重新分析照片。已命名人物和姓名会保留，自动分组会重建。继续吗？")) return;
+    if (!window.confirm("将使用新版人脸算法重新分析照片。已命名及人工确认的人物会保留，自动分组会重建。继续吗？")) return;
     setAiRunning(true);
     try {
       const prepared = await api.prepareFaceAiReanalysis();
@@ -525,6 +526,9 @@ export default React.memo(function FaceView(_props: Props) {
   };
 
   const visibleClusters = clusters;
+  const [groupPhotosOpen, setGroupPhotosOpen] = useState(false);
+
+  if (groupPhotosOpen) return <GroupPhotosView onBack={() => setGroupPhotosOpen(false)} />;
 
   return (
     <div className="h-full flex flex-col">
@@ -540,31 +544,30 @@ export default React.memo(function FaceView(_props: Props) {
             </p>
           </div>
           <div className="flex items-center gap-3">
-            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/70 border border-black/5 text-xs text-text-secondary shadow-sm">
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-bg-secondary/70 border border-text-primary/5 text-xs text-text-secondary shadow-sm">
               <span className={`w-2 h-2 rounded-full ${workerHealthy ? "bg-emerald-500" : "bg-slate-300"}`} />
               {workerHealthy ? "智能分析服务已就绪" : "智能分析准备中"}
             </div>
             <details className="relative">
-              <summary className="list-none cursor-pointer w-9 h-9 rounded-full bg-white/70 border border-black/5 shadow-sm flex items-center justify-center text-lg text-text-secondary hover:bg-white">•••</summary>
-              <div className="absolute right-0 mt-2 z-20 w-44 rounded-xl border border-black/10 bg-white/95 p-1.5 shadow-xl backdrop-blur-xl text-sm">
-                <button onClick={handleRunFaceDetection} disabled={aiRunning} className="w-full text-left rounded-lg px-3 py-2 hover:bg-black/5 disabled:opacity-50">分析新增照片人脸</button>
-                <button onClick={handleRunClustering} disabled={clustering} className="w-full text-left rounded-lg px-3 py-2 hover:bg-black/5 disabled:opacity-50">整理待分组人脸</button>
-                <button onClick={handleFullRecluster} disabled={clustering} className="w-full text-left rounded-lg px-3 py-2 hover:bg-black/5 disabled:opacity-50">完整重建人物分组…</button>
-                <button onClick={openAutoMerge} disabled={clustering || autoMergeRunning} className="w-full text-left rounded-lg px-3 py-2 hover:bg-black/5 disabled:opacity-50">自动合并相似人物…</button>
-                {hasMergeUndo && <button onClick={handleUndoAutomaticMerge} className="w-full text-left rounded-lg px-3 py-2 hover:bg-black/5 text-orange-700">撤销上次自动合并</button>}
-                {suspectedFaceCount > 0 && <button onClick={openSuspectedFaces} className="w-full text-left rounded-lg px-3 py-2 hover:bg-black/5">审核疑似误检 ({suspectedFaceCount})…</button>}
-                {faceAiUpgradeAvailable && <button onClick={handleFaceAiUpgrade} className="w-full text-left rounded-lg px-3 py-2 hover:bg-black/5 text-blue-700">使用新版算法重新分析…</button>}
-                {ignoredFaceCount > 0 && <button onClick={handleRestoreIgnoredFaces} className="w-full text-left rounded-lg px-3 py-2 hover:bg-black/5 text-text-secondary">恢复已忽略人脸 ({ignoredFaceCount})…</button>}
-                <button onClick={() => mergeMode ? (setMergeMode(false), setMergeSelected(new Set())) : startMergeMode("named")} className="w-full text-left rounded-lg px-3 py-2 hover:bg-black/5">合并已命名人物…</button>
-                <button onClick={() => mergeMode ? (setMergeMode(false), setMergeSelected(new Set())) : startMergeMode("unnamed")} className="w-full text-left rounded-lg px-3 py-2 hover:bg-black/5">{mergeMode ? "退出合并模式" : "合并未命名人物…"}</button>
+              <summary className="list-none cursor-pointer w-9 h-9 rounded-full bg-bg-secondary/70 border border-text-primary/5 shadow-sm flex items-center justify-center text-lg text-text-secondary hover:bg-bg-secondary">•••</summary>
+              <div className="absolute right-0 mt-2 z-20 w-44 rounded-xl border border-text-primary/10 bg-bg-secondary/95 p-1.5 shadow-xl backdrop-blur-xl text-sm">
+                <button onClick={handleRunFaceDetection} disabled={aiRunning} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5 disabled:opacity-50">分析新增照片人脸</button>
+                <button onClick={handleRunClustering} disabled={clustering} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5 disabled:opacity-50">整理待分组人脸</button>
+                <button onClick={handleFullRecluster} disabled={clustering} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5 disabled:opacity-50">完整重建人物分组…</button>
+                <button onClick={openAutoMerge} disabled={clustering || autoMergeRunning} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5 disabled:opacity-50">自动合并相似人物…</button>
+                {hasMergeUndo && <button onClick={handleUndoAutomaticMerge} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5 text-orange-700 dark:text-orange-300">撤销上次自动合并</button>}
+                {suspectedFaceCount > 0 && <button onClick={openSuspectedFaces} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5">审核疑似误检 ({suspectedFaceCount})…</button>}
+                {faceAiUpgradeAvailable && <button onClick={handleFaceAiUpgrade} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5 text-blue-700 dark:text-blue-300">使用新版算法重新分析…</button>}
+                {ignoredFaceCount > 0 && <button onClick={handleRestoreIgnoredFaces} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5 text-text-secondary">恢复已忽略人脸 ({ignoredFaceCount})…</button>}
+                <button onClick={() => mergeMode ? (setMergeMode(false), setMergeSelected(new Set())) : startMergeMode("named")} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5">合并已命名人物…</button>
+                <button onClick={() => mergeMode ? (setMergeMode(false), setMergeSelected(new Set())) : startMergeMode("unnamed")} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5">{mergeMode ? "退出合并模式" : "合并未命名人物…"}</button>
               </div>
             </details>
           </div>
         </div>
 
-        <AiStatusIndicator />
         {operationMessage && (
-          <div className="mb-4 flex items-center justify-between rounded-xl bg-white/70 border border-black/5 px-4 py-2.5 text-sm text-text-secondary">
+          <div className="mb-4 flex items-center justify-between rounded-xl bg-bg-secondary/70 border border-text-primary/5 px-4 py-2.5 text-sm text-text-secondary">
             <span>{operationMessage}</span>
             <button onClick={() => setOperationMessage(null)} className="text-text-muted hover:text-text-primary">关闭</button>
           </div>
@@ -585,7 +588,7 @@ export default React.memo(function FaceView(_props: Props) {
               }}
               className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-all ${
                 activeTab === tab
-                  ? "bg-white text-text-primary shadow-sm"
+                  ? "bg-bg-secondary text-text-primary shadow-sm"
                   : "text-text-muted hover:text-text-primary"
               }`}
             >
@@ -593,6 +596,7 @@ export default React.memo(function FaceView(_props: Props) {
               {" "}<span className="text-xs opacity-60">({tabCounts[tab]})</span>
             </button>
           ))}
+          <button type="button" onClick={() => setGroupPhotosOpen(true)} className="px-4 py-1.5 rounded-lg text-sm font-medium text-text-muted hover:text-text-primary">合影</button>
         </div>
 
         {/* Toolbar */}
@@ -615,7 +619,7 @@ export default React.memo(function FaceView(_props: Props) {
               </button>
               <button
                 onClick={() => startMergeMode("unnamed")}
-                className="px-4 py-1.5 rounded-lg text-sm text-text-secondary bg-white/70 border border-black/5 shadow-sm"
+                className="px-4 py-1.5 rounded-lg text-sm text-text-secondary bg-bg-secondary/70 border border-text-primary/5 shadow-sm"
               >
                 手动选择合并
               </button>
@@ -634,7 +638,7 @@ export default React.memo(function FaceView(_props: Props) {
                 <button
                   onClick={handleIgnoreSelectedPeople}
                   disabled={mergeSelected.size < 1 || mergeSaving}
-                  className="bg-red-50 text-red-700 px-4 py-1.5 rounded-lg text-sm disabled:opacity-50 disabled:cursor-not-allowed border border-red-100"
+                  className="bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300 px-4 py-1.5 rounded-lg text-sm disabled:opacity-50 disabled:cursor-not-allowed border border-red-100"
                 >
                   删除所选人物标记 ({mergeSelected.size})
                 </button>
@@ -643,7 +647,7 @@ export default React.memo(function FaceView(_props: Props) {
           )}
           {activeTab === "review" && !mergeMode && (
             <>
-              <span className="text-xs text-text-muted">低置信度通常是只有一张照片的人物。可逐个确认、命名，或选择多个合并。</span>
+              <span className="text-xs text-text-muted">单张人脸或身份不明确的照片会留在这里。请确认、命名或手动合并。</span>
               <button onClick={() => startMergeMode("review")} className="bg-orange-500 text-white px-3 py-1.5 rounded-lg text-sm shadow-sm">选择并合并</button>
             </>
           )}
@@ -653,7 +657,7 @@ export default React.memo(function FaceView(_props: Props) {
             </span>
           )}
           {mergeMode && (
-            <button onClick={() => { setMergeMode(false); setMergeSelected(new Set()); }} className="px-3 py-1.5 rounded-lg text-sm text-text-secondary hover:bg-black/5">
+            <button onClick={() => { setMergeMode(false); setMergeSelected(new Set()); }} className="px-3 py-1.5 rounded-lg text-sm text-text-secondary hover:bg-text-primary/5">
               取消
             </button>
           )}
@@ -670,10 +674,10 @@ export default React.memo(function FaceView(_props: Props) {
                 mergeMode
                   ? mergeSelected.has(cluster.id!)
                     ? "bg-accent-primary/20 border-2 border-accent-primary cursor-pointer"
-                    : "bg-white/50 border-2 border-transparent cursor-pointer hover:border-accent-primary/40"
+                    : "bg-bg-secondary/50 border-2 border-transparent cursor-pointer hover:border-accent-primary/40"
                   : activeTab === "review"
-                    ? "bg-white border-2 border-orange-300 cursor-pointer shadow-sm"
-                    : "cursor-pointer hover:bg-white/70 hover:shadow-sm"
+                    ? "bg-bg-secondary border-2 border-orange-300 cursor-pointer shadow-sm"
+                    : "cursor-pointer hover:bg-bg-secondary/70 hover:shadow-sm"
               }`}
               onClick={() => {
                 if (mergeMode) {
@@ -694,7 +698,7 @@ export default React.memo(function FaceView(_props: Props) {
                 <FaceThumb clusterId={cluster.id!} />
                 {mergeMode && (
                   <span className={`absolute top-2 right-2 w-6 h-6 rounded-full border-2 flex items-center justify-center text-xs font-bold shadow-sm ${
-                    mergeSelected.has(cluster.id!) ? "bg-accent-primary border-white text-white" : "bg-white/90 border-white text-transparent"
+                    mergeSelected.has(cluster.id!) ? "bg-accent-primary border-white text-white" : "bg-bg-secondary/90 border-white text-transparent"
                   }`}>
                     ✓
                   </span>
@@ -723,18 +727,18 @@ export default React.memo(function FaceView(_props: Props) {
                   <button
                     type="button"
                     onClick={(event) => { event.stopPropagation(); void handleConfirmCluster(cluster.id!); }}
-                    className="rounded-lg bg-emerald-50 px-1 py-1.5 text-[11px] font-medium text-emerald-700 hover:bg-emerald-100"
+                    className="rounded-lg bg-emerald-50 dark:bg-emerald-950/40 px-1 py-1.5 text-xs font-medium text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100"
                     title="确认这是一个独立人物"
                   >确认</button>
                   <button
                     type="button"
                     onClick={(event) => { event.stopPropagation(); setEditingId(cluster.id!); setEditName(cluster.name || ""); }}
-                    className="rounded-lg bg-black/[0.045] px-1 py-1.5 text-[11px] text-text-secondary hover:bg-black/[0.08]"
+                    className="rounded-lg bg-black/[0.045] px-1 py-1.5 text-xs text-text-secondary hover:bg-text-primary/[0.08]"
                   >命名</button>
                   <button
                     type="button"
                     onClick={(event) => { event.stopPropagation(); startMergeMode("review", cluster.id!); }}
-                    className="rounded-lg bg-orange-50 px-1 py-1.5 text-[11px] text-orange-700 hover:bg-orange-100"
+                    className="rounded-lg bg-orange-50 dark:bg-orange-950/40 px-1 py-1.5 text-xs text-orange-700 dark:text-orange-300 hover:bg-orange-100"
                   >合并</button>
                 </div>
               )}
@@ -748,7 +752,7 @@ export default React.memo(function FaceView(_props: Props) {
               type="button"
               onClick={() => { void loadMoreClusters(); }}
               disabled={pageLoading}
-              className="rounded-xl border border-black/10 bg-white/80 px-5 py-2 text-sm text-text-secondary shadow-sm hover:bg-white disabled:opacity-50"
+              className="rounded-xl border border-text-primary/10 bg-bg-secondary/80 px-5 py-2 text-sm text-text-secondary shadow-sm hover:bg-bg-secondary disabled:opacity-50"
             >
               {pageLoading ? "正在加载…" : `加载更多（已显示 ${clusters.length} / ${pageTotal}）`}
             </button>
@@ -773,19 +777,19 @@ export default React.memo(function FaceView(_props: Props) {
 
       {editingId !== null && (
         <div className="fixed inset-0 z-[1200] bg-black/30 backdrop-blur-sm flex items-center justify-center" onMouseDown={() => !renameSaving && setEditingId(null)}>
-          <div className="w-[360px] rounded-2xl bg-white p-5 shadow-2xl border border-black/10" onMouseDown={(event) => event.stopPropagation()}>
+          <div className="w-[360px] rounded-2xl bg-bg-secondary p-5 shadow-2xl border border-text-primary/10" onMouseDown={(event) => event.stopPropagation()}>
             <h3 className="text-lg font-semibold text-text-primary">命名人物</h3>
             <p className="text-xs text-text-muted mt-1 mb-4">这个名称会应用到该人物的全部照片。</p>
             <input
               value={editName}
               onChange={(event) => setEditName(event.target.value)}
               onKeyDown={(event) => { if (event.key === "Enter") handleRename(editingId); if (event.key === "Escape") setEditingId(null); }}
-              className="w-full rounded-xl border border-black/10 bg-black/[0.035] px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-accent-primary/30"
+              className="w-full rounded-xl border border-text-primary/10 bg-black/[0.035] px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-accent-primary/30"
               placeholder="输入人物姓名"
               autoFocus
             />
             <div className="mt-5 flex justify-end gap-2">
-              <button disabled={renameSaving} onClick={() => setEditingId(null)} className="px-4 py-2 rounded-lg text-sm text-text-secondary hover:bg-black/5 disabled:opacity-50">取消</button>
+              <button disabled={renameSaving} onClick={() => setEditingId(null)} className="px-4 py-2 rounded-lg text-sm text-text-secondary hover:bg-text-primary/5 disabled:opacity-50">取消</button>
               <button disabled={renameSaving || !editName.trim()} onClick={() => handleRename(editingId)} className="px-4 py-2 rounded-lg bg-accent-primary text-white text-sm font-medium disabled:opacity-50">
                 {renameSaving ? "保存中…" : "保存"}
               </button>
@@ -796,20 +800,20 @@ export default React.memo(function FaceView(_props: Props) {
 
       {mergeConfirmOpen && (
         <div className="fixed inset-0 z-[1200] bg-black/30 backdrop-blur-sm flex items-center justify-center" onMouseDown={() => !mergeSaving && setMergeConfirmOpen(false)}>
-          <div className="w-[390px] rounded-2xl bg-white p-5 shadow-2xl border border-black/10" onMouseDown={(event) => event.stopPropagation()}>
+          <div className="w-[390px] rounded-2xl bg-bg-secondary p-5 shadow-2xl border border-text-primary/10" onMouseDown={(event) => event.stopPropagation()}>
             <h3 className="text-lg font-semibold text-text-primary">合并 {mergeSelected.size} 个人物</h3>
             <p className="text-sm text-text-muted mt-2">可以合并为一个新人物，也可以直接归入已经命名的人物。</p>
             <div className="mt-4 space-y-2">
-              <label className={`block cursor-pointer rounded-xl border p-3 ${mergeTargetId == null ? "border-accent-primary bg-accent-primary/5" : "border-black/10"}`}>
+              <label className={`block cursor-pointer rounded-xl border p-3 ${mergeTargetId == null ? "border-accent-primary bg-accent-primary/5" : "border-text-primary/10"}`}>
                 <span className="flex items-center gap-2 text-sm font-medium"><input type="radio" checked={mergeTargetId == null} onChange={() => setMergeTargetId(null)} /> 合并为新人物</span>
-                <input value={mergeName} onChange={(event) => setMergeName(event.target.value)} onFocus={() => setMergeTargetId(null)} className="mt-2 w-full rounded-lg border border-black/10 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-accent-primary/30" placeholder="合并后姓名（可选）" />
+                <input value={mergeName} onChange={(event) => setMergeName(event.target.value)} onFocus={() => setMergeTargetId(null)} className="mt-2 w-full rounded-lg border border-text-primary/10 bg-bg-secondary px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-accent-primary/30" placeholder="合并后姓名（可选）" />
               </label>
-              <label className={`block rounded-xl border p-3 ${mergeTargetId != null ? "border-accent-primary bg-accent-primary/5" : "border-black/10"}`}>
+              <label className={`block rounded-xl border p-3 ${mergeTargetId != null ? "border-accent-primary bg-accent-primary/5" : "border-text-primary/10"}`}>
                 <span className="flex items-center gap-2 text-sm font-medium"><input type="radio" checked={mergeTargetId != null} disabled={!mergeTargetClusters.some((cluster) => !mergeSelected.has(cluster.id!))} onChange={() => setMergeTargetId(mergeTargetClusters.find((cluster) => !mergeSelected.has(cluster.id!))?.id ?? null)} /> 合并到已有姓名</span>
                 <select
                   value={mergeTargetId ?? ""}
                   onChange={(event) => setMergeTargetId(event.target.value ? Number(event.target.value) : null)}
-                  className="mt-2 w-full rounded-lg border border-black/10 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-accent-primary/30"
+                  className="mt-2 w-full rounded-lg border border-text-primary/10 bg-bg-secondary px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-accent-primary/30"
                 >
                   <option value="">选择已命名人物…</option>
                   {mergeTargetClusters.filter((cluster) => !mergeSelected.has(cluster.id!)).map((cluster) => (
@@ -819,7 +823,7 @@ export default React.memo(function FaceView(_props: Props) {
               </label>
             </div>
             <div className="mt-5 flex justify-end gap-2">
-              <button disabled={mergeSaving} onClick={() => setMergeConfirmOpen(false)} className="px-4 py-2 rounded-lg text-sm text-text-secondary hover:bg-black/5 disabled:opacity-50">返回选择</button>
+              <button disabled={mergeSaving} onClick={() => setMergeConfirmOpen(false)} className="px-4 py-2 rounded-lg text-sm text-text-secondary hover:bg-text-primary/5 disabled:opacity-50">返回选择</button>
               <button disabled={mergeSaving || (mergeTargetId == null && mergeSelected.size < 2)} onClick={handleMergeSelected} className="px-4 py-2 rounded-lg bg-accent-primary text-white text-sm font-medium disabled:opacity-50">
                 {mergeSaving ? "正在合并…" : "确认合并"}
               </button>
@@ -830,7 +834,7 @@ export default React.memo(function FaceView(_props: Props) {
 
       {autoMergeOpen && (
         <div className="fixed inset-0 z-[1200] bg-black/30 backdrop-blur-sm flex items-center justify-center" onMouseDown={() => !autoMergeRunning && setAutoMergeOpen(false)}>
-          <div className="w-[680px] max-h-[86vh] overflow-y-auto rounded-2xl bg-white p-6 shadow-2xl border border-black/10" onMouseDown={(event) => event.stopPropagation()}>
+          <div className="w-[680px] max-h-[86vh] overflow-y-auto rounded-2xl bg-bg-secondary p-6 shadow-2xl border border-text-primary/10" onMouseDown={(event) => event.stopPropagation()}>
             <h3 className="text-lg font-semibold text-text-primary">自动合并相似人物</h3>
             <p className="text-sm text-text-muted mt-2 leading-6">
               只比较未命名人物。已经命名的人物不会参与，也不会被改动；同一张照片中同时出现的人物不会自动合并。
@@ -854,7 +858,7 @@ export default React.memo(function FaceView(_props: Props) {
                 }}
                 className="mt-3 w-full accent-blue-600"
               />
-              <div className="mt-1 flex justify-between text-[11px] text-text-muted">
+              <div className="mt-1 flex justify-between text-xs text-text-muted">
                 <span>0.60 合并更多</span><span>0.72 平衡</span><span>0.90 更谨慎</span>
               </div>
               <p className="mt-3 text-xs text-text-secondary">
@@ -871,7 +875,7 @@ export default React.memo(function FaceView(_props: Props) {
                   <span className="text-sm font-medium">候选结果（{autoMergeCandidates.length} 组）</span>
                   {autoMergeCandidates.length > 0 && (
                     <button
-                      className="text-xs text-accent-primary"
+                      className="text-xs text-accent-link"
                       onClick={() => setAutoMergeSelected(
                         autoMergeSelected.size === autoMergeCandidates.length
                           ? new Set()
@@ -883,7 +887,7 @@ export default React.memo(function FaceView(_props: Props) {
                   )}
                 </div>
                 {autoMergeCandidates.length === 0 ? (
-                  <div className="rounded-xl border border-black/5 bg-black/[0.025] px-4 py-8 text-center text-sm text-text-muted">
+                  <div className="rounded-xl border border-text-primary/5 bg-black/[0.025] px-4 py-8 text-center text-sm text-text-muted">
                     当前阈值下没有可靠候选。可以稍微降低阈值后重新分析。
                   </div>
                 ) : (
@@ -892,10 +896,10 @@ export default React.memo(function FaceView(_props: Props) {
                       const key = candidateKey(candidate);
                       const selected = autoMergeSelected.has(key);
                       return (
-                        <div key={key} className={`rounded-xl border p-3 ${selected ? "border-accent-primary bg-accent-primary/5" : "border-black/10 bg-white"}`}>
+                        <div key={key} className={`rounded-xl border p-3 ${selected ? "border-accent-primary bg-accent-primary/5" : "border-text-primary/10 bg-bg-secondary"}`}>
                           <div className="flex items-center gap-3">
                             <button
-                              className={`w-5 h-5 shrink-0 rounded border text-xs ${selected ? "bg-accent-primary border-accent-primary text-white" : "border-black/20"}`}
+                              className={`w-5 h-5 shrink-0 rounded border text-xs ${selected ? "bg-accent-primary border-accent-primary text-white" : "border-text-primary/20"}`}
                               onClick={() => setAutoMergeSelected((current) => {
                                 const next = new Set(current);
                                 if (next.has(key)) next.delete(key); else next.add(key);
@@ -915,7 +919,7 @@ export default React.memo(function FaceView(_props: Props) {
                             </div>
                             <button
                               onClick={() => handleRejectAutoMergeCandidate(candidate)}
-                              className="shrink-0 rounded-lg px-2.5 py-1.5 text-xs text-orange-700 hover:bg-orange-50"
+                              className="shrink-0 rounded-lg px-2.5 py-1.5 text-xs text-orange-700 dark:text-orange-300 hover:bg-orange-50"
                             >不是同一人</button>
                           </div>
                         </div>
@@ -926,14 +930,14 @@ export default React.memo(function FaceView(_props: Props) {
               </div>
             )}
             <div className="mt-5 flex justify-end gap-2">
-              <button disabled={autoMergeRunning} onClick={() => setAutoMergeOpen(false)} className="px-4 py-2 rounded-lg text-sm text-text-secondary hover:bg-black/5 disabled:opacity-50">取消</button>
+              <button disabled={autoMergeRunning} onClick={() => setAutoMergeOpen(false)} className="px-4 py-2 rounded-lg text-sm text-text-secondary hover:bg-text-primary/5 disabled:opacity-50">取消</button>
               {!autoMergePreviewed ? (
                 <button disabled={autoMergeRunning} onClick={handlePreviewAutoMerge} className="px-4 py-2 rounded-lg bg-accent-primary text-white text-sm font-medium disabled:opacity-50">
                   {autoMergeRunning ? "正在分析…" : "查找合并候选"}
                 </button>
               ) : (
                 <>
-                  <button disabled={autoMergeRunning} onClick={handlePreviewAutoMerge} className="px-3 py-2 rounded-lg text-sm text-text-secondary hover:bg-black/5 disabled:opacity-50">重新分析</button>
+                  <button disabled={autoMergeRunning} onClick={handlePreviewAutoMerge} className="px-3 py-2 rounded-lg text-sm text-text-secondary hover:bg-text-primary/5 disabled:opacity-50">重新分析</button>
                   <button disabled={autoMergeRunning || autoMergeSelected.size === 0} onClick={handleAutoMerge} className="px-4 py-2 rounded-lg bg-accent-primary text-white text-sm font-medium disabled:opacity-50">
                     {autoMergeRunning ? "正在合并…" : `确认合并 ${autoMergeSelected.size} 组`}
                   </button>
@@ -946,7 +950,7 @@ export default React.memo(function FaceView(_props: Props) {
 
       {suspectedOpen && (
         <div className="fixed inset-0 z-[1200] bg-black/30 backdrop-blur-sm flex items-center justify-center" onMouseDown={() => setSuspectedOpen(false)}>
-          <div className="w-[760px] max-h-[84vh] overflow-y-auto rounded-2xl bg-white p-6 shadow-2xl border border-black/10" onMouseDown={(event) => event.stopPropagation()}>
+          <div className="w-[760px] max-h-[84vh] overflow-y-auto rounded-2xl bg-bg-secondary p-6 shadow-2xl border border-text-primary/10" onMouseDown={(event) => event.stopPropagation()}>
             <div className="flex items-start justify-between">
               <div>
                 <h3 className="text-lg font-semibold text-text-primary">审核疑似误检</h3>
@@ -959,21 +963,21 @@ export default React.memo(function FaceView(_props: Props) {
             ) : (
               <div className="mt-5 grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-3">
                 {suspectedFaces.map((face) => (
-                  <div key={face.id} className="rounded-xl border border-black/10 overflow-hidden bg-white">
+                  <div key={face.id} className="rounded-xl border border-text-primary/10 overflow-hidden bg-bg-secondary">
                     <div className="aspect-square"><SuspectedFaceThumb faceId={face.id} /></div>
                     <div className="p-2">
-                      <div className="text-[11px] text-text-muted">质量 {(face.quality_score * 100).toFixed(0)}% · 检测 {(face.detection_confidence * 100).toFixed(0)}%</div>
+                      <div className="text-xs text-text-muted">质量 {(face.quality_score * 100).toFixed(0)}% · 检测 {(face.detection_confidence * 100).toFixed(0)}%</div>
                       <div className="mt-2 grid grid-cols-2 gap-1">
-                        <button onClick={() => handleKeepSuspectedFace(face.id)} className="rounded-md bg-emerald-50 py-1 text-[11px] text-emerald-700">是人脸</button>
-                        <button onClick={() => handleDeleteSuspectedFace(face.id)} className="rounded-md bg-red-50 py-1 text-[11px] text-red-700">删除</button>
+                        <button onClick={() => handleKeepSuspectedFace(face.id)} className="rounded-md bg-emerald-50 dark:bg-emerald-950/40 py-1 text-xs text-emerald-700 dark:text-emerald-300">是人脸</button>
+                        <button onClick={() => handleDeleteSuspectedFace(face.id)} className="rounded-md bg-red-50 dark:bg-red-950/40 py-1 text-xs text-red-700 dark:text-red-300">删除</button>
                       </div>
                     </div>
                   </div>
                 ))}
               </div>
             )}
-            <div className="mt-5 flex justify-between border-t border-black/5 pt-4">
-              <button disabled={suspectedFaces.length === 0} onClick={handleDeleteAllSuspectedFaces} className="rounded-lg px-3 py-2 text-sm text-red-600 hover:bg-red-50 disabled:opacity-40">全部视为误检</button>
+            <div className="mt-5 flex justify-between border-t border-text-primary/5 pt-4">
+              <button disabled={suspectedFaces.length === 0} onClick={handleDeleteAllSuspectedFaces} className="rounded-lg px-3 py-2 text-sm text-red-600 dark:text-red-300 hover:bg-red-50 disabled:opacity-40">全部视为误检</button>
               <button onClick={() => setSuspectedOpen(false)} className="rounded-lg bg-accent-primary px-4 py-2 text-sm text-white">完成</button>
             </div>
           </div>

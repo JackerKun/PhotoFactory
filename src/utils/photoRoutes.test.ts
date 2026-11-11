@@ -21,3 +21,8 @@ describe("photoRouteForTag", () => {
     expect(photoFilterFromSearchParams(encoded)).toEqual(filter);
   });
 });
+
+  it("preserves the no-GPS filter through URL serialization", () => {
+    const params = photoSearchParamsFromFilter({ has_gps: false });
+    expect(photoFilterFromSearchParams(params).has_gps).toBe(false);
+  });

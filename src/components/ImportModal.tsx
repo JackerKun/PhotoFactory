@@ -3,6 +3,7 @@ import React, { useState, useRef, useCallback, useEffect } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { createProject, openProject, scanProject, updateExtensions, getProject, getRecentProjects, removeRecentProject } from "../api/tauri";
 import { useStore } from "../hooks/usePhotos";
+import Icon from "./Icon";
 import FormatFilterPanel from "./FormatFilterPanel";
 
 interface Props { onImported: () => void; onClose?: () => void }
@@ -31,10 +32,10 @@ export default React.memo(function ImportModal({ onImported, onClose }: Props) {
     setLoading(true);
     setError(null);
     try {
-      setProgress("Opening project...");
+      setProgress("正在打开照片库…");
       const project = await openProject(path);
       setProject(project);
-      setProgress("Loading photos...");
+      setProgress("正在加载照片…");
       setTimeout(() => onImported(), 500);
     } catch (err: any) {
       setError(err.toString());
@@ -73,7 +74,7 @@ export default React.memo(function ImportModal({ onImported, onClose }: Props) {
     const selected = await open({
       directory: true,
       multiple: false,
-      title: "Select Photo Folder",
+      title: "选择照片文件夹",
     });
     if (selected && typeof selected === "string") {
       setRootPath(selected);
@@ -101,12 +102,12 @@ export default React.memo(function ImportModal({ onImported, onClose }: Props) {
     let ok = false;
     try {
       if (mode === "create") {
-        setProgress("Creating project...");
-        const project = await createProject(rootPath.trim(), name.trim() || "My Photos");
+        setProgress("正在创建照片库…");
+        const project = await createProject(rootPath.trim(), name.trim() || "我的照片");
         setProject(project);
 
         if (extensions && extensions.length > 0) {
-          setProgress("Saving format settings...");
+          setProgress("正在保存格式设置…");
           const updated = await updateExtensions(extensions);
           setProject(updated);
         }
@@ -120,12 +121,13 @@ export default React.memo(function ImportModal({ onImported, onClose }: Props) {
 
         // Load photos into the store after scan completes — FilterSync's effect
         // fired earlier while scan was still running, so photos were empty.
-        useStore.getState().loadPhotos();
+        setProject({ ...(useStore.getState().project ?? project), total_photos: count });
+        void useStore.getState().loadPhotos();
       } else {
-        setProgress("Opening project...");
+        setProgress("正在打开照片库…");
         const project = await openProject(rootPath.trim());
         setProject(project);
-        setProgress("Loading photos...");
+        setProgress("正在加载照片…");
       }
       ok = true;
     } catch (err: any) {
@@ -167,7 +169,7 @@ export default React.memo(function ImportModal({ onImported, onClose }: Props) {
           <div className="mb-4">
             <label className="block text-sm text-text-secondary mb-1">项目名称</label>
             <input value={name} onChange={(e) => setName(e.target.value)}
-              placeholder="My Photos"
+              placeholder="我的照片"
               className="w-full bg-surface-primary border border-surface-secondary rounded-lg px-3 py-2 text-text-primary text-sm" />
           </div>
         )}
@@ -180,13 +182,13 @@ export default React.memo(function ImportModal({ onImported, onClose }: Props) {
               className="flex-1 bg-surface-primary border border-surface-secondary rounded-lg px-3 py-2 text-text-primary text-sm" />
             <button onClick={handlePickFolder}
               className="bg-surface-primary border border-surface-secondary rounded-lg px-3 py-2 text-text-primary text-sm hover:bg-accent-primary/20">
-              📁
+              <Icon name="folder" size={20} />
             </button>
           </div>
         </div>
 
         {loading && (
-          <div className="mb-4 p-2 bg-accent-primary/10 border border-accent-primary/30 rounded text-accent-primary text-sm">
+          <div className="mb-4 p-2 bg-accent-primary/10 border border-accent-primary/30 rounded text-accent-link text-sm">
             <div className="font-medium">{progress}</div>
             {photoCount > 0 && (
               <div className="mt-1 text-xs text-text-muted">

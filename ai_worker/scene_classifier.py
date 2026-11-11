@@ -94,7 +94,6 @@ class SceneClassifier:
     """Classifies scenes using a ResNet-50 Places365 model."""
 
     def __init__(self, model_path: Optional[str] = None):
-        import onnxruntime as ort
         models_dir = os.environ.get(
             "AI_MODELS_DIR", os.path.join(os.path.dirname(__file__), "models")
         )
@@ -105,21 +104,8 @@ class SceneClassifier:
                 f"Scene classifier model not found at {path}. Run download_models.py first."
             )
 
-        # Use CoreML on macOS for near-zero CPU usage; fall back to CPU with limited threads
-        providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
-        session_options = ort.SessionOptions()
-        thread_count = int(os.environ.get(
-            "PHOTFACTORY_AI_THREADS", max(2, min(6, (os.cpu_count() or 4) // 2))
-        ))
-        session_options.inter_op_num_threads = max(1, min(2, thread_count // 2))
-        session_options.intra_op_num_threads = thread_count
-        try:
-            self.session = ort.InferenceSession(path, sess_options=session_options, providers=providers)
-        except Exception as exc:
-            print(f"CoreML initialization failed; using bounded CPU inference: {exc}", flush=True)
-            self.session = ort.InferenceSession(
-                path, sess_options=session_options, providers=["CPUExecutionProvider"]
-            )
+        from inference_runtime import InferenceModel
+        self.session = InferenceModel("scene", path)
         self.input_name = self.session.get_inputs()[0].name
 
     def _preprocess(self, image: Image.Image) -> np.ndarray:

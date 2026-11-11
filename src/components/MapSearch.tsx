@@ -90,11 +90,11 @@ export default function MapSearch({
       </div>
 
       {open && (searching || searched || error) && (
-        <div className="absolute left-0 right-0 top-full z-[3000] mt-1 max-h-80 overflow-y-auto rounded-xl border border-black/10 bg-white p-1.5 text-left shadow-2xl">
+        <div className="absolute left-0 right-0 top-full z-[3000] mt-1 max-h-80 overflow-y-auto rounded-xl border border-text-primary/10 bg-bg-secondary p-1.5 text-left shadow-2xl">
           {searching ? (
             <p className="px-3 py-4 text-center text-xs text-text-muted">正在查找完整地址…</p>
           ) : error ? (
-            <p className="px-3 py-3 text-xs text-red-600">{error}</p>
+            <p className="px-3 py-3 text-xs text-red-600 dark:text-red-300">{error}</p>
           ) : results.length === 0 ? (
             <p className="px-3 py-4 text-center text-xs text-text-muted">没有找到匹配地址，请补充省、市或区县后重试</p>
           ) : (
@@ -107,10 +107,10 @@ export default function MapSearch({
                   onClick={() => choose(result)}
                   className="flex w-full items-start gap-2 rounded-lg px-3 py-2.5 text-left hover:bg-blue-50 focus:bg-blue-50"
                 >
-                  <svg className="mt-0.5 shrink-0 text-accent-primary" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><path d="M20 10c0 5-8 12-8 12S4 15 4 10a8 8 0 1 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/></svg>
+                  <svg className="mt-0.5 shrink-0 text-accent-link" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><path d="M20 10c0 5-8 12-8 12S4 15 4 10a8 8 0 1 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/></svg>
                   <span className="min-w-0">
                     <span className="block whitespace-normal text-xs font-medium leading-5 text-gray-800">{result.display_name}</span>
-                    <span className="block text-[10px] tabular-nums text-gray-400">{result.lat.toFixed(6)}, {result.lng.toFixed(6)}</span>
+                    <span className="block text-xs tabular-nums text-gray-400">{result.lat.toFixed(6)}, {result.lng.toFixed(6)}</span>
                   </span>
                 </button>
               ))}

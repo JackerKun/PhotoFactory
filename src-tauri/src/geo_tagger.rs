@@ -131,6 +131,16 @@ impl GeoTagger {
     ///
     /// Returns the number of photos successfully tagged.
     pub fn tag_photos(&self, conn: &Connection, batch_size: usize) -> AppResult<usize> {
+        self.tag_photos_with_progress(conn, batch_size, false, |_, _| Ok(true))
+    }
+
+    pub fn tag_photos_with_progress(
+        &self,
+        conn: &Connection,
+        batch_size: usize,
+        fail_fast: bool,
+        mut progress: impl FnMut(usize, usize) -> AppResult<bool>,
+    ) -> AppResult<usize> {
         let query = "
             SELECT id, latitude, longitude FROM photos
             WHERE latitude IS NOT NULL AND longitude IS NOT NULL AND deleted = 0
@@ -152,11 +162,18 @@ impl GeoTagger {
             .filter_map(|r| r.ok())
             .collect();
 
+        drop(stmt);
+        let total = rows.len();
         let mut tagged = 0;
+        let mut consecutive_errors = 0;
+        if !progress(0, total)? {
+            return Ok(tagged);
+        }
 
-        for (photo_id, lat, lng) in rows {
+        for (index, (photo_id, lat, lng)) in rows.into_iter().enumerate() {
             match self.reverse_geocode(lat, lng) {
                 Ok(label) => {
+                    consecutive_errors = 0;
                     let classification = AiClassification {
                         id: None,
                         photo_id,
@@ -171,11 +188,20 @@ impl GeoTagger {
                     }
                 }
                 Err(e) => {
+                    consecutive_errors += 1;
+                    if fail_fast && consecutive_errors >= 2 {
+                        return Err(AppError::Internal(format!(
+                            "地点标签查询连续失败，已结束本次联网查询：{e}"
+                        )));
+                    }
                     eprintln!(
                         "GeoTagger: failed to geocode photo {} ({}, {}): {}",
                         photo_id, lat, lng, e
                     );
                 }
+            }
+            if !progress(index + 1, total)? {
+                break;
             }
         }
 

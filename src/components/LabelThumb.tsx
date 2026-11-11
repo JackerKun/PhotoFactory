@@ -61,7 +61,7 @@ export default React.memo(function LabelThumb({ label, previewPath, size = "smal
   return (
     <div
       ref={hostRef}
-      className={size === "large" ? "w-full h-full flex items-center justify-center text-white text-3xl font-bold select-none" : "w-6 h-6 rounded flex-shrink-0 flex items-center justify-center text-white text-[10px] font-bold select-none"}
+      className={size === "large" ? "w-full h-full flex items-center justify-center text-white text-3xl font-bold select-none" : "w-6 h-6 rounded flex-shrink-0 flex items-center justify-center text-white text-xs font-bold select-none"}
       style={{ backgroundColor: `hsl(${hue}, 50%, 45%)` }}
     >
       ?

@@ -20,7 +20,7 @@ export function photoFilterFromSearchParams(params: URLSearchParams): PhotoFilte
     directory: params.get("dir") || undefined,
     tag: params.get("tag") || undefined,
     person_id: params.get("person") ? Number(params.get("person")) : undefined,
-    has_gps: params.get("gps") === "true" ? true : undefined,
+    has_gps: params.get("gps") === "true" ? true : params.get("gps") === "false" ? false : undefined,
     has_favorite: params.get("fav") === "true" ? true : params.get("fav") === "false" ? false : undefined,
     year: params.get("year") ? Number(params.get("year")) : undefined,
     month: params.get("month") ? Number(params.get("month")) : undefined,

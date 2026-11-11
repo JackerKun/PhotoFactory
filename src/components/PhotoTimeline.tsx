@@ -173,7 +173,7 @@ export default React.memo(function PhotoTimeline() {
               type="button"
               onClick={() => selectTime(undefined, undefined)}
               className={`mb-1 flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-sm transition-colors ${
-                !filter.year ? "bg-accent-primary/10 text-accent-primary" : "hover:bg-surface-primary"
+                !filter.year ? "bg-accent-primary/10 text-accent-link" : "hover:bg-surface-primary"
               }`}
             >
               <span>全部时间</span>
@@ -195,7 +195,7 @@ export default React.memo(function PhotoTimeline() {
                     onClick={() => selectTime(year, undefined)}
                     className={`flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-sm font-semibold transition-colors ${
                       filter.year === year && !filter.month
-                        ? "bg-accent-primary/10 text-accent-primary"
+                        ? "bg-accent-primary/10 text-accent-link"
                         : "hover:bg-surface-primary"
                     }`}
                   >

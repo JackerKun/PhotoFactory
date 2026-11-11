@@ -39,7 +39,7 @@ export default function LabelGroup({ node, onSelectTag, onRename }: Props) {
           onClick={() => onRename(node.label)}
           className="text-text-muted hover:text-text-primary text-xs opacity-0 group-hover:opacity-100 transition-opacity"
         >
-          Edit
+          编辑
         </button>
       </div>
 
@@ -63,7 +63,7 @@ export default function LabelGroup({ node, onSelectTag, onRename }: Props) {
                 onClick={() => onRename(child.label)}
                 className="text-text-muted hover:text-text-primary text-xs opacity-0 group-hover:opacity-100 transition-opacity"
               >
-                Edit
+                编辑
               </button>
             </div>
           ))}

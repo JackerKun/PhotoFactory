@@ -126,28 +126,6 @@ def compute_face_quality(
     return float(quality)
 
 
-def _complete_link_labels(embeddings: np.ndarray, threshold: float) -> np.ndarray:
-    """Cluster without DBSCAN's transitive-chain failure mode.
-
-    ArcFace embeddings are unit vectors and ``1 - cosine_similarity`` is their
-    cosine distance.  Complete-link clustering only joins two groups when every
-    cross-group pair is close enough, so a sequence of merely similar faces can
-    no longer collapse an entire library into one person.
-    """
-    if len(embeddings) == 0:
-        return np.array([], dtype=int)
-    if len(embeddings) == 1:
-        return np.array([0], dtype=int)
-
-    safe_threshold = float(max(0.45, min(0.8, threshold)))
-    return AgglomerativeClustering(
-        n_clusters=None,
-        metric="cosine",
-        linkage="complete",
-        distance_threshold=1.0 - safe_threshold,
-    ).fit_predict(embeddings)
-
-
 def _photo_id_from_embedding_name(filename: str):
     """Return the photo id encoded by Rust's ``{photo_id:06x}{index:02x}`` name."""
     try:
@@ -181,6 +159,9 @@ def plan_automatic_cluster_merges(
     members = {}
     photo_ids = {}
     for filename, cluster_id in assignments.items():
+        photo_id = _photo_id_from_embedding_name(filename)
+        if photo_id is not None:
+            photo_ids.setdefault(int(cluster_id), set()).add(photo_id)
         path = os.path.join(embeddings_dir, filename)
         try:
             vector = np.asarray(np.load(path), dtype=np.float32)
@@ -190,9 +171,6 @@ def plan_automatic_cluster_merges(
         if not np.isfinite(norm) or norm <= 0:
             continue
         members.setdefault(int(cluster_id), []).append(vector / norm)
-        photo_id = _photo_id_from_embedding_name(filename)
-        if photo_id is not None:
-            photo_ids.setdefault(int(cluster_id), set()).add(photo_id)
 
     cluster_ids = sorted(members)
     if len(cluster_ids) < 2:
@@ -324,17 +302,6 @@ def plan_automatic_cluster_merges(
     return details
 
 
-def _apply_planned_merges(assignments: dict, merge_groups: list) -> dict:
-    remap = {}
-    for group in merge_groups:
-        target = min(group)
-        remap.update({cluster_id: target for cluster_id in group})
-    return {
-        filename: remap.get(cluster_id, cluster_id)
-        for filename, cluster_id in assignments.items()
-    }
-
-
 def cluster_faces_v2(
     embeddings_dir: str,
     existing_clusters: dict = None,
@@ -342,204 +309,173 @@ def cluster_faces_v2(
     must_links: list = None,
     cannot_links: list = None,
     candidate_files: list = None,
+    memberships: dict = None,
+    qualities: dict = None,
+    review_files: list = None,
 ) -> dict:
-    """Incremental complete-link clustering with constraint support.
+    """Compare against bounded prototypes; enforce constraints using all memberships."""
+    prototypes = existing_clusters or {}
+    results = dict(prototypes)
+    occupied = {}
+    members = dict(prototypes)
+    members.update(memberships or {})
+    for filename, person in members.items():
+        occupied.setdefault(person, {}).setdefault(_photo_id_from_embedding_name(filename), set()).add(filename)
 
-    existing_clusters: {filename: cluster_id} from previous runs
-    must_links: [(face_key_1, face_key_2), ...]
-    cannot_links: same format
-    Returns: {filename: cluster_id}
-    """
-    if candidate_files is None:
-        npy_files = [f for f in os.listdir(embeddings_dir) if f.endswith('.npy')]
-    else:
-        # Incremental runs only load new faces and a few persisted prototypes
-        # per existing person, keeping memory bounded for very large libraries.
-        npy_files = sorted(set(candidate_files) | set((existing_clusters or {}).keys()))
-        npy_files = [f for f in npy_files if f.endswith('.npy')]
-    if not npy_files:
-        return {}
+    def links(pairs):
+        mapping = {}
+        for a, b in pairs or []:
+            left, right = f"{int(a):08x}.npy", f"{int(b):08x}.npy"
+            mapping.setdefault(left, set()).add(right)
+            mapping.setdefault(right, set()).add(left)
+        return mapping
 
-    embeddings = []
-    file_names = []
-    for f in sorted(npy_files):
-        try:
-            emb = np.load(os.path.join(embeddings_dir, f))
-            embeddings.append(emb)
-            file_names.append(f)
-        except Exception:
+    must, cannot = links(must_links), links(cannot_links)
+    quality = qualities or {}
+    threshold = float(np.clip(threshold, 0.45, 0.85))
+
+    def allowed(filename, person, manual=False):
+        if any(members.get(other) == person for other in cannot.get(filename, ())):
+            return False
+        photo = _photo_id_from_embedding_name(filename)
+        same_photo = occupied.get(person, {}).get(photo, ())
+        return photo is None or not same_photo or (
+            manual and set(same_photo).issubset(must.get(filename, ()))
+        )
+
+    def assign(filename, person):
+        results[filename] = members[filename] = person
+        occupied.setdefault(person, {}).setdefault(_photo_id_from_embedding_name(filename), set()).add(filename)
+
+    files = candidate_files if candidate_files is not None else os.listdir(embeddings_dir)
+    vectors = {}
+    for filename in sorted(set(files) | set(prototypes)):
+        if not filename.endswith(".npy") or (filename in members and filename not in prototypes):
             continue
+        try:
+            vector = np.asarray(np.load(os.path.join(embeddings_dir, filename)), dtype=np.float32)
+            norm = np.linalg.norm(vector)
+            if vector.ndim == 1 and np.isfinite(norm) and norm > 0:
+                vectors[filename] = vector / norm
+        except (ValueError, OSError):
+            continue
+    candidates = [filename for filename in vectors if filename not in members]
+    pending = set()
+    seeds = {}
+    for filename, person in prototypes.items():
+        if filename in vectors:
+            seeds.setdefault(person, []).append(vectors[filename])
+    people = sorted(seeds)
 
-    if not embeddings:
-        return {}
-
-    X = np.array(embeddings)
-    n_faces = len(X)
-
-    face_key_to_idx = {f: i for i, f in enumerate(file_names)}
-    must_link_map = {}
-    cannot_link_map = {}
-
-    def face_key_to_filename(key):
-        return f"{int(key):08x}.npy"
-
-    if must_links:
-        cluster_members = {}
-        if existing_clusters:
-            for fname, cid in existing_clusters.items():
-                cluster_members.setdefault(cid, set()).add(fname)
-
-        for key1, key2 in must_links:
-            f1, f2 = face_key_to_filename(key1), face_key_to_filename(key2)
-            idx1 = face_key_to_idx.get(f1)
-            idx2 = face_key_to_idx.get(f2)
-            if idx1 is None or idx2 is None:
+    # Resolve explicit links first, including links to non-prototype faces.
+    while True:
+        changed = False
+        for filename in candidates:
+            if filename in members:
                 continue
-            if existing_clusters and f1 in existing_clusters:
-                must_link_map[idx2] = existing_clusters[f1]
-            if existing_clusters and f2 in existing_clusters:
-                must_link_map[idx1] = existing_clusters[f2]
+            targets = {members[other] for other in must.get(filename, ()) if other in members}
+            if len(targets) == 1 and allowed(filename, next(iter(targets)), manual=True):
+                assign(filename, next(iter(targets)))
+                changed = True
+        if not changed:
+            break
 
-    if cannot_links and existing_clusters:
-        for key1, key2 in cannot_links:
-            f1, f2 = face_key_to_filename(key1), face_key_to_filename(key2)
-            idx1 = face_key_to_idx.get(f1)
-            idx2 = face_key_to_idx.get(f2)
-            if idx1 is None or idx2 is None:
+    remaining = [filename for filename in candidates if filename not in members]
+    if remaining and people:
+        matrix = np.stack([vectors[name] for name in remaining])
+        centers, references, starts = [], [], []
+        for person in people:
+            refs = np.stack(seeds[person])
+            centroid = refs.mean(axis=0)
+            centers.append(centroid / max(np.linalg.norm(centroid), 1e-12))
+            starts.append(len(references))
+            references.extend(refs)
+        nearest = np.maximum.reduceat(matrix @ np.stack(references).T, starts, axis=1)
+        scores = 0.72 * (matrix @ np.stack(centers).T) + 0.28 * nearest
+        # Give the strongest face first choice when a photo has competing faces.
+        for row in np.argsort(-scores.max(axis=1), kind="stable"):
+            name = remaining[row]
+            ranked = np.argsort(-scores[row], kind="stable")
+            viable = []
+            for pos in ranked:
+                if allowed(name, people[pos]):
+                    viable.append(pos)
+                    if len(viable) == 2:
+                        break
+            if any(other in members for other in must.get(name, ())):
+                pending.add(name)
                 continue
-            if f1 in existing_clusters:
-                cannot_link_map.setdefault(idx1, set()).add(
-                    existing_clusters[f2] if f2 in existing_clusters else None
-                )
-            if f2 in existing_clusters:
-                cannot_link_map.setdefault(idx2, set()).add(
-                    existing_clusters[f1] if f1 in existing_clusters else None
-                )
-
-    cluster_centroids = {}
-    cluster_prototypes = {}
-    cluster_sizes = {}
-    if existing_clusters:
-        cluster_members = {}
-        for fname, cid in existing_clusters.items():
-            if fname in face_key_to_idx:
-                cluster_members.setdefault(cid, []).append(face_key_to_idx[fname])
-
-        for cid, indices in cluster_members.items():
-            embs = X[indices]
-            centroid = np.mean(embs, axis=0)
-            centroid /= max(np.linalg.norm(centroid), 1e-12)
-            cluster_centroids[cid] = centroid
-            cluster_sizes[cid] = len(embs)
-            chosen = [int(np.argmax(embs @ centroid))]
-            while len(chosen) < min(3, len(embs)):
-                similarity_to_chosen = embs @ embs[chosen].T
-                next_index = int(np.argmin(np.max(similarity_to_chosen, axis=1)))
-                if next_index in chosen:
-                    break
-                chosen.append(next_index)
-            cluster_prototypes[cid] = embs[chosen]
-
-    if existing_clusters and len(existing_clusters) > 0:
-        results = dict(existing_clusters)
-        matched_files = set(existing_clusters)
-
-        # Compute every new-face/centroid similarity in one BLAS-backed matrix
-        # operation. The previous nested Python loop scaled as faces * people and
-        # dominated clustering time for larger libraries.
-        candidate_indices = [
-            i for i, fname in enumerate(file_names) if fname not in existing_clusters
-        ]
-        cluster_ids = list(cluster_centroids)
-        similarity_matrix = None
-        if candidate_indices and cluster_ids:
-            candidate_matrix = X[candidate_indices]
-            centroid_matrix = np.stack([cluster_centroids[cid] for cid in cluster_ids])
-            centroid_scores = cosine_sim_matrix(candidate_matrix, centroid_matrix)
-            prototype_vectors = []
-            prototype_cluster_positions = []
-            for cluster_position, cluster_id in enumerate(cluster_ids):
-                for prototype in cluster_prototypes[cluster_id]:
-                    prototype_vectors.append(prototype)
-                    prototype_cluster_positions.append(cluster_position)
-            prototype_raw = cosine_sim_matrix(candidate_matrix, np.stack(prototype_vectors))
-            prototype_scores = np.full_like(centroid_scores, -1.0)
-            for prototype_position, cluster_position in enumerate(prototype_cluster_positions):
-                prototype_scores[:, cluster_position] = np.maximum(
-                    prototype_scores[:, cluster_position], prototype_raw[:, prototype_position]
-                )
-            similarity_matrix = 0.78 * centroid_scores + 0.22 * prototype_scores
-
-        for row, i in enumerate(candidate_indices):
-            fname = file_names[i]
-
-            if i in must_link_map:
-                results[fname] = must_link_map[i]
-                matched_files.add(fname)
+            if not viable:
+                if scores[row, ranked[0]] >= threshold - 0.04:
+                    pending.add(name)
                 continue
-            if similarity_matrix is None:
-                continue
+            best = viable[0]
+            score = scores[row, best]
+            gap = score - scores[row, viable[1]] if len(viable) > 1 else 2.0
+            # Don't fall through to the second person if the closest identity
+            # is already in this photo. Keep both detections reviewable.
+            blocked_best = ranked[0] != best and scores[row, ranked[0]] >= threshold
+            effective = threshold + (0.05 if 0 < quality.get(name, 1) < 0.55 else 0)
+            if score >= effective and gap >= 0.06 and not blocked_best:
+                assign(name, people[best])
+            elif score >= threshold - 0.04 or blocked_best:
+                pending.add(name)
 
-            scores = similarity_matrix[row]
-            # Constraints are uncommon, so only constrained faces need a sorted
-            # fallback search. Everyone else uses the O(C) argmax fast path.
-            blocked = cannot_link_map.get(i, set())
-            if blocked:
-                choices = np.argsort(scores)[::-1]
-                best_pos = next(
-                    (int(pos) for pos in choices if cluster_ids[int(pos)] not in blocked),
-                    None,
-                )
-            else:
-                best_pos = int(np.argmax(scores))
+    remaining = [name for name in candidates if name not in members]
+    seed_names = [name for name in remaining if name not in pending]
+    labels = []
+    if len(seed_names) > 1:
+        matrix = np.stack([vectors[name] for name in seed_names])
+        distances = np.clip(1 - matrix @ matrix.T, 0, 2)
+        photo_ids = np.array([_photo_id_from_embedding_name(name) or 0 for name in seed_names])
+        low_quality = np.array([0 < quality.get(name, 1) < 0.55 for name in seed_names])
+        distances += 0.05 * (low_quality[:, None] | low_quality[None, :])
+        distances[(photo_ids[:, None] == photo_ids[None, :]) & (photo_ids[:, None] > 0)] = 2
+        positions = {name: idx for idx, name in enumerate(seed_names)}
+        for mapping, distance in ((must, 0), (cannot, 2)):
+            for left, others in mapping.items():
+                if left not in positions:
+                    continue
+                for right in others:
+                    if right in positions:
+                        distances[positions[left], positions[right]] = distance
+        # If two plausible matches contradict each other, don't let their
+        # nearly tied bridge decide which of them gets the face.
+        if len(seed_names) >= 3:
+            np.fill_diagonal(distances, 2)
+            closest = np.argpartition(distances, 1, axis=1)[:, :2]
+            for i, (left, right) in enumerate(closest):
+                if (max(distances[i, left], distances[i, right]) < 1 - threshold
+                    and abs(distances[i, left] - distances[i, right]) < 0.045
+                    and distances[left, right] >= 1 - threshold
+                    and not must.get(seed_names[i])):
+                    pending.add(seed_names[i])
+            for name in pending.intersection(positions):
+                i = positions[name]
+                distances[i, :] = distances[:, i] = 2
+        np.fill_diagonal(distances, 0)
+        labels = AgglomerativeClustering(
+            n_clusters=None, metric="precomputed", linkage="complete",
+            distance_threshold=1 - threshold,
+        ).fit_predict(distances)
+    elif seed_names:
+        labels = [0]
 
-            effective_threshold = threshold
-            if best_pos is not None and cluster_sizes[cluster_ids[best_pos]] >= 5:
-                effective_threshold = max(0.45, threshold - 0.015)
-            if best_pos is not None and float(scores[best_pos]) >= effective_threshold:
-                results[fname] = cluster_ids[best_pos]
-                matched_files.add(fname)
-
-        unmatched_indices = [
-            i for i in range(n_faces) if file_names[i] not in matched_files
-        ]
-        if unmatched_indices:
-            X_unmatched = X[unmatched_indices]
-            if len(X_unmatched) >= 2:
-                labels = _complete_link_labels(X_unmatched, threshold)
-
-                next_cluster_id = max(results.values(), default=-1) + 1
-                label_to_cluster = {}
-                for local_idx, global_idx in enumerate(unmatched_indices):
-                    label = int(labels[local_idx])
-                    if label not in label_to_cluster:
-                        label_to_cluster[label] = next_cluster_id
-                        next_cluster_id += 1
-                    results[file_names[global_idx]] = label_to_cluster[label]
-            else:
-                next_cluster_id = max(results.values(), default=-1) + 1
-                results[file_names[unmatched_indices[0]]] = next_cluster_id
-
-        return results
-
-    # Fresh clustering starts with conservative face-level seeds, then joins
-    # well-supported seed groups by centroid.  This avoids both DBSCAN chaining
-    # and the old behaviour where one unusual pose permanently split a person.
-    labels = _complete_link_labels(X, threshold)
-
-    results = {}
-    next_cluster_id = 0
-    label_to_cluster = {}
-    for i, raw_label in enumerate(labels):
-        label = int(raw_label)
-        if label not in label_to_cluster:
-            label_to_cluster[label] = next_cluster_id
-            next_cluster_id += 1
-        results[file_names[i]] = label_to_cluster[label]
-
-    merge_groups = plan_automatic_cluster_merges(
-        embeddings_dir,
-        results,
-        threshold=max(0.72, threshold + 0.12),
-    )
-    return _apply_planned_merges(results, merge_groups)
+    next_id = max(members.values(), default=-1) + 1
+    new_labels = {}
+    label_counts = dict(zip(*np.unique(labels, return_counts=True)))
+    for name, label in zip(seed_names, labels):
+        if label_counts[label] == 1 and 0 < quality.get(name, 1) < 0.55:
+            pending.add(name)
+        if name in pending:
+            continue
+        if label not in new_labels:
+            new_labels[label] = next_id
+            next_id += 1
+        assign(name, new_labels[label])
+    for name in sorted(pending):
+        assign(name, next_id)
+        next_id += 1
+    if review_files is not None:
+        review_files.extend(sorted(pending))
+    return results

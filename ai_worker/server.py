@@ -1,14 +1,16 @@
 """PhotoFactory AI Worker - HTTP server for face detection and scene classification."""
 
 import os
+import time
 import sys
 import subprocess
 import tempfile
+from threading import Lock
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import numpy as np
 import uvicorn
 
@@ -99,6 +101,7 @@ class ClassifyResponse(BaseModel):
 class DetectFacesRequest(BaseModel):
     paths: List[str]
     cache_dir: str = ""  # If provided, save embeddings to disk and return paths
+    previews: Dict[str, str] = Field(default_factory=dict)
 
 class DetectedFace(BaseModel):
     bbox: List[int]
@@ -140,6 +143,8 @@ class ClusterFacesV2Request(BaseModel):
     must_links: Optional[List[Tuple[int, int]]] = None
     cannot_links: Optional[List[Tuple[int, int]]] = None
     candidate_files: Optional[List[str]] = None
+    memberships: Optional[Dict[str, int]] = None
+    qualities: Optional[Dict[str, float]] = None
 
 class AutomaticMergeRequest(BaseModel):
     embeddings_dir: str
@@ -153,6 +158,15 @@ class FaceQualityRequest(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+
+_last_face_batch = {}
+_last_cluster_ms = None
+
+@app.get("/runtime")
+async def runtime_info():
+    from inference_runtime import available_providers, loaded_providers
+    return {"available": available_providers(), "models": loaded_providers(),
+            "face_batch": _last_face_batch, "cluster_ms": _last_cluster_ms}
 
 # --- Lazy model loading ---
 
@@ -176,38 +190,50 @@ def _check_models():
         )
 
 
+_face_detector_lock = Lock()
+
+
 def load_face_detector():
     global _face_detector
-    if _face_detector is None:
-        _check_models()
-        from face_detector import FaceDetector
-        _face_detector = FaceDetector()
-        print("Face detector loaded", flush=True)
-    return _face_detector
+    with _face_detector_lock:
+        if _face_detector is None:
+            _check_models()
+            from face_detector import FaceDetector
+            _face_detector = FaceDetector()
+            print("Face detector loaded", flush=True)
+        return _face_detector
+
+
+_scene_classifier_lock = Lock()
 
 
 def load_scene_classifier():
     global _scene_classifier
-    if _scene_classifier is None:
-        _check_models()
-        from scene_classifier import SceneClassifier
-        _scene_classifier = SceneClassifier()
-        print("Scene classifier loaded", flush=True)
-    return _scene_classifier
+    with _scene_classifier_lock:
+        if _scene_classifier is None:
+            _check_models()
+            from scene_classifier import SceneClassifier
+            _scene_classifier = SceneClassifier()
+            print("Scene classifier loaded", flush=True)
+        return _scene_classifier
+
+
+_semantic_classifier_lock = Lock()
 
 
 def load_semantic_classifier():
     """Load optional CLIP semantics without making legacy classification fail."""
     global _semantic_classifier, _semantic_unavailable
-    if _semantic_classifier is None and not _semantic_unavailable:
-        try:
-            from semantic_classifier import SemanticClassifier
-            _semantic_classifier = SemanticClassifier()
-            print("Semantic classifier loaded", flush=True)
-        except Exception as error:
-            _semantic_unavailable = True
-            print(f"Semantic classifier unavailable; continuing with scene labels: {error}", flush=True)
-    return _semantic_classifier
+    with _semantic_classifier_lock:
+        if _semantic_classifier is None and not _semantic_unavailable:
+            try:
+                from semantic_classifier import SemanticClassifier
+                _semantic_classifier = SemanticClassifier()
+                print("Semantic classifier loaded", flush=True)
+            except Exception as error:
+                _semantic_unavailable = True
+                print(f"Semantic classifier unavailable; continuing with scene labels: {error}", flush=True)
+        return _semantic_classifier
 
 
 # --- Endpoints ---
@@ -218,7 +244,9 @@ async def health() -> HealthResponse:
 
 
 @app.post("/classify")
-async def classify(req: ClassifyRequest) -> ClassifyResponse:
+def classify(req: ClassifyRequest) -> ClassifyResponse:
+    from image_input import open_ai_image
+
     try:
         classifier = load_scene_classifier()
         semantic_classifier = load_semantic_classifier()
@@ -233,8 +261,7 @@ async def classify(req: ClassifyRequest) -> ClassifyResponse:
             try:
                 jpeg_path = _convert_for_ai(path)
                 process_path = jpeg_path or path
-                from PIL import Image
-                with Image.open(process_path) as image:
+                with open_ai_image(process_path) as (image, _):
                     rgb = image.convert("RGB")
                     tags = classifier.classify_image(rgb)
                     if semantic_classifier is not None:
@@ -259,11 +286,15 @@ async def classify(req: ClassifyRequest) -> ClassifyResponse:
 
 
 @app.post("/detect_faces")
-async def detect_faces(req: DetectFacesRequest) -> DetectFacesResponse:
+def detect_faces(req: DetectFacesRequest) -> DetectFacesResponse:
+    global _last_face_batch
+    start = time.perf_counter()
     try:
         detector = load_face_detector()
         if req.cache_dir:
             os.makedirs(req.cache_dir, exist_ok=True)
+
+        timings = [{} for _ in req.paths]
 
         def process_photo(item):
             result_index, path = item
@@ -271,15 +302,32 @@ async def detect_faces(req: DetectFacesRequest) -> DetectFacesResponse:
                 return FaceResult(path=path, faces=[], error="file not found")
             jpeg_path = None
             try:
-                jpeg_path = _convert_for_ai(path)
-                process_path = jpeg_path or path
-                faces = detector.detect(process_path)
+                conversion_ms = 0.0
+                ext = os.path.splitext(path)[1].lower()
+                preview = req.previews.get(path)
+                # Decode HEIF directly, so a cached Windows preview can skip
+                # opening the full raster for photos with no detected faces.
+                # macOS builds those previews with ImageIO, which may rotate
+                # them differently. Its HEIF path uses the source alone.
+                faces = None
+                if ext in HEIF_EXTENSIONS:
+                    try:
+                        from pillow_heif import register_heif_opener
+                        register_heif_opener()
+                        faces = detector.detect(path, preview if sys.platform == "win32" else None, timings[result_index])
+                    except (OSError, ValueError):
+                        pass  # use the existing HEIF conversion/decoder fallback
+                if faces is None:
+                    conversion_start = time.perf_counter()
+                    jpeg_path = _convert_for_ai(path)
+                    conversion_ms = 1000 * (time.perf_counter() - conversion_start)
+                    faces = detector.detect(jpeg_path or path, None if jpeg_path else preview, timings[result_index])
+                timings[result_index]["decode_ms"] += conversion_ms
                 face_list = []
                 for i, f in enumerate(faces):
                     metadata = f.model_dump(exclude={"embedding", "embedding_path"})
                     if req.cache_dir:
                         embedding_path = os.path.join(req.cache_dir, f"{result_index}_{i}.npy")
-                        import numpy as np
                         np.save(embedding_path, np.array(f.embedding, dtype=np.float32))
                         face_list.append({**metadata, "embedding_path": embedding_path})
                     else:
@@ -293,9 +341,16 @@ async def detect_faces(req: DetectFacesRequest) -> DetectFacesResponse:
             finally:
                 if jpeg_path:
                     os.unlink(jpeg_path)
-        workers = max(1, min(2, int(os.environ.get("PHOTFACTORY_FACE_WORKERS", "2"))))
+        try:
+            workers = max(1, min(2, int(os.environ.get("PHOTOFACTORY_FACE_WORKERS",
+                                                       os.environ.get("PHOTFACTORY_FACE_WORKERS", "2")))))
+        except ValueError:
+            workers = 2
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="face-ai") as pool:
             results = list(pool.map(process_photo, enumerate(req.paths)))
+        _last_face_batch = {key: sum(row.get(key, 0) for row in timings)
+                            for key in ("preview_hits", "decode_ms", "detect_ms", "embed_ms")}
+        _last_face_batch.update(photos=len(req.paths), elapsed_ms=1000 * (time.perf_counter() - start))
         return DetectFacesResponse(results=results)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -389,7 +444,7 @@ async def cluster_faces(req: ClusterFaceRequest) -> ClusterFaceResponse:
 
 
 @app.post("/cluster_faces_v2")
-async def cluster_faces_v2(req: ClusterFacesV2Request):
+def cluster_faces_v2(req: ClusterFacesV2Request):
     """Enhanced clustering with adaptive eps and constraints."""
     from face_clusterer import cluster_faces_v2 as cluster_v2
 
@@ -398,6 +453,9 @@ async def cluster_faces_v2(req: ClusterFacesV2Request):
         raise HTTPException(status_code=400, detail=f"Embeddings dir not found: {embeddings_dir}")
 
     print(f"[cluster_faces_v2] Starting clustering for {embeddings_dir}...", flush=True)
+    global _last_cluster_ms
+    start = time.perf_counter()
+    review_files = []
     results = cluster_v2(
         embeddings_dir,
         existing_clusters=req.existing_clusters or {},
@@ -405,15 +463,19 @@ async def cluster_faces_v2(req: ClusterFacesV2Request):
         must_links=req.must_links or [],
         cannot_links=req.cannot_links or [],
         candidate_files=req.candidate_files,
+        memberships=req.memberships,
+        qualities=req.qualities,
+        review_files=review_files,
     )
     # Convert numpy ints to plain Python ints for JSON serialization
+    _last_cluster_ms = 1000 * (time.perf_counter() - start)
     plain_results = {k: int(v) for k, v in results.items()}
     print(f"[cluster_faces_v2] Done: {len(plain_results)} faces clustered", flush=True)
-    return {"clusters": plain_results}
+    return {"clusters": plain_results, "review_files": review_files}
 
 
 @app.post("/plan_automatic_face_merges")
-async def plan_automatic_face_merges(req: AutomaticMergeRequest):
+def plan_automatic_face_merges(req: AutomaticMergeRequest):
     """Suggest merges only among the unnamed assignments supplied by the app."""
     from face_clusterer import plan_automatic_cluster_merges
 
@@ -470,5 +532,61 @@ def main():
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
 
 
+def thumbnail_stream():
+    """Serve multiple thumbnail requests using one decoder process."""
+    import json
+    from pathlib import Path
+    from PIL import Image
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+    for line in sys.stdin.buffer:
+        success = False
+        try:
+            request = json.loads(line)
+            source = Path(request["source"])
+            size = int(request["size"])
+            if not 1 <= size <= 1024:
+                raise ValueError("invalid thumbnail size")
+            if source.suffix.lower() in RAW_EXTENSIONS:
+                import rawpy
+                with rawpy.imread(str(source)) as raw:
+                    image = Image.fromarray(raw.postprocess(half_size=True))
+            else:
+                with Image.open(source) as original:
+                    image = original.convert("RGB")
+            image.thumbnail((size, size), Image.Resampling.LANCZOS)
+            image.save(request["target"], format="WEBP", lossless=True, method=2)
+            success = True
+        except Exception as error:
+            print(f"Thumbnail decode failed: {error}", file=sys.stderr, flush=True)
+        print(json.dumps(success), flush=True)
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--thumbnail-stream":
+        thumbnail_stream()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--check-directml":
+        from inference_runtime import available_providers
+        providers = available_providers()
+        print("Bundled ONNX providers:", ", ".join(providers))
+        raise SystemExit(0 if "DmlExecutionProvider" in providers else 1)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--convert-image":
+        # Shared decoder for Rust thumbnail/face previews, also in PyInstaller builds.
+        # Do not start uvicorn or initialize inference models in this mode.
+        import shutil
+        if len(sys.argv) != 4:
+            raise SystemExit("Usage: --convert-image SOURCE DESTINATION")
+        converted = _convert_for_ai(sys.argv[2])
+        try:
+            if converted is None:
+                from PIL import Image
+                with Image.open(sys.argv[2]) as image:
+                    image.convert("RGB").save(sys.argv[3], "JPEG", quality=90)
+            else:
+                shutil.copyfile(converted, sys.argv[3])
+        finally:
+            if converted is not None:
+                os.unlink(converted)
+    else:
+        main()

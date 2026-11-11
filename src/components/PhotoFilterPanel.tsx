@@ -43,7 +43,7 @@ export default React.memo(function PhotoFilterPanel() {
       </button>
       {open && (
         <div className="absolute right-0 top-full z-50 mt-2 w-[360px] max-h-[70vh] overflow-y-auto rounded-2xl border border-surface-secondary bg-bg-secondary p-4 shadow-2xl">
-          <div className="flex items-center justify-between"><h3 className="text-sm font-semibold">照片筛选</h3><button type="button" onClick={clear} className="text-xs text-accent-primary">全部清除</button></div>
+          <div className="flex items-center justify-between"><h3 className="text-sm font-semibold">照片筛选</h3><button type="button" onClick={clear} className="text-xs text-accent-link">全部清除</button></div>
           <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
             <label className="col-span-1">格式<select value={filter.format ?? ""} onChange={(e) => setFilter({ format: e.target.value || undefined })} className="mt-1 w-full rounded-lg border border-surface-secondary bg-bg-primary p-2"><option value="">全部格式</option>{options.formats.map((item) => <option key={item.value} value={item.value}>{item.value.toUpperCase()} ({item.count})</option>)}</select></label>
             <label className="col-span-1">相机<select value={filter.camera ?? ""} onChange={(e) => setFilter({ camera: e.target.value || undefined })} className="mt-1 w-full rounded-lg border border-surface-secondary bg-bg-primary p-2"><option value="">全部相机</option>{options.cameras.map((item) => <option key={item.value} value={item.value}>{item.value} ({item.count})</option>)}</select></label>

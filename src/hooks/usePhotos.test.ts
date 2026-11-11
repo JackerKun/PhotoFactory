@@ -68,6 +68,41 @@ describe("photo pagination store", () => {
     expect(useStore.getState().totalPhotos).toBe(5);
   });
 
+  it("retries a locked database without clearing existing photos", async () => {
+    useStore.setState({ photos: [photo(1)] });
+    vi.mocked(api.getPhotos)
+      .mockRejectedValueOnce("database is locked")
+      .mockResolvedValueOnce(page([photo(2)], 1, false));
+    const load = useStore.getState().loadPhotos();
+    expect(useStore.getState().photos.map((item) => item.id)).toEqual([1]);
+    await load;
+    expect(api.getPhotos).toHaveBeenCalledTimes(2);
+    expect(useStore.getState().photos.map((item) => item.id)).toEqual([2]);
+  });
+
+  it("ends loading on a stalled request and ignores its late response after retry", async () => {
+    vi.useFakeTimers();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      let finish!: (result: PhotoPage) => void;
+      vi.mocked(api.getPhotos).mockReturnValueOnce(new Promise((resolve) => { finish = resolve; }));
+      const stalled = useStore.getState().loadPhotos();
+      await vi.advanceTimersByTimeAsync(12_000);
+      await stalled;
+      expect(useStore.getState().loading).toBe(false);
+      expect(useStore.getState().photoLoadError?.message).toContain("超时");
+      vi.mocked(api.getPhotos).mockResolvedValueOnce(page([photo(2)], 1, false));
+      await useStore.getState().loadPhotos();
+      finish(page([photo(1)], 1, false));
+      await Promise.resolve();
+      expect(useStore.getState().photos.map((item) => item.id)).toEqual([2]);
+      expect(useStore.getState().photoLoadError).toBeNull();
+    } finally {
+      vi.useRealTimers();
+      log.mockRestore();
+    }
+  });
+
   it("keeps every lazily loaded page instead of discarding photos after 2000", async () => {
     const initial = Array.from({ length: 2000 }, (_, index) => photo(3000 - index));
     useStore.setState({

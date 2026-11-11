@@ -61,7 +61,7 @@ export default function KeyboardShortcutsDialog({ open, onClose }: { open: boole
                 {group.shortcuts.map(([keys, action]) => (
                   <div key={keys} className="flex items-center justify-between gap-3 text-xs">
                     <span className="text-text-secondary">{action}</span>
-                    <kbd className="shrink-0 rounded border border-surface-secondary bg-surface-primary px-2 py-1 font-mono text-[10px] text-text-primary shadow-sm">{keys}</kbd>
+                    <kbd className="shrink-0 rounded border border-surface-secondary bg-surface-primary px-2 py-1 font-mono text-xs text-text-primary shadow-sm">{keys}</kbd>
                   </div>
                 ))}
               </div>

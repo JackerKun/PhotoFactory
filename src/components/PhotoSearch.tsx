@@ -65,7 +65,7 @@ export default React.memo(function PhotoSearch() {
 });
 
 function SuggestionGroup({ title, children }: { title: string; children: React.ReactNode }) {
-  return <section className="mt-2 border-t border-surface-secondary pt-2"><h4 className="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wide text-text-muted">{title}</h4>{children}</section>;
+  return <section className="mt-2 border-t border-surface-secondary pt-2"><h4 className="px-3 pb-1 text-xs font-semibold uppercase tracking-wide text-text-muted">{title}</h4>{children}</section>;
 }
 
 function Suggestion({ label, detail, onClick }: { label: string; detail: string; onClick: () => void }) {

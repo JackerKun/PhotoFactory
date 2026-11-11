@@ -17,9 +17,9 @@ Version **0.1.2** is under active development. Try a copy of your photographs fi
 | --- | --- |
 | Photos | Directory indexing, incremental updates, square / proportional grids, timeline navigation, keyword and EXIF filters, sorting, favorites and ratings. |
 | Viewer | Zoom, pan, folder filmstrip, metadata, tags and existing face results. Double-click a photograph, then press `I` for details. |
-| People | Local face analysis, naming, merging, review and ignore / restore workflows. Automatic unnamed-person merging has candidate review and undo. |
+| People | Local face analysis, naming, merging, review, and group photos filtered by people or group size. Automatic merging of unnamed people supports preview and undo. |
 | Tags | Scene and semantic results grouped by source; editable tags allow manual correction. |
-| Map | Standard / satellite layers, address candidates, GPS photograph previews and individual / batch coordinate editing. |
+| Map | Standard and satellite layers, offline map import and export, GPS photograph previews, capture tracks, address search, and coordinate editing. |
 | Albums | Time-, person-, place- and content-based organization with search and pagination. |
 | Library tools | Jobs, intelligent search, similar-photo candidates, RAW+JPEG stacks, stories, trash, edit parameters, XMP and additional read-only storage sources. |
 
@@ -35,11 +35,19 @@ Version **0.1.2** is under active development. Try a copy of your photographs fi
 
 ![Library tool entry points](docs/screenshots/tools.webp)
 
+In the map toolbar, open **Capture tracks (拍摄轨迹)**, select an area, optionally set a date range, and generate a track. PhotoFactory connects geotagged photos in capture order. Click a point to spread out nearby thumbnails, then click a thumbnail to open the photo. Collapse the floating panel with the arrow next to its title to keep the map clear. The refresh icon in the map status bar retries failed tiles.
+
+Run `./startOffline.sh` to open the standalone offline map tool in a browser. Export one layer as `.mbtiles` or both layers as `.pfmap`, then import the package through the map toolbar. PhotoFactory stores imported maps under `.pf/maps/offline/` and fetches missing tiles online when available. The map also exports imported and cached tiles. See the [offline map guide](docs/OFFLINE_MAPS.md).
+
+The sidebar offers light, dark, and system themes. The background tasks panel shows thumbnail and AI progress, with low, balanced, and full thumbnail performance settings.
+
 The [Chinese user guide](docs/USER_GUIDE.md) explains the workflows and keyboard shortcuts. Import indexes existing files rather than moving or copying them. Select the original directory containing `.pf/project.json` to reopen a project. Use incremental scanning when adding photographs instead of rebuilding every person group.
 
 ## Development
 
-Prepare Node.js (CI uses 20), Rust stable, Python 3.10 / 3.11 and the platform's Tauri prerequisites. Windows needs C++ Build Tools and WebView2; macOS needs Xcode Command Line Tools. See the [build guide](docs/BUILDING.md).
+Prepare Node.js (CI uses 22), Rust stable, Python 3.10 / 3.11 and the platform's Tauri prerequisites. Windows needs C++ Build Tools and WebView2. macOS needs Xcode Command Line Tools. See the [build guide](docs/BUILDING.md).
+
+Use `./start.sh` to prepare dependencies and start the desktop app in one step. Run it from Git Bash on Windows. For manual setup, follow the steps below.
 
 ```bash
 cd PhotoFactory
@@ -71,7 +79,7 @@ Windows builds use `build-windows.ps1`, or `build.sh windows` in Git Bash on Win
 
 The workflow in `.github/workflows/release.yml` builds macOS Intel / Apple Silicon and Windows x64 / ARM64 on matching runners. Pushing a stable `vX.Y.Z` tag publishes a Release only after all four builds, tests and artifact integrity checks pass. Manual branch runs produce Actions artifacts only. Models are downloaded and validated in CI; they do not belong in Git. Windows ARM64 uses a native ARM64 app with an x64 AI Worker under Windows 11 emulation; 32-bit Windows is unsupported. See the [release guide](docs/BUILDING.md#6-github-actions-四架构构建与-release). Local ad-hoc signing is not Developer ID signing or Apple notarization. This README does not advertise local build paths as public downloads.
 
-For this documentation update, the macOS frontend passed **29 tests across 11 files** and the TypeScript / Vite build. Existing bundle-size warnings remain. Native AI, Windows and large-library acceptance testing were not performed for this documentation task.
+Build status, test results, and temporary installer artifacts are available in [GitHub Actions](https://github.com/JackerKun/PhotoFactory/actions/workflows/release.yml).
 
 ## Data and limitations
 

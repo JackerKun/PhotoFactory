@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { MapContainer, Marker, useMap, useMapEvents } from "react-leaflet";
 import L from "leaflet";
 import type { Photo, FaceDetection, FaceCluster, CustomAttribute, ManualTag } from "../types";
+import { imageErrorMessage } from "../utils/imageError";
 import { formatDate, formatDateTime, formatFileSize } from "../utils/format";
 import * as api from "../api/tauri";
 import { useStore } from "../hooks/usePhotos";
@@ -392,11 +393,11 @@ export function GpsBatchEditor({
       {/* Top bar: search + close */}
       <div className="flex items-center gap-2 p-3 border-b border-surface-secondary bg-bg-secondary flex-shrink-0">
         <div className="flex rounded-lg bg-surface-primary p-0.5 text-xs">
-          <button type="button" onClick={() => setEditMode("single")} className={`rounded-md px-3 py-1.5 ${editMode === "single" ? "bg-white text-text-primary shadow-sm" : "text-text-muted"}`}>逐张定位</button>
+          <button type="button" onClick={() => setEditMode("single")} className={`rounded-md px-3 py-1.5 ${editMode === "single" ? "bg-bg-secondary text-text-primary shadow-sm" : "text-text-muted"}`}>逐张定位</button>
           <button type="button" onClick={() => {
             setEditMode("batch");
             if (!targetLocation && currentSingleLocation) setTargetLocation(currentSingleLocation);
-          }} className={`rounded-md px-3 py-1.5 ${editMode === "batch" ? "bg-white text-text-primary shadow-sm" : "text-text-muted"}`}>统一位置</button>
+          }} className={`rounded-md px-3 py-1.5 ${editMode === "batch" ? "bg-bg-secondary text-text-primary shadow-sm" : "text-text-muted"}`}>统一位置</button>
         </div>
         <MapSearch
           className="flex-1"
@@ -407,7 +408,7 @@ export function GpsBatchEditor({
           }}
         />
         <button onClick={onClose}
-          className="text-text-muted hover:text-text-primary text-xl px-2" title="Close (ESC)">
+          className="text-text-muted hover:text-text-primary text-xl px-2" title="关闭（Esc）">
           &times;
         </button>
       </div>
@@ -435,15 +436,15 @@ export function GpsBatchEditor({
         {currentPhoto && (
           <div className="absolute top-3 left-3 bg-bg-secondary/95 rounded-xl px-3 py-2 shadow-lg z-[1000] min-w-56">
             <p className="text-text-primary text-xs font-medium truncate max-w-[200px]">{currentPhoto.filename}</p>
-            <p className="text-text-muted text-[10px]">
+            <p className="text-text-muted text-xs">
               {editMode === "single" ? "本张" : "统一目标"}：{displayedLocation ? `${displayedLocation.lat.toFixed(6)}, ${displayedLocation.lng.toFixed(6)}` : "请在地图上选点"}
             </p>
             <div className="mt-1 flex items-center gap-2">
-              <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${editMode === "single" ? "bg-orange-100 text-orange-700" : "bg-blue-100 text-blue-700"}`}>
+              <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${editMode === "single" ? "bg-orange-100 dark:bg-orange-950/40 text-orange-700 dark:text-orange-300" : "bg-blue-100 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300"}`}>
                 {editMode === "single" ? `未保存 ${draftLocations.size} 张` : `已选 ${selectedIds.size} 张`}
               </span>
               {editMode === "batch" && currentPhoto && knownLocations.has(currentPhoto.id!) && (
-                <button type="button" className="text-[10px] text-accent-primary hover:underline" onClick={() => {
+                <button type="button" className="text-xs text-accent-link hover:underline" onClick={() => {
                   const currentLoc = knownLocations.get(currentPhoto.id!);
                   if (!currentLoc) return;
                   setTargetLocation(currentLoc);
@@ -475,12 +476,12 @@ export function GpsBatchEditor({
         <div className="flex flex-col gap-1 flex-shrink-0 pr-3 border-r border-surface-secondary">
           <button onClick={handleConfirm} disabled={saving || (editMode === "single" ? currentPhotoIdValue == null || !draftLocations.has(currentPhotoIdValue) : selectedIds.size === 0 || !targetLocation)}
             className="bg-green-600 hover:bg-green-500 text-white px-3 py-1 rounded text-xs font-semibold whitespace-nowrap disabled:opacity-40"
-            title="Confirm (Enter)">
+            title="确认（Enter）">
             {saving ? "保存中…" : editMode === "single" ? "保存当前" : `应用到 ${selectedIds.size} 张`}
           </button>
           <button onClick={handleClear} disabled={saving || (editMode === "batch" && selectedIds.size === 0)}
             className="bg-red-600 hover:bg-red-500 text-white px-3 py-1 rounded text-xs font-semibold whitespace-nowrap disabled:opacity-40"
-            title="Clear & next (Delete)">
+            title="清除并查看下一张（Delete）">
             {editMode === "single" ? "清除当前" : `清除 ${selectedIds.size} 张`}
           </button>
         </div>
@@ -490,16 +491,16 @@ export function GpsBatchEditor({
           <div>{currentIdx + 1} / {editorPhotos.length} · {editMode === "single" ? `草稿 ${draftLocations.size}` : `已选 ${selectedIds.size}`}</div>
           {editMode === "single" ? (
             <>
-              <button type="button" disabled={saving || draftLocations.size === 0} className="text-accent-primary hover:underline disabled:opacity-40" onClick={handleSaveAllDrafts}>保存全部草稿 ({draftLocations.size})</button>
-              <div className="text-[9px] text-text-muted">橙色：未保存 · 绿色：已有坐标</div>
+              <button type="button" disabled={saving || draftLocations.size === 0} className="text-accent-link hover:underline disabled:opacity-40" onClick={handleSaveAllDrafts}>保存全部草稿 ({draftLocations.size})</button>
+              <div className="text-xs text-text-muted">橙色：未保存 · 绿色：已有坐标</div>
             </>
           ) : (
             <>
               <div className="flex gap-2">
-                <button type="button" className="text-accent-primary hover:underline" onClick={() => setSelectedIds(new Set(editorPhotos.flatMap((photo) => photo.id != null ? [photo.id] : [])))}>全选</button>
+                <button type="button" className="text-accent-link hover:underline" onClick={() => setSelectedIds(new Set(editorPhotos.flatMap((photo) => photo.id != null ? [photo.id] : [])))}>全选</button>
                 <button type="button" className="text-text-muted hover:text-text-primary" onClick={() => setSelectedIds(new Set())}>取消选择</button>
               </div>
-              <div className="text-[9px] text-text-muted">点圆圈选择 · Shift 连选</div>
+              <div className="text-xs text-text-muted">点圆圈选择 · Shift 连选</div>
             </>
           )}
         </div>
@@ -536,7 +537,7 @@ export function GpsBatchEditor({
                     <button
                       type="button"
                       aria-label={isBatchSelected ? `取消选择 ${photo.filename}` : `选择 ${photo.filename}`}
-                      className={`absolute top-1 left-1 z-10 h-4 w-4 rounded-full border flex items-center justify-center text-[10px] font-bold shadow-sm ${
+                      className={`absolute top-1 left-1 z-10 h-4 w-4 rounded-full border flex items-center justify-center text-xs font-bold shadow-sm ${
                         isBatchSelected ? "border-blue-500 bg-blue-500 text-white" : "border-white bg-black/30 text-transparent"
                       }`}
                       onClick={(event) => { event.stopPropagation(); toggleSelection(idx, event.shiftKey); }}
@@ -545,7 +546,7 @@ export function GpsBatchEditor({
                     </button>
                   )}
                   {hasDraft ? (
-                    <div className="absolute top-0 right-0 w-4 h-4 bg-orange-500 rounded-bl text-[9px] leading-4 text-center text-white" title={draftLocation ? "坐标已修改，尚未保存" : "坐标将被清除，尚未保存"}>●</div>
+                    <div className="absolute top-0 right-0 w-4 h-4 bg-orange-500 rounded-bl text-xs leading-4 text-center text-white" title={draftLocation ? "坐标已修改，尚未保存" : "坐标将被清除，尚未保存"}>●</div>
                   ) : hasLoc ? (
                     <div className="absolute top-0 right-0 w-3 h-3 bg-green-500 rounded-bl" title="已有 GPS" />
                   ) : null}
@@ -558,7 +559,7 @@ export function GpsBatchEditor({
           </div>
         </div>
         {statusMessage && (
-          <div className={`absolute bottom-[94px] left-1/2 z-[1000] -translate-x-1/2 rounded-full px-4 py-2 text-xs shadow-lg ${statusMessage.includes("失败") ? "bg-red-600 text-white" : "bg-white text-gray-700"}`}>
+          <div className={`absolute bottom-[94px] left-1/2 z-[1000] -translate-x-1/2 rounded-full px-4 py-2 text-xs shadow-lg ${statusMessage.includes("失败") ? "bg-red-600 text-white" : "bg-bg-secondary text-gray-700"}`}>
             {statusMessage}
           </div>
         )}
@@ -727,18 +728,18 @@ function LocationSection({ photo, onGpsSaved, dirtyRef, pendingRef, onOpenBatchE
       return (
         <div>
           <div className="flex items-center justify-between mb-2">
-            <h3 className="text-text-muted text-xs uppercase font-semibold">Location</h3>
+            <h3 className="text-text-muted text-xs uppercase font-semibold">拍摄位置</h3>
             <div className="flex items-center gap-1">
               <button
                 type="button"
                 onClick={onShowNearby}
-                className="inline-flex h-7 w-7 items-center justify-center rounded-full text-accent-primary hover:bg-accent-primary/10"
+                className="inline-flex h-7 w-7 items-center justify-center rounded-full text-accent-link hover:bg-accent-primary/10"
                 title="在地图中查看附近照片"
                 aria-label="在地图中查看附近照片"
               >
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><path d="M20 10c0 5-8 12-8 12S4 15 4 10a8 8 0 1 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/></svg>
               </button>
-              <button onClick={() => handleEdit()} className="px-1 text-xs text-accent-primary hover:underline">Edit</button>
+              <button onClick={() => handleEdit()} className="px-1 text-xs text-accent-link hover:underline">编辑</button>
             </div>
           </div>
           <p className="text-text-secondary text-xs mb-2">
@@ -751,8 +752,8 @@ function LocationSection({ photo, onGpsSaved, dirtyRef, pendingRef, onOpenBatchE
     return (
       <div>
         <div className="flex items-center justify-between mb-2">
-          <h3 className="text-text-muted text-xs uppercase font-semibold">Location</h3>
-          <button onClick={() => handleEdit()} className="text-xs text-accent-primary hover:underline">Edit</button>
+          <h3 className="text-text-muted text-xs uppercase font-semibold">拍摄位置</h3>
+          <button onClick={() => handleEdit()} className="text-xs text-accent-link hover:underline">编辑</button>
         </div>
       </div>
     );
@@ -767,15 +768,15 @@ function LocationSection({ photo, onGpsSaved, dirtyRef, pendingRef, onOpenBatchE
   return (
     <div>
       <div className="flex items-center justify-between mb-2">
-        <h3 className="text-text-muted text-xs uppercase font-semibold">Location</h3>
-        <button onClick={handleCancel} className="text-xs text-text-muted hover:text-text-primary">Cancel</button>
+        <h3 className="text-text-muted text-xs uppercase font-semibold">拍摄位置</h3>
+        <button onClick={handleCancel} className="text-xs text-text-muted hover:text-text-primary">取消</button>
       </div>
-      <p className="text-text-muted text-xs mb-2">Changes are written to the original file's EXIF data.</p>
+      <p className="text-text-muted text-xs mb-2">保存后会将坐标写入原照片的 EXIF 信息。</p>
 
       {photo.latitude != null && photo.longitude != null && !isDirty && (
         <div className="flex items-center justify-between mb-2">
           <p className="text-text-secondary text-xs">{photo.latitude.toFixed(6)}, {photo.longitude.toFixed(6)}</p>
-          <button onClick={handleClear} className="text-xs text-red-400 hover:text-red-300">Clear</button>
+          <button onClick={handleClear} className="text-xs text-red-400 hover:text-red-300">清除</button>
         </div>
       )}
 
@@ -795,11 +796,11 @@ function LocationSection({ photo, onGpsSaved, dirtyRef, pendingRef, onOpenBatchE
       <div className="flex gap-2 mt-3">
         <button onClick={handleConfirm} disabled={saving}
           className="flex-1 bg-green-600 text-white py-1.5 rounded text-xs font-semibold disabled:opacity-50">
-          {saving ? "Saving..." : "Confirm"}
+          {saving ? "正在保存…" : "确认"}
         </button>
         <button onClick={handleCancel} disabled={saving}
           className="flex-1 bg-red-600 text-white py-1.5 rounded text-xs font-semibold disabled:opacity-50">
-          Cancel
+          取消
         </button>
       </div>
     </div>
@@ -827,6 +828,9 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
   const [newValue, setNewValue] = useState("");
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewError, setPreviewError] = useState(false);
+  const [previewErrorText, setPreviewErrorText] = useState("预览加载失败");
+  const [actionError, setActionError] = useState("");
+  const [favoriteSaving, setFavoriteSaving] = useState(false);
   const [previewRetryToken, setPreviewRetryToken] = useState(0);
   const previewDecodeRetriesRef = useRef(0);
   const previewDecodeTimerRef = useRef<number | null>(null);
@@ -914,6 +918,7 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
             return;
           }
           console.error("Failed to load detail preview:", error);
+          setPreviewErrorText(imageErrorMessage(error));
           setPreviewError(true);
         });
     };
@@ -933,6 +938,7 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
       return;
     }
     setPreviewUrl(null);
+    setPreviewErrorText("预览图片无法显示");
     setPreviewError(true);
   }, []);
 
@@ -1047,9 +1053,12 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
   };
 
   const handleRating = async (rating: number) => {
-    await api.updatePhotosRating([photoId], rating);
-    setPhoto((current) => current ? { ...current, rating } : null);
-    updatePhotoInList(photoId, { rating });
+    setActionError("");
+    try {
+      await api.updatePhotosRating([photoId], rating);
+      setPhoto((current) => current ? { ...current, rating } : null);
+      updatePhotoInList(photoId, { rating });
+    } catch (error) { setActionError(`评分保存失败：${String(error)}`); }
   };
 
   const handleUnsavedSave = async () => {
@@ -1074,6 +1083,17 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
     setUnsavedDialog(null);
   };
 
+  const toggleFavorite = async () => {
+    setActionError("");
+    setFavoriteSaving(true);
+    try {
+      const is_favorite = await api.togglePhotoFavorite(photoId);
+      setPhoto((value) => value ? { ...value, is_favorite } : value);
+      updatePhotoInList(photoId, { is_favorite });
+    } catch (error) { setActionError(`收藏操作失败：${String(error)}`); }
+    finally { setFavoriteSaving(false); }
+  };
+
   if (!photo) return null;
 
   const panel = (
@@ -1084,15 +1104,15 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
       style={embedded ? undefined : { width }}
     >
       <div className="sticky top-0 bg-bg-secondary z-10 flex items-center justify-between p-4 border-b border-surface-secondary">
-        <h2 className="font-semibold">Photo Details</h2>
-        <button onClick={onClose} className="text-text-muted hover:text-text-primary text-xl">&times;</button>
+        <h2 className="font-semibold">照片详情</h2>
+        <button onClick={onClose} aria-label="关闭照片详情" className="ui-button">&times;</button>
       </div>
 
       <div className="p-4 space-y-4">
         {/* Preview */}
         {!embedded && (
           <div
-            className="aspect-square bg-surface-primary rounded-lg overflow-hidden cursor-zoom-in"
+            className="aspect-[4/3] bg-surface-primary rounded-lg overflow-hidden cursor-zoom-in"
             onDoubleClick={() => setLightboxPhotoId(photoId)}
             onContextMenu={(event) => {
               event.preventDefault();
@@ -1103,41 +1123,55 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
             {previewUrl ? (
               <img src={previewUrl} alt={photo.filename} className="w-full h-full object-contain" onError={handlePreviewDecodeError} />
             ) : (
-              <div className="w-full h-full flex items-center justify-center text-text-muted">
-                {previewError ? "预览生成失败" : "正在加载预览…"}
+              <div className="flex h-full w-full flex-col items-center justify-center gap-3 text-sm text-text-secondary" role="status">
+                <span>{previewError ? previewErrorText : "正在加载预览…"}</span>
+                {previewError && <button type="button" className="ui-button" onClick={(event) => { event.stopPropagation(); previewDecodeRetriesRef.current = 0; setPreviewRetryToken((value) => value + 1); }}>重新加载</button>}
               </div>
             )}
           </div>
         )}
 
+        <div className="flex flex-wrap gap-2">
+          {!embedded && <button type="button" className="ui-button" onClick={() => setLightboxPhotoId(photoId)}>查看大图</button>}
+          <button type="button" className="ui-button" onClick={() => api.revealInFileManager(photo.path).catch((error) => setActionError(String(error)))}>文件位置</button>
+        </div>
+          <div className="flex items-center gap-3 border-t border-surface-secondary pt-2">
+            <span className="font-medium text-text-primary">星级:</span>
+            <StarRating value={photo.rating} onChange={handleRating} />
+            <button type="button" aria-pressed={photo.is_favorite} disabled={favoriteSaving} onClick={() => void toggleFavorite()} className="ui-button ml-auto">{photo.is_favorite ? "取消收藏" : "收藏"}</button>
+          </div>
+        {actionError && <p role="alert" className="text-sm text-red-500">{actionError}</p>}
         {/* Info */}
         <div className="space-y-2 text-sm">
-          <h3 className="text-text-muted text-xs uppercase font-semibold">Information</h3>
-          <p className="text-text-secondary"><span className="text-text-primary font-medium">File:</span> {photo.filename}</p>
-          <p className="text-text-secondary"><span className="text-text-primary font-medium">Size:</span> {formatFileSize(photo.file_size)}</p>
-          <p className="text-text-secondary"><span className="text-text-primary font-medium">Date:</span> {formatDate(photo.taken_at)}</p>
-          <p className="text-text-secondary"><span className="text-text-primary font-medium">Modified:</span> {formatDateTime(photo.file_mtime)}</p>
+          <h3 className="text-text-muted text-xs uppercase font-semibold">基本信息</h3>
+          <p className="text-text-secondary"><span className="text-text-primary font-medium">文件名：</span> {photo.filename}</p>
+          <p className="text-text-secondary"><span className="text-text-primary font-medium">大小：</span> {formatFileSize(photo.file_size)}</p>
+          <p className="text-text-secondary"><span className="text-text-primary font-medium">拍摄时间：</span> {formatDate(photo.taken_at)}</p>
+          <p className="text-text-secondary"><span className="text-text-primary font-medium">修改时间：</span> {formatDateTime(photo.file_mtime)}</p>
+
+        </div>
+
+        <details className="rounded-xl border border-surface-secondary p-3">
+          <summary className="cursor-pointer text-sm font-medium">相机与 EXIF</summary>
+          <div className="mt-3 space-y-2 text-sm">
           {photo.camera_make && (
-            <p className="text-text-secondary"><span className="text-text-primary font-medium">Camera:</span> {photo.camera_make} {photo.camera_model}</p>
+            <p className="text-text-secondary"><span className="text-text-primary font-medium">相机：</span> {photo.camera_make} {photo.camera_model}</p>
           )}
           {photo.width && photo.height && (
-            <p className="text-text-secondary"><span className="text-text-primary font-medium">Dimensions:</span> {photo.width} × {photo.height}</p>
+            <p className="text-text-secondary"><span className="text-text-primary font-medium">尺寸：</span> {photo.width} × {photo.height}</p>
           )}
           {photo.exposure_time && (
-            <p className="text-text-secondary"><span className="text-text-primary font-medium">Shutter:</span> {photo.exposure_time}s</p>
+            <p className="text-text-secondary"><span className="text-text-primary font-medium">快门：</span> {photo.exposure_time}s</p>
           )}
           {photo.f_number && (
-            <p className="text-text-secondary"><span className="text-text-primary font-medium">Aperture:</span> f/{photo.f_number}</p>
+            <p className="text-text-secondary"><span className="text-text-primary font-medium">光圈：</span> f/{photo.f_number}</p>
           )}
           {photo.iso && (
             <p className="text-text-secondary"><span className="text-text-primary font-medium">ISO:</span> {photo.iso}</p>
           )}
-          <div className="flex items-center gap-3 border-t border-surface-secondary pt-2">
-            <span className="font-medium text-text-primary">星级:</span>
-            <StarRating value={photo.rating} onChange={handleRating} />
-            {photo.is_favorite && <span className="text-xs text-red-500">♥ 已收藏</span>}
+
           </div>
-        </div>
+        </details>
 
         {/* Location (edit with confirm/cancel) */}
         <LocationSection photo={photo} onGpsSaved={handleUpdateGps} dirtyRef={dirtyRef} pendingRef={pendingRef} onShowNearby={() => {
@@ -1163,21 +1197,21 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
         <div>
           <div className="flex items-center justify-between mb-2">
             <h3 className="text-text-muted text-xs uppercase font-semibold">标签</h3>
-            <button onClick={() => setShowTagPicker((value) => !value)} className="text-accent-primary text-xs font-medium">{showTagPicker ? "完成" : "＋ 添加"}</button>
+            <button onClick={() => setShowTagPicker((value) => !value)} className="text-accent-link text-xs font-medium">{showTagPicker ? "完成" : "＋ 添加"}</button>
           </div>
           <div className="flex flex-wrap gap-1.5">
             {manualTags.map((tag) => (
-              <button key={tag.id} onClick={() => handleToggleManualTag(tag)} disabled={tagSaving} className="inline-flex items-center gap-1.5 rounded-full border border-black/[0.06] bg-white px-2.5 py-1 text-xs text-text-primary shadow-sm disabled:opacity-50" title="点击移除">
+              <button key={tag.id} onClick={() => handleToggleManualTag(tag)} disabled={tagSaving} className="inline-flex items-center gap-1.5 rounded-full border border-text-primary/[0.06] bg-bg-secondary px-2.5 py-1 text-xs text-text-primary shadow-sm disabled:opacity-50" title="点击移除">
                 <span className="w-2 h-2 rounded-full" style={{ backgroundColor: tag.color }} />{tag.name}<span className="text-text-muted">×</span>
               </button>
             ))}
             {manualTags.length === 0 && !showTagPicker && <span className="text-xs text-text-muted">尚未添加标签</span>}
           </div>
           {showTagPicker && (
-            <div className="mt-2 rounded-xl border border-black/[0.07] bg-white/70 p-2 max-h-40 overflow-y-auto">
+            <div className="mt-2 rounded-xl border border-text-primary/[0.07] bg-bg-secondary/70 p-2 max-h-40 overflow-y-auto">
               {allManualTags.length > 0 ? allManualTags.map((tag) => {
                 const checked = manualTags.some((item) => item.id === tag.id);
-                return <button key={tag.id} onClick={() => handleToggleManualTag(tag)} disabled={tagSaving} className="w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm hover:bg-black/[0.04] disabled:opacity-50"><span className="w-3 h-3 rounded-full" style={{ backgroundColor: tag.color }} /><span className="flex-1 text-left truncate">{tag.name}</span><span className={checked ? "text-accent-primary" : "text-transparent"}>✓</span></button>;
+                return <button key={tag.id} onClick={() => handleToggleManualTag(tag)} disabled={tagSaving} className="w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm hover:bg-text-primary/[0.04] disabled:opacity-50"><span className="w-3 h-3 rounded-full" style={{ backgroundColor: tag.color }} /><span className="flex-1 text-left truncate">{tag.name}</span><span className={checked ? "text-accent-link" : "text-transparent"}>✓</span></button>;
               }) : <p className="p-2 text-xs text-text-muted">请先到“标签”页面创建标签。</p>}
             </div>
           )}
@@ -1198,8 +1232,8 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
                     key={face.id ?? `${face.photo_id}-${face.bbox_x}-${face.bbox_y}`}
                     className={`rounded-lg border p-2.5 text-sm transition-colors ${
                       editing
-                        ? "border-emerald-500 bg-emerald-50/80 shadow-[0_0_0_1px_rgba(16,185,129,0.15)]"
-                        : "border-black/[0.05] bg-surface-primary"
+                        ? "border-emerald-500 bg-emerald-50/80 dark:bg-emerald-950/40 shadow-[0_0_0_1px_rgba(16,185,129,0.15)]"
+                        : "border-text-primary/[0.05] bg-surface-primary"
                     }`}
                   >
                     <div className="flex items-center justify-between gap-2">
@@ -1209,7 +1243,7 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
                           type="button"
                           disabled={faceSaving || face.id == null}
                           onClick={() => { setEditingFaceId(editing ? null : face.id); setFaceTargetId(face.person_id); setNewFacePersonName(""); setFaceError(null); }}
-                          className="text-accent-primary hover:underline disabled:opacity-50"
+                          className="text-accent-link hover:underline disabled:opacity-50"
                         >{editing ? "收起" : "修改"}</button>
                         <button type="button" disabled={faceSaving || face.id == null} onClick={() => void handleDeleteFace(face)} className="text-red-500 hover:underline disabled:opacity-50">取消识别</button>
                       </div>
@@ -1220,7 +1254,7 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
                           <select
                             value={faceTargetId ?? ""}
                             onChange={(event) => setFaceTargetId(event.target.value ? Number(event.target.value) : null)}
-                            className="min-w-0 flex-1 rounded-lg border border-black/10 bg-white px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-accent-primary/25"
+                            className="min-w-0 flex-1 rounded-lg border border-text-primary/10 bg-bg-secondary px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-accent-primary/25"
                           >
                             <option value="">选择已有姓名…</option>
                             {faceClusters.filter((cluster) => cluster.name?.trim()).map((cluster) => (
@@ -1235,9 +1269,9 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
                             onChange={(event) => setNewFacePersonName(event.target.value)}
                             onKeyDown={(event) => { if (event.key === "Enter") void handleCreatePersonForFace(face.id!); }}
                             placeholder="或输入新人物姓名…"
-                            className="min-w-0 flex-1 rounded-lg border border-black/10 bg-white px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-accent-primary/25"
+                            className="min-w-0 flex-1 rounded-lg border border-text-primary/10 bg-bg-secondary px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-accent-primary/25"
                           />
-                          <button type="button" disabled={faceSaving || !newFacePersonName.trim()} onClick={() => void handleCreatePersonForFace(face.id!)} className="rounded-lg border border-accent-primary px-3 py-1.5 text-xs font-medium text-accent-primary disabled:opacity-40">新建</button>
+                          <button type="button" disabled={faceSaving || !newFacePersonName.trim()} onClick={() => void handleCreatePersonForFace(face.id!)} className="rounded-lg border border-accent-primary px-3 py-1.5 text-xs font-medium text-accent-link disabled:opacity-40">新建</button>
                         </div>
                       </div>
                     )}
@@ -1250,8 +1284,8 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
         )}
 
         {/* Custom Attributes */}
-        <div>
-          <h3 className="text-text-muted text-xs uppercase font-semibold mb-2">Custom Attributes</h3>
+        <details className="rounded-xl border border-surface-secondary p-3">
+          <summary className="mb-2 cursor-pointer text-sm font-medium">自定义属性</summary>
           {attributes.map((a) => (
             <div key={a.key} className="flex items-center justify-between bg-surface-primary rounded px-2 py-1 mb-1 text-sm">
               <span className="text-text-primary font-medium">{a.key}</span>
@@ -1260,27 +1294,27 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
           ))}
           <div className="flex gap-2 mt-2">
             <input value={newKey} onChange={(e) => setNewKey(e.target.value)}
-              placeholder="Key" className="flex-1 bg-surface-primary border border-surface-secondary rounded px-2 py-1 text-sm text-text-primary" />
+              placeholder="属性名" className="flex-1 bg-surface-primary border border-surface-secondary rounded px-2 py-1 text-sm text-text-primary" />
             <input value={newValue} onChange={(e) => setNewValue(e.target.value)}
-              placeholder="Value" className="flex-1 bg-surface-primary border border-surface-secondary rounded px-2 py-1 text-sm text-text-primary" />
-            <button onClick={handleAddAttribute} className="bg-accent-primary text-white px-3 py-1 rounded text-sm">Add</button>
+              placeholder="属性值" className="flex-1 bg-surface-primary border border-surface-secondary rounded px-2 py-1 text-sm text-text-primary" />
+            <button onClick={handleAddAttribute} className="bg-accent-primary text-white px-3 py-1 rounded text-sm">添加</button>
           </div>
-        </div>
+        </details>
       </div>
 
       {unsavedDialog && (
         <div className="fixed inset-0 bg-black/50 z-[1002] flex items-center justify-center"
           onClick={(e) => { if (e.target === e.currentTarget) handleUnsavedStay(); }}>
           <div className="bg-bg-secondary rounded-xl p-6 w-80 shadow-2xl">
-            <h3 className="text-lg font-semibold mb-2 text-text-primary">Unsaved GPS Changes</h3>
-            <p className="text-text-secondary text-sm mb-4">You have unsaved GPS changes. Do you want to save them?</p>
+            <h3 className="text-lg font-semibold mb-2 text-text-primary">定位修改尚未保存</h3>
+            <p className="text-text-secondary text-sm mb-4">是否保存本次定位修改？</p>
             <div className="flex gap-2">
               <button onClick={handleUnsavedSave}
-                className="flex-1 bg-green-600 text-white py-2 rounded text-sm font-semibold hover:bg-green-500">Save</button>
+                className="flex-1 bg-green-600 text-white py-2 rounded text-sm font-semibold hover:bg-green-500">保存</button>
               <button onClick={handleUnsavedDiscard}
-                className="flex-1 bg-red-600 text-white py-2 rounded text-sm font-semibold hover:bg-red-500">Discard</button>
+                className="flex-1 bg-red-600 text-white py-2 rounded text-sm font-semibold hover:bg-red-500">放弃修改</button>
               <button onClick={handleUnsavedStay}
-                className="flex-1 bg-surface-primary border border-surface-secondary text-text-primary py-2 rounded text-sm hover:bg-surface-primary/80">Stay</button>
+                className="flex-1 bg-surface-primary border border-surface-secondary text-text-primary py-2 rounded text-sm hover:bg-surface-primary/80">继续编辑</button>
             </div>
           </div>
         </div>

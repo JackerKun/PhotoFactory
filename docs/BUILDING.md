@@ -287,3 +287,5 @@ ONNX Runtime、NumPy、rawpy 和模型本身占用数百 MB。不要删除 `_int
 
 MinGW 只能覆盖部分 Rust 交叉编译需求，无法生成 Windows 版 PyInstaller Worker，也不能可靠完成 MSI/NSIS 打包。请使用 Windows 主机或本仓库的 Windows CI。
 
+
+Windows AI 安装包默认包含 ONNX Runtime DirectML；构建会检查打包后的 worker 能否列出 DirectML。系统不支持或模型在加速后端运行失败时，worker 会自动用 CPU 继续。macOS 会尝试 Core ML，使用 CUDA 版 ONNX Runtime 的开发环境会优先尝试 CUDA。通过「后台任务 → AI 运行信息」可核对各模型选择的后端。开发时可以用 `PHOTOFACTORY_AI_PROVIDER=cpu ./start.sh` 强制 CPU，以便比较同一批照片的耗时。

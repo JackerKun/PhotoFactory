@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PhotoFactory 离线地图打包</title>
+<link rel="stylesheet" href="/vendor/leaflet.css">
+<link rel="stylesheet" href="/style.css">
+<script src="/vendor/leaflet.js" defer></script>
+<script src="/vendor/street-vector.js" defer></script>
+<script src="/streets.js" defer></script>
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header><h1>PhotoFactory <span>离线地图</span></h1><div class="tools">
+  <button id="pan" type="button" aria-pressed="true">移动地图</button>
+  <button id="select" type="button" aria-pressed="false">框选范围</button>
+  <button id="fit" type="button" disabled>定位选区</button>
+  <button id="clear-selection" type="button" disabled>清除选区</button>
+  <select id="preview" aria-label="预览底图"><option value="street">预览：标准地图</option><option value="satellite">预览：卫星地图</option></select>
+  <button id="refresh-preview" type="button">应用地图源</button>
+</div></header>
+<main>
+<section id="map-area" aria-label="地图"><div id="map"></div><p id="map-hint">滚轮缩放，拖动地图。点击「框选范围」后拖出要保存的区域。</p></section>
+<aside>
+  <form id="settings">
+    <h2>打包设置</h2>
+    <label>打包范围<select name="mode"><option value="viewed">已浏览的瓦片</option><option value="scan">完整扫描框选区域</option></select></label>
+    <label>打包图层<select name="layer"><option value="standard">标准地图</option><option value="both">两种地图</option><option value="satellite">卫星实景地图</option></select></label>
+    <label id="source-label"><span>地图来源</span><select name="source"><option value="streets">内置街道地图</option><option value="natural-earth">Natural Earth 标准概览（0–6）</option><option value="nasa">NASA 卫星概览（0–8）</option><option value="url">自定义 XYZ 网址</option><option value="directory">本地 XYZ 目录</option></select></label>
+    <p id="source-hint" hidden></p>
+    <div id="primary-source" hidden>
+      <label><span id="primary-value-label">瓦片网址</span><input name="sourceValue"></label>
+      <label>来源署名<input name="credit"></label>
+    </div>
+    <fieldset><legend>缩放层级</legend><div class="range"><label>最低<input type="number" name="minZoom" min="0" max="19" value="0" required></label><label>最高<input type="number" name="maxZoom" min="0" max="19" value="19" required></label></div></fieldset>
+    <fieldset id="satellite-settings" hidden>
+      <legend>卫星实景地图</legend>
+      <label>卫星来源<select name="satelliteSource"><option value="nasa">NASA 卫星概览（0–8）</option><option value="url">自定义 XYZ 网址</option><option value="directory">本地 XYZ 目录</option></select></label>
+      <div id="satellite-source" hidden>
+        <label><span id="satellite-value-label">瓦片网址</span><input name="satelliteValue"></label>
+        <label>卫星来源署名<input name="satelliteCredit"></label>
+      </div>
+      <div class="range"><label>最低<input type="number" name="satelliteMinZoom" min="0" max="19" value="0" required></label><label>最高<input type="number" name="satelliteMaxZoom" min="0" max="19" value="19" required></label></div>
+    </fieldset>
+    <label>地图包名称<input name="name" maxlength="100" placeholder="离线地图"></label>
+    <label>瓦片上限<input type="number" name="limit" min="1" value="20000" required></label>
+    <div class="tools"><button id="estimate" type="button">估算瓦片</button><button id="start" type="submit" class="primary">开始打包</button></div>
+  </form>
+  <section class="task" aria-label="打包进度">
+    <label class="check"><input id="follow" type="checkbox" checked>跟随扫描位置</label>
+    <progress id="progress" max="1" value="0" aria-label="打包进度"></progress>
+    <p id="status" role="status">缩放和平移地图会保存已加载的瓦片。</p>
+    <div class="tools"><button id="stop" type="button" disabled>停止</button><a id="download" class="primary" hidden>下载地图包</a></div>
+  </section>
+</aside>
+</main>
+</body>
+</html>

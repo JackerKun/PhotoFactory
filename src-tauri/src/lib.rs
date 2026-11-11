@@ -5,6 +5,8 @@ pub mod device_tagger;
 pub mod error;
 pub mod geo_tagger;
 pub mod models;
+pub mod offline_maps;
+pub mod process;
 pub mod scanner;
 pub mod tags;
 pub mod thumbnail;

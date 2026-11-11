@@ -162,9 +162,12 @@ export interface StorageSource { id:number; path:string; label:string; kind:stri
 export interface IgnoredFace { id:number; photo_id:number; ignored_at:number }
 export interface PhotoEdit { photo_id:number; crop_json:string; rotation:number; exposure:number; contrast:number; temperature:number; updated_at:number }
 
+export type ThumbnailPerformance = "low" | "balanced" | "full";
+
 export interface ThumbnailProcessingStatus {
   running: boolean;
   batch_size: number;
+  gpu_backend?: string | null;
   total_pending: number;
   processed: number;
   succeeded: number;
@@ -175,7 +178,7 @@ export interface ThumbnailProcessingStatus {
 
 export interface AiProcessingStatus {
   status?: "idle" | "running" | "paused" | "canceled" | "done" | "error";
-  stage: "starting" | "recovering_faces" | "face_detection" | "classification" | "clustering" | "clustering_done" | "clustering_error" | "paused" | "canceled" | "done" | "error" | "idle" | null;
+  stage: "starting" | "recovering_faces" | "face_detection" | "classification" | "clustering" | "clustering_done" | "clustering_error" | "geo_tagging" | "finishing_tags" | "paused" | "canceled" | "done" | "error" | "idle" | null;
   processed: number;
   total: number;
   failed?: number;
@@ -231,7 +234,7 @@ export interface LabelNode {
 export interface SmartAlbum {
   id: number;
   name: string;
-  album_type: "travel" | "monthly" | "themed" | "person" | "manual";
+  album_type: "travel" | "monthly" | "themed" | "person" | "manual" | "person_combination";
   rule_json: string;
   cover_photo_id: number | null;
   photo_count: number;

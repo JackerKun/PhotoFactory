@@ -15,7 +15,7 @@ fn collect_entries(dir: &Path) -> AppResult<Vec<(std::path::PathBuf, u64, System
     for entry_res in WalkDir::new(dir)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.file_type().is_file() && !e.file_name().to_string_lossy().starts_with('.'))
         .filter(|e| e.path().extension().map_or(false, |ext| ext == "webp"))
     {
         let path = entry_res.path().to_path_buf();
@@ -50,11 +50,18 @@ pub fn evict_lru(dir: &Path, target_bytes: u64) -> AppResult<usize> {
     if !dir.exists() {
         return Ok(0);
     }
-    let mut entries = collect_entries(dir)?;
-    // Sort by mtime ascending so the least-recently-used entries come first.
-    entries.sort_by_key(|(_, _, mtime)| *mtime);
+    evict_entries(collect_entries(dir)?, target_bytes)
+}
 
+fn evict_entries(
+    mut entries: Vec<(std::path::PathBuf, u64, SystemTime)>,
+    target_bytes: u64,
+) -> AppResult<usize> {
     let mut total: u64 = entries.iter().map(|(_, size, _)| size).sum();
+    if total <= target_bytes {
+        return Ok(0);
+    }
+    entries.sort_by_key(|(_, _, mtime)| *mtime);
     let mut deleted = 0;
 
     for (path, size, _) in &entries {
@@ -73,12 +80,22 @@ pub fn evict_lru(dir: &Path, target_bytes: u64) -> AppResult<usize> {
 /// If so, evict the least-recently-used files until the cache fits.
 /// Returns the number of files that were evicted.
 pub fn maybe_evict(dir: &Path) -> AppResult<usize> {
-    let current_size = calculate_cache_size(dir)?;
-    if current_size > THUMBNAIL_CACHE_MAX_BYTES {
-        evict_lru(dir, THUMBNAIL_CACHE_MAX_BYTES)
-    } else {
-        Ok(0)
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{LazyLock, Mutex};
+    use std::time::{Duration, Instant};
+
+    static CHECKED: LazyLock<Mutex<HashMap<PathBuf, Instant>>> = LazyLock::new(Default::default);
+    let now = Instant::now();
+    {
+        let mut checked = CHECKED.lock().unwrap();
+        checked.retain(|_, time| now.duration_since(*time) < Duration::from_secs(15));
+        if checked.contains_key(dir) {
+            return Ok(0);
+        }
+        checked.insert(dir.to_owned(), now);
     }
+    evict_entries(collect_entries(dir)?, THUMBNAIL_CACHE_MAX_BYTES)
 }
 
 #[cfg(test)]

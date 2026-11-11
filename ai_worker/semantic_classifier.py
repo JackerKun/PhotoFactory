@@ -135,7 +135,6 @@ def select_semantic_tags(
 
 class SemanticClassifier:
     def __init__(self, models_dir: str | None = None):
-        import onnxruntime as ort
         from tokenizers import Tokenizer
 
         models_dir = models_dir or os.environ.get(
@@ -148,16 +147,12 @@ class SemanticClassifier:
         if missing:
             raise FileNotFoundError("Semantic model is not installed: " + ", ".join(missing))
 
-        options = ort.SessionOptions()
-        threads = int(os.environ.get("PHOTFACTORY_AI_THREADS", "4"))
-        options.inter_op_num_threads = max(1, min(2, threads // 2))
-        options.intra_op_num_threads = max(1, threads)
-        # The int8 graph is intentionally CPU-only. CoreML can accept portions
-        # of this quantized graph but fails later during text execution on some
-        # macOS/ONNX Runtime combinations. Places365 continues to use CoreML.
-        providers = ["CPUExecutionProvider"]
-        self.vision = ort.InferenceSession(vision_path, sess_options=options, providers=providers)
-        self.text = ort.InferenceSession(text_path, sess_options=options, providers=providers)
+        from inference_runtime import InferenceModel
+        # Quantized CLIP uses the CPU kernels on macOS; Windows and CUDA
+        # can try the accelerator, with per-model CPU fallback.
+        import sys
+        self.vision = InferenceModel("semantic_vision", vision_path, accelerate=sys.platform != "darwin")
+        self.text = InferenceModel("semantic_text", text_path, accelerate=False)
 
         tokenizer = Tokenizer.from_file(tokenizer_path)
         tokenizer.enable_truncation(max_length=77)

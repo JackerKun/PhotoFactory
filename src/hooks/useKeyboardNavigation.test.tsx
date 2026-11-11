@@ -45,4 +45,14 @@ describe("useKeyboardNavigation", () => {
     expect(onRatePhoto).not.toHaveBeenCalled();
     input.remove();
   });
+  it("does not change the selected photo while the task dialog is open", () => {
+    const onSelectPhoto = vi.fn();
+    renderHook(() => useKeyboardNavigation({ selectedPhotoId: 10, onSelectPhoto, photoIds: [10,20], columnCount: 1 }));
+    const dialog = document.createElement("dialog");
+    dialog.setAttribute("open", "");
+    document.body.appendChild(dialog);
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    expect(onSelectPhoto).not.toHaveBeenCalled();
+    dialog.remove();
+  });
 });

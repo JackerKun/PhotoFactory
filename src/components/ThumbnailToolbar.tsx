@@ -4,6 +4,7 @@ import PhotoTimeline from "./PhotoTimeline";
 import PhotoSearch from "./PhotoSearch";
 import PhotoFilterPanel from "./PhotoFilterPanel";
 import PhotoSortMenu from "./PhotoSortMenu";
+import ActiveFilters from "./ActiveFilters";
 import StarRating from "./StarRating";
 import * as api from "../api/tauri";
 import KeyboardShortcutsDialog from "./KeyboardShortcutsDialog";
@@ -18,6 +19,7 @@ export default React.memo(function ThumbnailToolbar() {
     photos,
     totalPhotos,
     loading,
+    photoLoadError,
     ratingSelectionMode,
     ratingSelection,
     setRatingSelectionMode,
@@ -41,7 +43,7 @@ export default React.memo(function ThumbnailToolbar() {
             onClick={() => setThumbnailShape("square")}
             className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all ${
               thumbnailShape === "square"
-                ? "bg-bg-secondary text-accent-primary shadow-sm"
+                ? "bg-bg-secondary text-accent-link shadow-sm"
                 : "text-text-muted hover:text-text-primary"
             }`}
             title="方格：像 iOS 相册一样铺满裁切"
@@ -56,7 +58,7 @@ export default React.memo(function ThumbnailToolbar() {
             onClick={() => setThumbnailShape("proportional")}
             className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all ${
               thumbnailShape === "proportional"
-                ? "bg-bg-secondary text-accent-primary shadow-sm"
+                ? "bg-bg-secondary text-accent-link shadow-sm"
                 : "text-text-muted hover:text-text-primary"
             }`}
             title="原比例：保留完整画面并自动铺满每行"
@@ -85,15 +87,16 @@ export default React.memo(function ThumbnailToolbar() {
       </div>
 
       <div className="mt-1.5 flex min-h-5 items-center justify-center gap-3 text-xs text-text-muted" aria-live="polite">
-        <span>{totalPhotos > 0 ? `已加载 ${photos.length.toLocaleString()} / 共 ${totalPhotos.toLocaleString()} 张` : loading ? "正在加载照片…" : "共 0 张"}</span>
+        <span>{totalPhotos > 0 ? `已加载 ${photos.length.toLocaleString()} / 共 ${totalPhotos.toLocaleString()} 张` : loading ? "正在加载照片…" : photoLoadError ? "照片读取失败" : "共 0 张"}</span>
         {ratingSelectionMode && (
           <div className="flex items-center gap-2 rounded-full bg-surface-primary px-3 py-1">
             <span>已选 {ratingSelection.length} 张</span>
             <StarRating value={0} onChange={applyRating} size="sm" disabled={ratingSelection.length === 0} />
-            <button type="button" onClick={clearRatingSelection} className="text-accent-primary">清除选择</button>
+            <button type="button" onClick={clearRatingSelection} className="text-accent-link">清除选择</button>
           </div>
         )}
       </div>
+      <ActiveFilters />
       <KeyboardShortcutsDialog open={showShortcuts} onClose={() => setShowShortcuts(false)} />
     </div>
   );

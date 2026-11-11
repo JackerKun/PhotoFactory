@@ -8,17 +8,17 @@ export function formatFileSize(bytes: number): string {
 }
 
 export function formatDate(timestamp: number | null): string {
-  if (!timestamp) return "Unknown";
-  return new Date(timestamp * 1000).toLocaleDateString("en-US", {
-    year: "numeric", month: "short", day: "numeric",
+  if (!timestamp) return "未知";
+  return new Date(timestamp * 1000).toLocaleDateString("zh-CN", {
+    year: "numeric", month: "long", day: "numeric",
   });
 }
 
 export function formatDateTime(timestamp: number | null): string {
-  if (!timestamp) return "Unknown";
-  return new Date(timestamp * 1000).toLocaleString("en-US", {
-    year: "numeric", month: "short", day: "numeric",
-    hour: "2-digit", minute: "2-digit",
+  if (!timestamp) return "未知";
+  return new Date(timestamp * 1000).toLocaleString("zh-CN", {
+    year: "numeric", month: "long", day: "numeric",
+    hour: "2-digit", minute: "2-digit", hour12: false,
   });
 }
 

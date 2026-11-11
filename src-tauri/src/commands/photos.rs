@@ -3,14 +3,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tauri::State;
 
-use crate::commands::project::{get_conn, AppState};
+use crate::commands::project::{current_project, get_conn, read_project_db, AppState};
 use crate::db::{classification_dao, custom_attr_dao, photo_dao};
 use crate::error::{AppError, AppResult};
 use crate::models::{
     AiClassification, CustomAttribute, Photo, PhotoCursor, PhotoFilter, PhotoFilterOptions,
     PhotoPage, PhotoTimelineBucket,
 };
-use crate::thumbnail::processor::ProcessingStatus;
+use crate::thumbnail::processor::{ProcessingStatus, ThumbnailPerformance};
 use crate::thumbnail::{eviction, generator};
 use base64::Engine;
 use serde::Deserialize;
@@ -27,18 +27,16 @@ pub struct PhotoGpsUpdate {
 /// Global counter tracking concurrent on-demand thumbnail generations.
 /// Used to throttle parallel spawn_blocking calls during fast scrolling.
 static ACTIVE_THUMBNAIL_TASKS: AtomicUsize = AtomicUsize::new(0);
+static THUMBNAIL_SLOT: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 struct ActiveThumbnailGuard;
 
 impl Drop for ActiveThumbnailGuard {
     fn drop(&mut self) {
         ACTIVE_THUMBNAIL_TASKS.fetch_sub(1, Ordering::SeqCst);
+        THUMBNAIL_SLOT.notify_waiters();
     }
 }
-
-/// Maximum concurrent on-demand thumbnail generations. Prevents resource exhaustion
-/// when the user scrolls quickly through many photos without pre-generated thumbnails.
-const MAX_CONCURRENT_THUMBNAILS: usize = 4;
 
 #[tauri::command]
 pub async fn cmd_get_photos(
@@ -47,8 +45,10 @@ pub async fn cmd_get_photos(
     filter: PhotoFilter,
     state: State<'_, AppState>,
 ) -> AppResult<PhotoPage> {
-    let conn = get_conn(state.clone())?;
-    photo_dao::get_photos_page(&conn, cursor.as_ref(), limit.clamp(1, 500), &filter)
+    read_project_db(current_project(&state)?, move |conn| {
+        photo_dao::get_photos_page(conn, cursor.as_ref(), limit.clamp(1, 500), &filter)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -56,8 +56,10 @@ pub async fn cmd_get_photo_timeline(
     filter: PhotoFilter,
     state: State<'_, AppState>,
 ) -> AppResult<Vec<PhotoTimelineBucket>> {
-    let conn = get_conn(state)?;
-    photo_dao::get_photo_timeline(&conn, &filter)
+    read_project_db(current_project(&state)?, move |conn| {
+        photo_dao::get_photo_timeline(conn, &filter)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -65,8 +67,10 @@ pub async fn cmd_get_photo_filter_options(
     filter: PhotoFilter,
     state: State<'_, AppState>,
 ) -> AppResult<PhotoFilterOptions> {
-    let conn = get_conn(state)?;
-    photo_dao::get_photo_filter_options(&conn, &filter)
+    read_project_db(current_project(&state)?, move |conn| {
+        photo_dao::get_photo_filter_options(conn, &filter)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -86,9 +90,11 @@ pub async fn cmd_update_photos_rating(
 
 #[tauri::command]
 pub async fn cmd_get_photo(photo_id: i64, state: State<'_, AppState>) -> AppResult<Photo> {
-    let conn = get_conn(state.clone())?;
-    photo_dao::get_photo_by_id(&conn, photo_id)?
-        .ok_or_else(|| AppError::NotFound(format!("Photo {} not found", photo_id)))
+    read_project_db(current_project(&state)?, move |conn| {
+        photo_dao::get_photo_by_id(conn, photo_id)?
+            .ok_or_else(|| AppError::NotFound(format!("Photo {photo_id} not found")))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -153,9 +159,12 @@ pub async fn cmd_get_thumbnail_path(
             .ok_or_else(|| AppError::Project("No project open".into()))?
             .clone()
     };
-    let conn = get_conn(state)?;
-    let photo = photo_dao::get_photo_by_id(&conn, photo_id)?
-        .ok_or_else(|| AppError::NotFound(format!("Photo {} not found", photo_id)))?;
+    let processor = state.thumbnail_processor.clone();
+    let photo = read_project_db(project.clone(), move |conn| {
+        photo_dao::get_photo_by_id(conn, photo_id)?
+            .ok_or_else(|| AppError::NotFound(format!("Photo {photo_id} not found")))
+    })
+    .await?;
 
     let out_dir = match size.as_str() {
         "large" => project.large_thumbnails_path(),
@@ -171,41 +180,55 @@ pub async fn cmd_get_thumbnail_path(
     // Thumbnail file not found on disk — regenerate on demand regardless of
     // file size or DB status. This handles the case where the user deleted
     // cache files that the database still thinks exist.
-    // Throttle: reject if too many concurrent generations
-    let active = ACTIVE_THUMBNAIL_TASKS.fetch_add(1, Ordering::SeqCst);
-    if active >= MAX_CONCURRENT_THUMBNAILS {
-        ACTIVE_THUMBNAIL_TASKS.fetch_sub(1, Ordering::SeqCst);
-        return Err(AppError::AiWorker(
-            "Too many concurrent thumbnail generations, try again later".into(),
-        ));
-    }
-    let _active_guard = ActiveThumbnailGuard;
+    // Wait for a slot instead of failing visible thumbnails during fast scrolling.
+    let (active_guard, mode) = loop {
+        let mode = processor.performance();
+        let notified = THUMBNAIL_SLOT.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if ACTIVE_THUMBNAIL_TASKS
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+                (active < mode.foreground_limit()).then_some(active + 1)
+            })
+            .is_ok()
+        {
+            break (ActiveThumbnailGuard, mode);
+        }
+        notified.await;
+    };
 
     // Generate on demand — spawn_blocking to avoid blocking the async runtime
     let source = Path::new(&photo.path).to_path_buf();
-    let out_dir_clone = out_dir.clone();
-    let out_dir_for_eviction = out_dir.clone();
-    let size_clone = size.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        if size_clone == "large" {
-            generator::generate_large_thumbnail(&source, &out_dir_clone)
-        } else if size_clone == "medium" {
-            generator::generate_medium_thumbnail(&source, &out_dir_clone)
-        } else {
-            generator::generate_small_thumbnail(&source, &out_dir_clone)
+    let pixels = match size.as_str() {
+        "large" => 1024,
+        "medium" => 512,
+        _ => 256,
+    };
+    tokio::task::spawn_blocking(move || -> AppResult<String> {
+        let _active_guard = active_guard;
+        let result = generator::generate_thumbnail_with_mode(&source, &out_dir, pixels, mode)?;
+        if pixels == 256 && result.exists() {
+            // A valid cached image is usable even if a writer temporarily owns the database.
+            let update = rusqlite::Connection::open_with_flags(
+                project.db_path(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )
+            .and_then(|conn| {
+                conn.busy_timeout(std::time::Duration::from_millis(100))?;
+                conn.execute(
+                    "UPDATE photos SET thumbnail_status = 1 WHERE id = ? AND thumbnail_status <> 1",
+                    [photo_id],
+                )
+            });
+            if let Err(error) = update {
+                eprintln!("Could not record thumbnail status for photo {photo_id}: {error}");
+            }
         }
+        let _ = eviction::maybe_evict(&out_dir);
+        Ok(result.to_string_lossy().into_owned())
     })
     .await
-    .map_err(|e| AppError::AiWorker(format!("spawn_blocking failed: {}", e)))??;
-    // Verify the generated file actually exists before updating DB
-    if result.exists() {
-        photo_dao::update_thumbnail_status(&conn, photo_id, 1)?;
-    }
-    // Trigger LRU eviction after on-demand generation too
-    let _ = eviction::maybe_evict(&out_dir_for_eviction);
-
-    // Return the actual path that was generated
-    Ok(result.to_string_lossy().to_string())
+    .map_err(|error| AppError::Internal(format!("缩略图任务中断：{error}")))?
 }
 
 #[tauri::command]
@@ -224,9 +247,7 @@ pub async fn cmd_start_thumbnail_batch(state: State<'_, AppState>) -> AppResult<
     }
 
     // Spawn the background task so the command returns immediately.
-    tauri::async_runtime::spawn(async move {
-        processor.process_all(&project).await;
-    });
+    tauri::async_runtime::spawn_blocking(move || processor.process_all(&project));
 
     Ok("Thumbnail batch processing started".to_string())
 }
@@ -289,6 +310,21 @@ pub async fn cmd_get_thumbnail_processing_status(
     Ok(state.thumbnail_processor.get_status())
 }
 
+#[tauri::command]
+pub fn cmd_get_thumbnail_performance(state: State<'_, AppState>) -> ThumbnailPerformance {
+    state.thumbnail_processor.performance()
+}
+
+#[tauri::command]
+pub fn cmd_set_thumbnail_performance(
+    mode: ThumbnailPerformance,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    state.thumbnail_processor.set_performance(mode)?;
+    THUMBNAIL_SLOT.notify_waiters();
+    Ok(())
+}
+
 /// Scan all photos for missing thumbnails and regenerate them.
 /// Checks both sharded and legacy thumbnail paths. Existing thumbnails are skipped.
 #[tauri::command]
@@ -306,7 +342,7 @@ pub async fn cmd_rebuild_thumbnail_cache(state: State<'_, AppState>) -> AppResul
     }
 
     let project_clone = project.clone();
-    tauri::async_runtime::spawn(async move {
+    tauri::async_runtime::spawn_blocking(move || {
         let conn = match crate::db::connection::init_db(&project_clone.db_path()) {
             Ok(c) => c,
             Err(_) => return,
@@ -338,7 +374,7 @@ pub async fn cmd_rebuild_thumbnail_cache(state: State<'_, AppState>) -> AppResul
             photos.len()
         );
         // Start batch processing for the newly marked pending photos
-        processor.process_all(&project_clone).await;
+        processor.process_all(&project_clone);
     });
 
     Ok("Thumbnail cache rebuild started".to_string())

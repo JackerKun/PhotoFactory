@@ -19,10 +19,15 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: https://asset.localhost file: data: blob:; connect-src 'self' http://localhost:* ipc: http://ipc.localhost;",
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost https://asset.localhost file: data: blob:; connect-src 'self' http://localhost:* ipc: http://ipc.localhost;",
       "assetProtocol": {
         "enable": true,
-        "scope": ["$HOME/**", "**/.*/**/*"]
+        "scope": {
+          "allow": [
+            "$HOME/**"
+          ],
+          "requireLiteralLeadingDot": false
+        }
       }
     }
   },

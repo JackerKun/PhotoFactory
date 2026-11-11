@@ -2,6 +2,7 @@
 """Face detection and embedding extraction using ONNX Runtime."""
 
 import os
+import time
 import sys
 import math
 from typing import List, Optional, Tuple
@@ -11,6 +12,8 @@ from PIL import Image
 # Allow running both as module and script
 sys.path.insert(0, os.path.dirname(__file__))
 from server import DetectedFace
+from inference_runtime import InferenceModel
+from image_input import open_ai_image
 
 
 class FaceDetector:
@@ -27,7 +30,6 @@ class FaceDetector:
     _VARIANCE = [0.1, 0.2]  # Standard RetinaFace variance
 
     def __init__(self, det_model_path: Optional[str] = None, rec_model_path: Optional[str] = None):
-        import onnxruntime as ort
         models_dir = os.environ.get(
             "AI_MODELS_DIR", os.path.join(os.path.dirname(__file__), "models")
         )
@@ -39,28 +41,8 @@ class FaceDetector:
         if not os.path.exists(rec_path):
             raise FileNotFoundError(f"ArcFace model not found at {rec_path}. Run download_models.py first.")
 
-        # Use CoreML on macOS for near-zero CPU usage; fall back to CPU with limited threads
-        providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
-        session_options = ort.SessionOptions()
-        thread_count = int(os.environ.get(
-            "PHOTFACTORY_AI_THREADS", max(2, min(6, (os.cpu_count() or 4) // 2))
-        ))
-        session_options.inter_op_num_threads = max(1, min(2, thread_count // 2))
-        session_options.intra_op_num_threads = thread_count
-        try:
-            self.det_session = ort.InferenceSession(det_path, sess_options=session_options, providers=providers)
-            self.rec_session = ort.InferenceSession(rec_path, sess_options=session_options, providers=providers)
-        except Exception as exc:
-            # CoreML can be present but unavailable (for example, if its model-cache
-            # directory cannot be created). ONNX Runtime does not automatically retry
-            # session construction with the next provider in that case.
-            print(f"CoreML initialization failed; using bounded CPU inference: {exc}", flush=True)
-            self.det_session = ort.InferenceSession(
-                det_path, sess_options=session_options, providers=["CPUExecutionProvider"]
-            )
-            self.rec_session = ort.InferenceSession(
-                rec_path, sess_options=session_options, providers=["CPUExecutionProvider"]
-            )
+        self.det_session = InferenceModel("face_detection", det_path)
+        self.rec_session = InferenceModel("face_embedding", rec_path, static_batch_symbol="None")
         self.det_input_name = self.det_session.get_inputs()[0].name
         self.rec_input_name = self.rec_session.get_inputs()[0].name
         rec_batch = self.rec_session.get_inputs()[0].shape[0]
@@ -85,48 +67,80 @@ class FaceDetector:
                         anchors.append([cx, cy, w, h])
         return np.array(anchors, dtype=np.float32)
 
-    def detect(self, image_path: str) -> List[DetectedFace]:
-        """Detect faces and return bounding boxes with embeddings."""
-        source = Image.open(image_path)
-        source_w, source_h = source.size
-        # JPEG decoders can discard high-frequency blocks while decoding. This
-        # avoids materializing a 40–100 MP frame when detection only needs 640px.
-        source.draft("RGB", (self._INPUT_SIZE, self._INPUT_SIZE))
-        image = source.convert("RGB")
-        orig_w, orig_h = image.size
-        output_scale_x = source_w / max(orig_w, 1)
-        output_scale_y = source_h / max(orig_h, 1)
-
-        # Preprocess
+    def detect(self, image_path: str, preview_path: str | None = None, timings: dict | None = None) -> List[DetectedFace]:
+        """Detect on a compatible cached preview, then embed crops from the source."""
+        start = time.perf_counter()
+        with open_ai_image(image_path) as (source, (source_w, source_h)):
+            reduced_source = source.size != (source_w, source_h)
+            image = None
+            if preview_path:
+                try:
+                    if os.path.getmtime(preview_path) >= os.path.getmtime(image_path):
+                        with Image.open(preview_path) as preview:
+                            pw, ph = preview.size
+                            # Direct-format thumbnails preserve encoded pixel orientation.
+                            # Allow one pixel of rounding from the Rust thumbnail scaler.
+                            aspect_error = (abs(ph - source_h * pw / source_w) if source_w >= source_h
+                                            else abs(pw - source_w * ph / source_h))
+                            if (max(pw, ph) >= self._INPUT_SIZE and aspect_error <= 1.1
+                                and pw <= source_w and ph <= source_h):
+                                image = preview.convert("RGB")
+                except (OSError, ValueError):
+                    pass
+            used_preview = image is not None
+            if image is None:
+                if not reduced_source:
+                    source.draft("RGB", (self._INPUT_SIZE, self._INPUT_SIZE))
+                image = source.convert("RGB")
+        decoded = time.perf_counter()
+        width, height = image.size
+        sx, sy = source_w / width, source_h / height
         inp, scale, pad_x, pad_y = self._preprocess(image)
-
-        # Run detection
         det_outputs = self.det_session.run(None, {self.det_input_name: inp})
+        boxes = self._decode_boxes(det_outputs, scale, pad_x, pad_y, width, height)
+        detected = time.perf_counter()
 
-        # Decode boxes
-        boxes = self._decode_boxes(det_outputs, scale, pad_x, pad_y, orig_w, orig_h)
+        def prepare(full_image):
+            crop_sx, crop_sy = full_image.width / width, full_image.height / height
+            prepared = []
+            for x, y, w, h, landmarks, score in boxes:
+                left, top = max(0, round(x * sx)), max(0, round(y * sy))
+                right = min(source_w, max(left + 1, round((x + w) * sx)))
+                bottom = min(source_h, max(top + 1, round((y + h) * sy)))
+                points = None if landmarks is None else np.asarray(landmarks) * [sx, sy]
+                crop_points = None if landmarks is None else np.asarray(landmarks) * [crop_sx, crop_sy]
+                crop = self._align_face(full_image, crop_points)
+                aligned = crop is not None
+                if crop is None:
+                    crop_left, crop_top = max(0, round(x * crop_sx)), max(0, round(y * crop_sy))
+                    crop_right = min(full_image.width, max(crop_left + 1, round((x + w) * crop_sx)))
+                    crop_bottom = min(full_image.height, max(crop_top + 1, round((y + h) * crop_sy)))
+                    crop = full_image.crop((crop_left, crop_top, crop_right, crop_bottom))
+                yaw, pitch, roll = self._estimate_pose(landmarks)
+                quality = self._quality_score(crop, score, right - left, bottom - top, yaw, pitch, roll, aligned)
+                prepared.append((crop, left, top, right - left, bottom - top, points,
+                                 score, quality, yaw, pitch, roll, aligned))
+            return prepared
 
+        crop_decoded = detected
         prepared = []
-        for x, y, w, h, landmarks, score in boxes:
-            face_crop = self._align_face(image, landmarks)
-            alignment_success = face_crop is not None
-            if face_crop is None:
-                face_crop = image.crop((
-                    max(0, x), max(0, y),
-                    min(orig_w, x + w), min(orig_h, y + h)
-                ))
-            yaw, pitch, roll = self._estimate_pose(landmarks)
-            quality = self._quality_score(
-                face_crop, score, int(w * output_scale_x), int(h * output_scale_y),
-                yaw, pitch, roll, alignment_success
-            )
-            output_landmarks = None if landmarks is None else np.asarray(landmarks) * np.array([output_scale_x, output_scale_y])
-            prepared.append((
-                face_crop, int(x * output_scale_x), int(y * output_scale_y),
-                int(w * output_scale_x), int(h * output_scale_y), output_landmarks,
-                score, quality, yaw, pitch, roll, alignment_success
-            ))
+        if boxes:
+            if not used_preview and (reduced_source or image.size == (source_w, source_h)):
+                prepared = prepare(image)
+            else:
+                with open_ai_image(image_path) as (full_source, _):
+                    full_image = full_source if full_source.mode == "RGB" else full_source.convert("RGB")
+                    full_image.load()
+                    crop_decoded = time.perf_counter()
+                    prepared = prepare(full_image)
         embeddings = self._get_embeddings([item[0] for item in prepared])
+        if timings is not None:
+            timings.update(
+                preview_hits=int(used_preview),
+                decode_ms=1000 * (decoded - start + crop_decoded - detected),
+                detect_ms=1000 * (detected - decoded),
+                embed_ms=1000 * (time.perf_counter() - crop_decoded),
+            )
         results = []
         for item, embedding in zip(prepared, embeddings):
             _, x, y, w, h, landmarks, score, quality, yaw, pitch, roll, alignment_success = item
@@ -359,10 +373,11 @@ class FaceDetector:
         if not face_images:
             return []
         prepared = [self._prepare_embedding_input(image) for image in face_images]
-        if self.rec_supports_batch and len(prepared) > 1:
-            batches = [np.concatenate(prepared, axis=0)]
-        else:
-            batches = prepared
+        batch_size = 8 if self.rec_supports_batch and self.rec_session.provider not in (
+            "DmlExecutionProvider", "CoreMLExecutionProvider",
+        ) else 1
+        batches = (np.concatenate(prepared[start:start + batch_size], axis=0)
+                   for start in range(0, len(prepared), batch_size))
         embeddings = []
         for batch in batches:
             output = self.rec_session.run(None, {self.rec_input_name: batch})[0]

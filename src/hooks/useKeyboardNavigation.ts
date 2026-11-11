@@ -41,7 +41,7 @@ export function useKeyboardNavigation({
       if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable) {
         return;
       }
-      if (isLightboxOpen || document.querySelector('[role="dialog"][aria-label="键盘快捷键"]')) return;
+      if (isLightboxOpen || document.querySelector('dialog[open], [role="dialog"][aria-label="键盘快捷键"]')) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
 
       const ids = photoIdsRef.current;

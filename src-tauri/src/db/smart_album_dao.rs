@@ -1,5 +1,5 @@
 // src-tauri/src/db/smart_album_dao.rs
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
@@ -15,6 +15,138 @@ pub struct SmartAlbum {
     pub photo_count: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersonCombination {
+    person_ids: Vec<i64>,
+    exact: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupPhoto {
+    pub photo_id: i64,
+    pub people_count: i64,
+    pub unconfirmed_count: i64,
+}
+
+// A confirmed identity is counted once (mirrors, collages, etc.). A real face
+// with no reliable identity contributes to the visible count, but never to a
+// saved person's membership. Ignored and suspected detections do not count.
+const GROUP_QUERY: &str = "
+WITH selected AS (SELECT CAST(value AS INTEGER) AS id FROM json_each(?1)),
+face_counts AS (
+  SELECT fd.photo_id,
+         COUNT(DISTINCT CASE WHEN COALESCE(fd.review_status,'active')='active' THEN fd.person_id END) AS known,
+         SUM(CASE WHEN fd.person_id IS NULL OR fd.review_status='identity_review' THEN 1 ELSE 0 END) AS unconfirmed,
+         COUNT(DISTINCT CASE WHEN COALESCE(fd.review_status,'active')='active' AND fd.person_id IN (SELECT id FROM selected)
+                             THEN fd.person_id END) AS matched
+  FROM face_detections fd JOIN photos p ON p.id=fd.photo_id
+  WHERE p.deleted=0 AND COALESCE(fd.review_status,'active') IN ('active','identity_review')
+  GROUP BY fd.photo_id
+), matches AS (
+  SELECT photo_id, known+unconfirmed AS total, unconfirmed
+  FROM face_counts WHERE known+unconfirmed >= 2
+    AND (?2=0 OR (?2<4 AND known+unconfirmed=?2) OR (?2=4 AND known+unconfirmed>=4))
+    AND matched=(SELECT COUNT(*) FROM selected)
+    AND (NOT ?3 OR known+unconfirmed=matched)
+)";
+
+pub fn get_group_photos(
+    conn: &rusqlite::Connection,
+    people: &[i64],
+    size: i64,
+    exact: bool,
+    cursor: Option<i64>,
+    limit: i64,
+) -> AppResult<Vec<GroupPhoto>> {
+    let people = serde_json::json!(people).to_string();
+    let mut stmt = conn.prepare(&format!(
+        "{GROUP_QUERY}
+        SELECT photo_id,total,unconfirmed FROM matches
+        WHERE (?4 IS NULL OR photo_id < ?4) ORDER BY photo_id DESC LIMIT ?5"
+    ))?;
+    let rows = stmt.query_map(
+        params![people, size, exact, cursor, limit.clamp(1, 200)],
+        |row| {
+            Ok(GroupPhoto {
+                photo_id: row.get(0)?,
+                people_count: row.get(1)?,
+                unconfirmed_count: row.get(2)?,
+            })
+        },
+    )?;
+    rows.collect::<Result<_, _>>().map_err(Into::into)
+}
+
+pub fn create_person_combination(
+    conn: &rusqlite::Connection,
+    name: &str,
+    mut person_ids: Vec<i64>,
+    exact: bool,
+) -> AppResult<i64> {
+    let name = name.trim();
+    person_ids.sort_unstable();
+    person_ids.dedup();
+    if name.is_empty() || !(2..=20).contains(&person_ids.len()) {
+        return Err(AppError::Project(
+            "请输入相册名称，并选择 2–20 位已命名人物".into(),
+        ));
+    }
+    for id in &person_ids {
+        let named: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM face_clusters fc LEFT JOIN person_metadata pm ON pm.person_id=fc.id
+             WHERE fc.id=?1 AND TRIM(COALESCE(NULLIF(fc.name,''),pm.user_name,''))<>'')",
+            [id], |row| row.get(0),
+        )?;
+        if !named {
+            return Err(AppError::Project("人物已变化，请刷新后重新选择".into()));
+        }
+    }
+    let rule = serde_json::json!({ "person_ids": person_ids, "exact": exact }).to_string();
+    conn.execute(
+        "INSERT INTO smart_albums(name,album_type,rule_json) VALUES (?1,'person_combination',?2)",
+        params![name, rule],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn combination_rule(json: &str) -> AppResult<PersonCombination> {
+    serde_json::from_str(json)
+        .map_err(|error| AppError::Project(format!("人物组合相册规则无法读取：{error}")))
+}
+
+pub fn replace_combination_person(
+    conn: &rusqlite::Connection,
+    source: i64,
+    target: i64,
+) -> AppResult<()> {
+    let mut stmt = conn
+        .prepare("SELECT id,rule_json FROM smart_albums WHERE album_type='person_combination'")?;
+    let albums = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    for (id, json) in albums {
+        let mut rule = combination_rule(&json)?;
+        if !rule.person_ids.contains(&source) {
+            continue;
+        }
+        for person in &mut rule.person_ids {
+            if *person == source {
+                *person = target;
+            }
+        }
+        rule.person_ids.sort_unstable();
+        rule.person_ids.dedup();
+        conn.execute(
+            "UPDATE smart_albums SET rule_json=?2, updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+            params![id, serde_json::json!(rule).to_string()],
+        )?;
+    }
+    Ok(())
 }
 
 /// Get all smart albums with photo counts.
@@ -40,7 +172,26 @@ pub fn get_all_smart_albums(conn: &rusqlite::Connection) -> AppResult<Vec<SmartA
             updated_at: row.get(7)?,
         })
     })?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.into())
+    let mut albums = rows.collect::<Result<Vec<_>, _>>()?;
+    for album in &mut albums {
+        if album.album_type != "person_combination" {
+            continue;
+        }
+        let rule = combination_rule(&album.rule_json)?;
+        if rule.person_ids.len() < 2 {
+            album.cover_photo_id = None;
+            continue;
+        }
+        let people = serde_json::json!(rule.person_ids).to_string();
+        let (count, cover) = conn.query_row(
+            &format!("{GROUP_QUERY} SELECT COUNT(*), COALESCE(MAX(CASE WHEN photo_id=?4 THEN photo_id END), MAX(photo_id)) FROM matches"),
+            params![people, 0, rule.exact, album.cover_photo_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        album.photo_count = count;
+        album.cover_photo_id = cover;
+    }
+    Ok(albums)
 }
 
 /// Get photos in a smart album with pagination.
@@ -51,6 +202,30 @@ pub fn get_album_photos(
     cursor: Option<i64>,
     limit: i64,
 ) -> AppResult<Vec<(i64, i64)>> {
+    let combination: Option<String> = conn
+        .query_row(
+            "SELECT rule_json FROM smart_albums WHERE id=?1 AND album_type='person_combination'",
+            [album_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(json) = combination {
+        let rule = combination_rule(&json)?;
+        if rule.person_ids.len() < 2 {
+            return Ok(vec![]);
+        }
+        return Ok(get_group_photos(
+            conn,
+            &rule.person_ids,
+            0,
+            rule.exact,
+            cursor.and_then(i64::checked_neg),
+            limit,
+        )?
+        .into_iter()
+        .map(|row| (row.photo_id, -row.photo_id))
+        .collect());
+    }
     let mut stmt = conn.prepare(
         "SELECT sap.photo_id, sap.position
          FROM smart_album_photos sap
@@ -191,6 +366,32 @@ pub fn remove_photos_from_album(
 }
 
 pub fn set_album_cover(conn: &rusqlite::Connection, album_id: i64, photo_id: i64) -> AppResult<()> {
+    let rule: Option<String> = conn
+        .query_row(
+            "SELECT rule_json FROM smart_albums WHERE id=?1 AND album_type='person_combination'",
+            [album_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(json) = rule {
+        let rule = combination_rule(&json)?;
+        if rule.person_ids.len() >= 2
+            && get_group_photos(
+                conn,
+                &rule.person_ids,
+                0,
+                rule.exact,
+                photo_id.checked_add(1),
+                1,
+            )?
+            .first()
+            .is_some_and(|row| row.photo_id == photo_id)
+        {
+            conn.execute("UPDATE smart_albums SET cover_photo_id=?2,updated_at=CURRENT_TIMESTAMP WHERE id=?1", params![album_id,photo_id])?;
+            return Ok(());
+        }
+        return Err(AppError::Project("照片不在此组合相册中".into()));
+    }
     let changed = conn.execute(
         "UPDATE smart_albums SET cover_photo_id = ?2, updated_at = CURRENT_TIMESTAMP
          WHERE id = ?1 AND EXISTS (
@@ -209,10 +410,13 @@ pub fn set_album_cover(conn: &rusqlite::Connection, album_id: i64, photo_id: i64
 pub fn regenerate_smart_albums(conn: &rusqlite::Connection) -> AppResult<i64> {
     conn.execute(
         "DELETE FROM smart_album_photos WHERE album_id IN
-         (SELECT id FROM smart_albums WHERE album_type <> 'manual')",
+         (SELECT id FROM smart_albums WHERE album_type NOT IN ('manual','person_combination'))",
         [],
     )?;
-    conn.execute("DELETE FROM smart_albums WHERE album_type <> 'manual'", [])?;
+    conn.execute(
+        "DELETE FROM smart_albums WHERE album_type NOT IN ('manual','person_combination')",
+        [],
+    )?;
 
     let mut count = 0i64;
 
@@ -453,8 +657,10 @@ fn generate_person_albums(conn: &rusqlite::Connection) -> AppResult<i64> {
             "INSERT INTO smart_album_photos (album_id, photo_id, position)
              SELECT ?1, p.id, ROW_NUMBER() OVER (ORDER BY COALESCE(p.taken_at, p.file_mtime) DESC)
              FROM photos p
-             JOIN face_detections fd ON fd.photo_id = p.id
-             WHERE fd.person_id = ?2 AND p.deleted = 0
+             WHERE p.deleted = 0 AND EXISTS (
+                 SELECT 1 FROM face_detections fd WHERE fd.photo_id=p.id AND fd.person_id=?2
+                   AND COALESCE(fd.review_status,'active')='active'
+             )
              ORDER BY COALESCE(p.taken_at, p.file_mtime) DESC
              LIMIT 200",
             params![album_id, person_id],
@@ -498,6 +704,89 @@ mod tests {
              VALUES (?1, ?2, ?3, 1000, ?4, ?4, ?4, 0)",
             params![id, path, format!("photo_{}.jpg", id), taken_at],
         ).unwrap();
+    }
+
+    #[test]
+    fn group_filters_and_saved_combinations_track_current_people() {
+        let conn = new_in_memory_db();
+        for (id, name) in [(1, "甲"), (2, "乙"), (3, "丙"), (4, "丁")] {
+            conn.execute(
+                "INSERT INTO face_clusters(id,name,face_count,created_at) VALUES (?1,?2,0,0)",
+                params![id, name],
+            )
+            .unwrap();
+        }
+        for id in 1..=5 {
+            insert_photo(&conn, id, &format!("/{id}.jpg"), id);
+        }
+        for (photo, person, status) in [
+            (1, Some(1), "active"),
+            (1, Some(1), "active"),
+            (1, Some(2), "active"),
+            (1, None, "ignored"),
+            (2, Some(1), "active"),
+            (2, Some(2), "active"),
+            (2, Some(3), "identity_review"),
+            (3, Some(1), "active"),
+            (3, None, "suspected_false_positive"),
+            (4, Some(1), "active"),
+            (4, Some(2), "active"),
+            (4, Some(3), "active"),
+            (4, Some(4), "active"),
+            (5, Some(1), "active"),
+            (5, Some(2), "active"),
+        ] {
+            conn.execute("INSERT INTO face_detections(photo_id,person_id,review_status,created_at) VALUES (?1,?2,?3,0)",params![photo,person,status]).unwrap();
+        }
+        conn.execute("UPDATE photos SET deleted=1 WHERE id=5", [])
+            .unwrap();
+        assert_eq!(
+            get_group_photos(&conn, &[], 2, false, None, 20).unwrap()[0].photo_id,
+            1
+        );
+        let three = get_group_photos(&conn, &[], 3, false, None, 20).unwrap();
+        assert_eq!((three[0].photo_id, three[0].unconfirmed_count), (2, 1));
+        assert_eq!(
+            get_group_photos(&conn, &[], 4, false, None, 20).unwrap()[0].photo_id,
+            4
+        );
+        assert_eq!(
+            get_group_photos(&conn, &[1, 2], 0, false, None, 20)
+                .unwrap()
+                .len(),
+            3
+        );
+        let album = create_person_combination(&conn, "  家人  ", vec![1, 2, 2], true).unwrap();
+        assert_eq!(
+            get_album_photos(&conn, album, None, 20).unwrap(),
+            vec![(1, -1)]
+        );
+        assert!(get_album_photos(&conn, album, Some(-1), 20)
+            .unwrap()
+            .is_empty());
+        conn.execute(
+            "UPDATE face_detections SET review_status='ignored' WHERE photo_id=2 AND person_id=3",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            get_album_photos(&conn, album, None, 20).unwrap(),
+            vec![(2, -2), (1, -1)]
+        );
+        set_album_cover(&conn, album, 1).unwrap();
+        assert!(set_album_cover(&conn, album, 3).is_err());
+        regenerate_smart_albums(&conn).unwrap();
+        let albums = get_all_smart_albums(&conn).unwrap();
+        let saved = albums.iter().find(|item| item.id == album).unwrap();
+        assert_eq!(
+            (saved.name.as_str(), saved.photo_count, saved.cover_photo_id),
+            ("家人", 2, Some(1))
+        );
+        super::super::face_dao::merge_clusters(&conn, 2, 3).unwrap();
+        assert_eq!(
+            get_album_photos(&conn, album, None, 20).unwrap(),
+            vec![(2, -2), (1, -1)]
+        );
     }
 
     fn insert_classification(conn: &Connection, photo_id: i64, label: &str, tag_type: &str) {

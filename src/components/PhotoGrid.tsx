@@ -174,7 +174,7 @@ function TagHeader({ label, onBack, onClear }: { label: string; onBack: () => vo
       <button
         onClick={onBack}
         className="text-text-muted hover:text-text-primary p-1 rounded transition-colors"
-        title="Back to Tags"
+        title="返回标签"
       >
         <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2">
           <path d="M12 4L6 10L12 16" strokeLinecap="round" strokeLinejoin="round" />
@@ -233,13 +233,13 @@ function PersonHeader({ personId, onBack, onClear }: { personId: number; onBack:
       <button
         onClick={onBack}
         className="text-text-muted hover:text-text-primary p-1 rounded transition-colors"
-        title="Back to People"
+        title="返回人物"
       >
         <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2">
           <path d="M12 4L6 10L12 16" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       </button>
-      <h2 className="text-lg font-bold">{personName || "Loading..."}</h2>
+      <h2 className="text-lg font-bold">{personName || "正在加载…"}</h2>
       {photoCount > 0 && (
         <span className="text-sm text-text-muted">{photoCount} 张照片</span>
       )}
@@ -255,7 +255,8 @@ function PersonHeader({ personId, onBack, onClear }: { personId: number; onBack:
 }
 
 export default function PhotoGrid({ onSelectPhoto, onDoubleClickPhoto, selectedPhotoId }: Props) {
-  const { photos, loading, filter, thumbnailShape } = useStore();
+  const { photos, loading, filter, thumbnailShape, photoLoadError, loadPhotos, loadMore } = useStore();
+  const hasFilters = Object.entries(filter).some(([key, value]) => !key.startsWith("sort_") && value != null && value !== "");
   const clearPhotoFilters = useStore((state) => state.clearPhotoFilters);
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -327,9 +328,19 @@ export default function PhotoGrid({ onSelectPhoto, onDoubleClickPhoto, selectedP
         )}
         <PhotoTimelineRail active={activeTimelinePosition} onJump={handleTimelineJump} />
       </div>
-      {!loading && photos.length === 0 && (
-        <div className="absolute inset-x-0 top-28 text-center py-8 text-text-muted">
-          No photos found. Import a folder to get started.
+      {loading && photos.length === 0 && (
+        <div role="status" className="pointer-events-none absolute inset-x-0 top-1/2 text-center text-sm text-text-secondary">正在读取照片库…</div>
+      )}
+      {photoLoadError && (
+        <div role="alert" className="absolute inset-x-0 bottom-4 z-10 mx-auto w-fit max-w-[90%] rounded-xl border border-surface-secondary bg-bg-secondary p-3 text-sm shadow-lg">
+          <span>读取照片失败。{photoLoadError.message}</span>
+          <button type="button" className="ui-button ml-2" onClick={() => void (photoLoadError.page === "next" ? loadMore() : loadPhotos())}>重试</button>
+        </div>
+      )}
+      {!loading && !photoLoadError && photos.length === 0 && (
+        <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 px-8 text-center text-sm text-text-secondary">
+          <p>{hasFilters ? "没有符合当前条件的照片" : "照片库暂无照片，请导入照片文件夹。"}</p>
+          {hasFilters && <button type="button" className="ui-button mt-3" onClick={handleClearFilters}>清除筛选</button>}
         </div>
       )}
     </div>

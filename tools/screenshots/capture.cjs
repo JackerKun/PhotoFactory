@@ -1,8 +1,8 @@
 const {spawn}=require('node:child_process');
 const root=require('node:path').resolve(__dirname,'../..');
 const fsPrep=require('node:fs'),pathPrep=require('node:path');
-const cache=pathPrep.join(__dirname,'.capture');fsPrep.mkdirSync(cache,{recursive:true});
-const app=fsPrep.mkdtempSync(pathPrep.join(cache,'app-'));
+const cache=pathPrep.join(require('node:os').tmpdir(),'photofactory-doc-capture');fsPrep.mkdirSync(cache,{recursive:true});
+const app=fsPrep.realpathSync(fsPrep.mkdtempSync(pathPrep.join(cache,'app-')));
 fsPrep.cpSync(pathPrep.join(root,'src'),pathPrep.join(app,'src'),{recursive:true});
 for(const name of ['index.html','package.json','tsconfig.json','tailwind.config.js','postcss.config.js'])fsPrep.copyFileSync(pathPrep.join(root,name),pathPrep.join(app,name));
 fsPrep.mkdirSync(pathPrep.join(app,'public/demo'),{recursive:true});

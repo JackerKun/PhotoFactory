@@ -1,8 +1,8 @@
+import Icon, { type IconName } from "./Icon";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "../api/tauri";
 import type { ManualTag } from "../types";
 import { useStore } from "../hooks/usePhotos";
-import AiStatusIndicator from "./AiStatusIndicator";
 
 interface Props { onSelectTag: (label: string) => void }
 type TagLayout = "cards" | "palette" | "compact";
@@ -14,10 +14,9 @@ const layoutOptions: { id: TagLayout; label: string; icon: string }[] = [
   { id: "palette", label: "色板", icon: "●" },
   { id: "compact", label: "列表", icon: "☰" },
 ];
-const categoryIcons: Record<string, string> = {
-  "人物": "👤", "活动": "🏃", "动物": "🐾", "食物": "🍽️", "交通": "🚙", "物品": "📦",
-  "自然": "🌿", "天气": "☀️", "建筑": "🏛️", "场景": "🖼️", "地点": "📍", "时间": "🕐",
-  "事件": "🎉", "设备": "📷", "色彩与氛围": "🎨", "其他": "🏷️",
+const categoryIcons: Record<string, IconName> = {
+  "自然": "nature", "天气": "weather", "建筑": "building", "场景": "photos", "地点": "location", "时间": "time",
+  "事件": "event", "设备": "photos", "色彩与氛围": "colors", "其他": "tags",
 };
 const sourceNames: Record<string, string> = {
   ai_semantic: "语义", ai_scene: "场景", geo_location: "地点", time_period: "时间",
@@ -109,7 +108,7 @@ export default React.memo(function TagView({ onSelectTag }: Props) {
 
   const tagActions = (tag: ManualTag) => (
     <div className="flex items-center gap-1">
-      <button onClick={(event) => { event.stopPropagation(); openEdit(tag); }} className="h-8 w-8 rounded-full hover:bg-black/[0.06] text-text-muted" title="编辑标签" aria-label="编辑标签">
+      <button onClick={(event) => { event.stopPropagation(); openEdit(tag); }} className="h-8 w-8 rounded-full hover:bg-text-primary/[0.06] text-text-muted" title="编辑标签" aria-label="编辑标签">
         <svg className="mx-auto" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="m4 20 4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20Z"/><path d="m13.5 7.5 3 3"/></svg>
       </button>
       <button onClick={(event) => { event.stopPropagation(); remove(tag); }} className="h-8 w-8 rounded-full hover:bg-red-50 text-text-muted hover:text-red-500" title="删除标签" aria-label="删除标签">
@@ -127,31 +126,30 @@ export default React.memo(function TagView({ onSelectTag }: Props) {
         </div>
         <div className="flex items-center gap-3">
           <div className="flex p-1 rounded-xl bg-black/[0.045]">
-            <button onClick={() => setMode("smart")} className={`h-8 rounded-lg px-3 text-sm ${mode === "smart" ? "bg-white shadow-sm" : "text-text-muted"}`}>智能分类</button>
-            <button onClick={() => setMode("editable")} className={`h-8 rounded-lg px-3 text-sm ${mode === "editable" ? "bg-white shadow-sm" : "text-text-muted"}`}>可编辑标签</button>
+            <button onClick={() => setMode("smart")} className={`h-8 rounded-lg px-3 text-sm ${mode === "smart" ? "bg-bg-secondary shadow-sm" : "text-text-muted"}`}>智能分类</button>
+            <button onClick={() => setMode("editable")} className={`h-8 rounded-lg px-3 text-sm ${mode === "editable" ? "bg-bg-secondary shadow-sm" : "text-text-muted"}`}>可编辑标签</button>
           </div>
-          {mode === "editable" && <div className="flex p-1 rounded-xl bg-black/[0.045]">{layoutOptions.map((option) => <button key={option.id} onClick={() => changeLayout(option.id)} title={`${option.label}布局`} className={`h-8 min-w-9 px-2 rounded-lg text-sm ${layout === option.id ? "bg-white shadow-sm" : "text-text-muted hover:text-text-primary"}`}>{option.icon}</button>)}</div>}
-          <button onClick={calculateAiTags} disabled={aiStarting || (!!aiStage && aiStage !== "done" && aiStage !== "error")} className="rounded-xl bg-white/80 border border-black/[0.07] px-4 py-2 text-sm font-medium shadow-sm hover:bg-white disabled:opacity-50">{aiStarting ? "启动中…" : "✦ AI 计算标签"}</button>
+          {mode === "editable" && <div className="flex p-1 rounded-xl bg-black/[0.045]">{layoutOptions.map((option) => <button key={option.id} onClick={() => changeLayout(option.id)} title={`${option.label}布局`} className={`h-8 min-w-9 px-2 rounded-lg text-sm ${layout === option.id ? "bg-bg-secondary shadow-sm" : "text-text-muted hover:text-text-primary"}`}>{option.icon}</button>)}</div>}
+          <button onClick={calculateAiTags} disabled={aiStarting || (!!aiStage && aiStage !== "done" && aiStage !== "error")} className="rounded-xl bg-bg-secondary/80 border border-text-primary/[0.07] px-4 py-2 text-sm font-medium shadow-sm hover:bg-bg-secondary disabled:opacity-50">{aiStarting ? "启动中…" : "✦ AI 计算标签"}</button>
           {mode === "editable" && <button onClick={openCreate} className="rounded-xl bg-accent-primary text-white px-4 py-2 text-sm font-medium shadow-sm hover:brightness-105">＋ 新建标签</button>}
         </div>
       </div>
 
-      <AiStatusIndicator />
 
-      {message && <div className="mb-4 flex justify-between rounded-xl bg-red-50 border border-red-100 px-4 py-2.5 text-sm text-red-600"><span>{message}</span><button onClick={() => setMessage(null)}>关闭</button></div>}
+      {message && <div className="mb-4 flex justify-between rounded-xl bg-red-50 dark:bg-red-950/40 border border-red-100 px-4 py-2.5 text-sm text-red-600 dark:text-red-300"><span>{message}</span><button onClick={() => setMessage(null)}>关闭</button></div>}
 
       {mode === "smart" && <>
-        <div className="mb-5 flex flex-wrap items-center gap-3 rounded-2xl border border-black/[0.055] bg-white/65 p-3 shadow-sm">
-          <input value={query} onChange={(event) => setQuery(event.target.value)} className="h-9 min-w-[240px] flex-1 rounded-xl border border-black/10 bg-white px-3 text-sm outline-none focus:ring-2 focus:ring-accent-primary/25" placeholder="搜索智能标签或分类…" />
+        <div className="mb-5 flex flex-wrap items-center gap-3 rounded-2xl border border-text-primary/[0.055] bg-bg-secondary/65 p-3 shadow-sm">
+          <input value={query} onChange={(event) => setQuery(event.target.value)} className="h-9 min-w-[240px] flex-1 rounded-xl border border-text-primary/10 bg-bg-secondary px-3 text-sm outline-none focus:ring-2 focus:ring-accent-primary/25" placeholder="搜索智能标签或分类…" />
           <label className="flex items-center gap-2 rounded-xl bg-black/[0.035] px-3 py-2 text-sm text-text-secondary"><input type="checkbox" checked={reliableOnly} onChange={(event) => setReliableOnly(event.target.checked)} />只显示可靠结果</label>
         </div>
         <div className="space-y-5">
-          {filteredGroups.map((group) => <section key={group.category} className="rounded-2xl border border-black/[0.055] bg-white/65 p-4 shadow-sm">
-            <div className="mb-3 flex items-center gap-2"><span className="text-xl">{categoryIcons[group.category] || "🏷️"}</span><h3 className="font-semibold">{group.category}</h3><span className="text-xs text-text-muted">{group.labels.length} 个标签</span></div>
+          {filteredGroups.map((group) => <section key={group.category} className="rounded-2xl border border-text-primary/[0.055] bg-bg-secondary/65 p-4 shadow-sm">
+            <div className="mb-3 flex items-center gap-2"><Icon name={categoryIcons[group.category] || "tags"} size={20} /><h3 className="font-semibold">{group.category}</h3><span className="text-xs text-text-muted">{group.labels.length} 个标签</span></div>
             <div className="flex flex-wrap gap-2">
-              {group.labels.map((label) => <button key={`${label.source}-${label.label}`} onClick={() => onSelectTag(label.label)} className="rounded-xl border border-black/[0.06] bg-white px-3 py-2 text-left shadow-sm hover:border-accent-primary/30 hover:shadow-md">
-                <span className="flex items-center gap-2"><span className="text-sm font-medium">{label.label}</span><span className="rounded-full bg-accent-primary/8 px-1.5 py-0.5 text-[10px] text-accent-primary">{sourceNames[label.source] || label.source}</span></span>
-                <span className="mt-1 block text-[11px] text-text-muted">{label.photo_count} 张 · 可信度 {Math.round(label.average_confidence * 100)}%</span>
+              {group.labels.map((label) => <button key={`${label.source}-${label.label}`} onClick={() => onSelectTag(label.label)} className="rounded-xl border border-text-primary/[0.06] bg-bg-secondary px-3 py-2 text-left shadow-sm hover:border-accent-primary/30 hover:shadow-md">
+                <span className="flex items-center gap-2"><span className="text-sm font-medium">{label.label}</span><span className="rounded-full bg-accent-primary/8 px-1.5 py-0.5 text-xs text-accent-link">{sourceNames[label.source] || label.source}</span></span>
+                <span className="mt-1 block text-xs text-text-muted">{label.photo_count} 张 · 可信度 {Math.round(label.average_confidence * 100)}%</span>
               </button>)}
             </div>
           </section>)}
@@ -160,7 +158,7 @@ export default React.memo(function TagView({ onSelectTag }: Props) {
       </>}
 
       {mode === "editable" && layout === "cards" && <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4">
-        {tags.map((tag) => <div key={tag.id} className="group rounded-2xl bg-white/70 border border-black/[0.055] shadow-sm hover:shadow-md overflow-hidden">
+        {tags.map((tag) => <div key={tag.id} className="group rounded-2xl bg-bg-secondary/70 border border-text-primary/[0.055] shadow-sm hover:shadow-md overflow-hidden">
           <button onClick={() => onSelectTag(tag.name)} className="w-full h-24 flex items-center justify-center" style={{ background: `linear-gradient(135deg, ${tag.color}30, ${tag.color}0D)` }}>
             <span className="px-4 py-2 rounded-full text-sm font-semibold text-white shadow-sm" style={{ backgroundColor: tag.color }}>{tag.name}</span>
           </button>
@@ -169,23 +167,23 @@ export default React.memo(function TagView({ onSelectTag }: Props) {
       </div>}
 
       {mode === "editable" && layout === "palette" && <div className="flex flex-wrap gap-3">
-        {tags.map((tag) => <div key={tag.id} className="group flex items-center gap-2 rounded-full bg-white/75 border border-black/[0.055] pl-2 pr-1 py-1 shadow-sm"><button onClick={() => onSelectTag(tag.name)} className="flex items-center gap-2"><span className="w-5 h-5 rounded-full" style={{ backgroundColor: tag.color }} /><span className="text-sm font-medium">{tag.name}</span><span className="text-xs text-text-muted">{tag.photo_count}</span></button>{tagActions(tag)}</div>)}
+        {tags.map((tag) => <div key={tag.id} className="group flex items-center gap-2 rounded-full bg-bg-secondary/75 border border-text-primary/[0.055] pl-2 pr-1 py-1 shadow-sm"><button onClick={() => onSelectTag(tag.name)} className="flex items-center gap-2"><span className="w-5 h-5 rounded-full" style={{ backgroundColor: tag.color }} /><span className="text-sm font-medium">{tag.name}</span><span className="text-xs text-text-muted">{tag.photo_count}</span></button>{tagActions(tag)}</div>)}
       </div>}
 
       {mode === "editable" && layout === "compact" && <div className="grid grid-cols-1 lg:grid-cols-2 gap-2">
-        {tags.map((tag) => <div key={tag.id} className="flex items-center rounded-xl bg-white/60 border border-black/[0.045] px-3 py-2"><button onClick={() => onSelectTag(tag.name)} className="flex flex-1 items-center gap-3 text-left"><span className="w-3 h-3 rounded-full" style={{ backgroundColor: tag.color }} /><span className="font-medium text-sm">{tag.name}</span><span className="ml-auto text-xs text-text-muted">{tag.photo_count} 张</span></button>{tagActions(tag)}</div>)}
+        {tags.map((tag) => <div key={tag.id} className="flex items-center rounded-xl bg-bg-secondary/60 border border-text-primary/[0.045] px-3 py-2"><button onClick={() => onSelectTag(tag.name)} className="flex flex-1 items-center gap-3 text-left"><span className="w-3 h-3 rounded-full" style={{ backgroundColor: tag.color }} /><span className="font-medium text-sm">{tag.name}</span><span className="ml-auto text-xs text-text-muted">{tag.photo_count} 张</span></button>{tagActions(tag)}</div>)}
       </div>}
 
-      {mode === "editable" && tags.length === 0 && <button onClick={calculateAiTags} className="w-full mt-12 rounded-2xl border-2 border-dashed border-black/10 py-16 text-center text-text-muted hover:border-accent-primary/40 hover:text-accent-primary"><span className="block text-3xl mb-2">✦</span>让 AI 为照片创建标签，也可以使用右上角手工新建</button>}
+      {mode === "editable" && tags.length === 0 && <button onClick={calculateAiTags} className="w-full mt-12 rounded-2xl border-2 border-dashed border-text-primary/10 py-16 text-center text-text-muted hover:border-accent-primary/40 hover:text-accent-link"><span className="block text-3xl mb-2">✦</span>让 AI 为照片创建标签，也可以使用右上角手工新建</button>}
 
       {editing && <div className="fixed inset-0 z-[1200] bg-black/30 backdrop-blur-sm flex items-center justify-center" onMouseDown={() => !saving && setEditing(null)}>
-        <div className="w-[380px] rounded-2xl bg-white p-5 shadow-2xl border border-black/10" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="w-[380px] rounded-2xl bg-bg-secondary p-5 shadow-2xl border border-text-primary/10" onMouseDown={(event) => event.stopPropagation()}>
           <h3 className="text-lg font-semibold">{editing === "new" ? "新建标签" : "编辑标签"}</h3>
           <label className="block text-xs text-text-muted mt-4 mb-1.5">名称</label>
-          <input value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") save(); if (event.key === "Escape") setEditing(null); }} maxLength={40} className="w-full rounded-xl border border-black/10 bg-black/[0.035] px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-accent-primary/30" placeholder="例如：精选、待修图、家人" autoFocus />
+          <input value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") save(); if (event.key === "Escape") setEditing(null); }} maxLength={40} className="w-full rounded-xl border border-text-primary/10 bg-black/[0.035] px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-accent-primary/30" placeholder="例如：精选、待修图、家人" autoFocus />
           <label className="block text-xs text-text-muted mt-4 mb-2">颜色</label>
           <div className="flex flex-wrap gap-2">{colors.map((value) => <button key={value} onClick={() => setColor(value)} className={`w-8 h-8 rounded-full transition-transform ${color === value ? "ring-2 ring-offset-2 ring-accent-primary scale-90" : "hover:scale-105"}`} style={{ backgroundColor: value }} aria-label={`选择颜色 ${value}`} />)}</div>
-          <div className="mt-6 flex justify-end gap-2"><button disabled={saving} onClick={() => setEditing(null)} className="px-4 py-2 rounded-lg text-sm text-text-secondary hover:bg-black/5">取消</button><button disabled={saving || !name.trim()} onClick={save} className="px-4 py-2 rounded-lg bg-accent-primary text-white text-sm font-medium disabled:opacity-50">{saving ? "保存中…" : "保存"}</button></div>
+          <div className="mt-6 flex justify-end gap-2"><button disabled={saving} onClick={() => setEditing(null)} className="px-4 py-2 rounded-lg text-sm text-text-secondary hover:bg-text-primary/5">取消</button><button disabled={saving || !name.trim()} onClick={save} className="px-4 py-2 rounded-lg bg-accent-primary text-white text-sm font-medium disabled:opacity-50">{saving ? "保存中…" : "保存"}</button></div>
         </div>
       </div>}
     </div>

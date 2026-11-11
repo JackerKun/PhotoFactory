@@ -96,7 +96,7 @@ pub fn get_named_faces_for_photo(
          FROM face_detections fd
          JOIN face_clusters fc ON fc.id = fd.person_id
          LEFT JOIN person_metadata pm ON pm.person_id = fc.id
-         WHERE fd.photo_id = ?1 AND TRIM(COALESCE(fc.name, pm.user_name, '')) != ''",
+         WHERE fd.photo_id = ?1 AND (TRIM(COALESCE(fc.name, pm.user_name, '')) != '' OR pm.confidence = 'high')",
     )?;
     let rows = stmt.query_map([photo_id], |r| {
         Ok(FaceDetection {
@@ -142,28 +142,29 @@ pub fn prepare_face_reanalysis(conn: &rusqlite::Connection) -> AppResult<usize> 
     let tx = conn.unchecked_transaction()?;
     let removed = tx.execute(
         "DELETE FROM face_detections
-         WHERE (person_id IS NULL AND COALESCE(review_status, 'active') != 'ignored')
+         WHERE ((person_id IS NULL AND COALESCE(review_status, 'active') != 'ignored')
             OR person_id IN (
              SELECT fc.id FROM face_clusters fc
              LEFT JOIN person_metadata pm ON pm.person_id = fc.id
-             WHERE TRIM(COALESCE(fc.name, pm.user_name, '')) = ''
+             WHERE TRIM(COALESCE(fc.name, pm.user_name, '')) = '' AND COALESCE(pm.confidence,'') <> 'high'
+         )) AND NOT EXISTS (
+             SELECT 1 FROM face_constraints c
+             WHERE face_detections.embedding_path = printf('%08x.npy',(c.photo_id_1 << 8) | c.face_index_1)
+                OR face_detections.embedding_path = printf('%08x.npy',(c.photo_id_2 << 8) | c.face_index_2)
          )",
         [],
     )?;
     tx.execute(
-        "DELETE FROM person_metadata WHERE person_id IN (
-            SELECT fc.id FROM face_clusters fc
-            LEFT JOIN person_metadata pm ON pm.person_id = fc.id
-            WHERE TRIM(COALESCE(fc.name, pm.user_name, '')) = ''
-         )",
+        "DELETE FROM person_metadata WHERE TRIM(COALESCE(user_name,''))=''
+           AND COALESCE(confidence,'') <> 'high'
+           AND EXISTS (SELECT 1 FROM face_clusters fc WHERE fc.id=person_id AND TRIM(COALESCE(fc.name,''))='')
+           AND NOT EXISTS (SELECT 1 FROM face_detections fd WHERE fd.person_id=person_metadata.person_id)",
         [],
     )?;
     tx.execute(
-        "DELETE FROM face_clusters WHERE id IN (
-            SELECT fc.id FROM face_clusters fc
-            LEFT JOIN person_metadata pm ON pm.person_id = fc.id
-            WHERE TRIM(COALESCE(fc.name, pm.user_name, '')) = ''
-         )",
+        "DELETE FROM face_clusters WHERE TRIM(COALESCE(name,''))=''
+           AND NOT EXISTS (SELECT 1 FROM face_detections fd WHERE fd.person_id=face_clusters.id)
+           AND NOT EXISTS (SELECT 1 FROM person_metadata pm WHERE pm.person_id=face_clusters.id)",
         [],
     )?;
     tx.execute("DELETE FROM face_merge_history", [])?;
@@ -379,11 +380,11 @@ pub fn reset_automatic_clusters(conn: &rusqlite::Connection) -> AppResult<usize>
     let tx = conn.unchecked_transaction()?;
     let reset = tx.execute(
         "UPDATE face_detections
-         SET person_id = NULL
+         SET person_id = NULL, review_status = CASE WHEN review_status = 'identity_review' THEN 'active' ELSE review_status END
          WHERE person_id IN (
              SELECT fc.id FROM face_clusters fc
              LEFT JOIN person_metadata pm ON pm.person_id = fc.id
-             WHERE TRIM(COALESCE(fc.name, pm.user_name, '')) = ''
+             WHERE TRIM(COALESCE(fc.name, pm.user_name, '')) = '' AND COALESCE(pm.confidence,'') <> 'high'
          )",
         [],
     )?;
@@ -392,12 +393,15 @@ pub fn reset_automatic_clusters(conn: &rusqlite::Connection) -> AppResult<usize>
          WHERE person_id IN (
              SELECT fc.id FROM face_clusters fc
              WHERE TRIM(COALESCE(fc.name, '')) = ''
+               AND NOT EXISTS (SELECT 1 FROM face_detections fd WHERE fd.person_id=fc.id)
          )",
         [],
     )?;
     tx.execute(
         "DELETE FROM face_clusters
-         WHERE TRIM(COALESCE(name, '')) = ''",
+         WHERE TRIM(COALESCE(name, '')) = ''
+           AND NOT EXISTS (SELECT 1 FROM face_detections fd WHERE fd.person_id=face_clusters.id)
+           AND NOT EXISTS (SELECT 1 FROM person_metadata pm WHERE pm.person_id=face_clusters.id AND TRIM(COALESCE(pm.user_name,''))<>'')",
         [],
     )?;
     tx.execute(
@@ -410,6 +414,10 @@ pub fn reset_automatic_clusters(conn: &rusqlite::Connection) -> AppResult<usize>
 }
 
 pub fn rename_cluster(conn: &rusqlite::Connection, cluster_id: i64, name: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE face_detections SET review_status = 'active' WHERE person_id = ?1 AND review_status = 'identity_review'",
+        [cluster_id],
+    )?;
     conn.execute(
         "UPDATE face_clusters SET name = ? WHERE id = ?",
         params![name, cluster_id],
@@ -447,6 +455,9 @@ pub fn set_cluster_confidence(
          ON CONFLICT(person_id) DO UPDATE SET confidence = excluded.confidence",
         params![cluster_id, confidence],
     )?;
+    if confidence != "low" {
+        conn.execute("UPDATE face_detections SET review_status = 'active' WHERE person_id = ?1 AND review_status = 'identity_review'", [cluster_id])?;
+    }
     Ok(())
 }
 
@@ -459,6 +470,43 @@ pub fn assign_face_to_person(
         "UPDATE face_detections SET person_id = ? WHERE id = ?",
         params![person_id, face_id],
     )?;
+    Ok(())
+}
+
+fn face_embedding_key(conn: &rusqlite::Connection, face_id: i64) -> AppResult<Option<i64>> {
+    let path: Option<String> = conn.query_row(
+        "SELECT embedding_path FROM face_detections WHERE id=?1",
+        [face_id],
+        |row| row.get(0),
+    )?;
+    Ok(path.and_then(|path| {
+        path.strip_suffix(".npy")
+            .and_then(|stem| i64::from_str_radix(stem, 16).ok())
+    }))
+}
+
+fn record_face_correction(
+    conn: &rusqlite::Connection,
+    face_id: i64,
+    old: Option<i64>,
+    target: i64,
+) -> AppResult<()> {
+    if old == Some(target) {
+        return Ok(());
+    }
+    let Some(key) = face_embedding_key(conn, face_id)? else {
+        return Ok(());
+    };
+    let target_key = get_other_face_key_for_cluster(conn, target, Some(face_id))?;
+    let old_key = match old {
+        Some(person) => get_other_face_key_for_cluster(conn, person, Some(face_id))?,
+        None => None,
+    };
+    for (other, kind) in [(old_key, "cannot_link"), (target_key, "must_link")] {
+        if let Some(other) = other.filter(|other| *other != key) {
+            crate::db::constraint_dao::set_constraint_by_face_keys(conn, key, other, kind)?;
+        }
+    }
     Ok(())
 }
 
@@ -489,8 +537,9 @@ pub fn reassign_face_to_person(
         )
         .map_err(|_| crate::error::AppError::NotFound(format!("Face {} not found", face_id)))?;
 
+    record_face_correction(&tx, face_id, old_person_id, person_id)?;
     tx.execute(
-        "UPDATE face_detections SET person_id = ?1 WHERE id = ?2",
+        "UPDATE face_detections SET person_id = ?1, review_status = CASE WHEN review_status IN ('identity_review','suspected_false_positive') THEN 'active' ELSE review_status END WHERE id = ?2",
         params![person_id, face_id],
     )?;
     tx.execute(
@@ -544,8 +593,9 @@ pub fn create_named_person_for_face(
         "INSERT INTO person_metadata (person_id, confidence, centroid_cached) VALUES (?1, 'high', 1)",
         [person_id],
     )?;
+    record_face_correction(&tx, face_id, old_person_id, person_id)?;
     tx.execute(
-        "UPDATE face_detections SET person_id = ?1 WHERE id = ?2",
+        "UPDATE face_detections SET person_id = ?1, review_status = CASE WHEN review_status IN ('identity_review','suspected_false_positive') THEN 'active' ELSE review_status END WHERE id = ?2",
         params![person_id, face_id],
     )?;
     tx.execute(
@@ -637,11 +687,13 @@ pub fn merge_clusters(conn: &rusqlite::Connection, from_id: i64, to_id: i64) -> 
         "DELETE FROM person_metadata WHERE person_id = ?1",
         [from_id],
     )?;
+    crate::db::smart_album_dao::replace_combination_person(&tx, from_id, to_id)?;
     tx.execute("DELETE FROM face_clusters WHERE id = ?1", params![from_id])?;
     tx.execute(
         "UPDATE face_clusters SET face_count = (SELECT COUNT(*) FROM face_detections WHERE person_id = ?1) WHERE id = ?1",
         [to_id],
     )?;
+    set_cluster_confidence(&tx, to_id, "high")?;
     tx.commit()?;
     Ok(())
 }
@@ -660,7 +712,7 @@ pub fn merge_clusters_batch(
             continue;
         }
         tx.execute(
-            "UPDATE face_detections SET person_id = ?1 WHERE person_id = ?2",
+            "UPDATE face_detections SET person_id = ?1, review_status = CASE WHEN review_status = 'identity_review' THEN 'active' ELSE review_status END WHERE person_id = ?2",
             params![target_id, source_id],
         )?;
         // Confirmed/named people have a metadata row that references the cluster.
@@ -670,6 +722,7 @@ pub fn merge_clusters_batch(
             "DELETE FROM person_metadata WHERE person_id = ?1",
             params![source_id],
         )?;
+        crate::db::smart_album_dao::replace_combination_person(&tx, *source_id, target_id)?;
         tx.execute(
             "DELETE FROM face_clusters WHERE id = ?1",
             params![source_id],
@@ -685,6 +738,7 @@ pub fn merge_clusters_batch(
         "UPDATE face_clusters SET face_count = (SELECT COUNT(*) FROM face_detections WHERE person_id = ?1) WHERE id = ?1",
         params![target_id],
     )?;
+    set_cluster_confidence(&tx, target_id, "high")?;
     tx.commit()?;
     Ok(())
 }
@@ -735,6 +789,23 @@ pub fn apply_automatic_merge_groups(
         if !valid {
             continue;
         }
+        let ids_json = serde_json::json!(ids).to_string();
+        let conflicts: bool = tx.query_row(
+            "WITH selected AS (SELECT CAST(value AS INTEGER) FROM json_each(?1)),
+             faces AS (SELECT fd.* FROM face_detections fd JOIN photos p ON p.id=fd.photo_id
+                       WHERE fd.person_id IN selected AND p.deleted=0)
+             SELECT EXISTS (SELECT 1 FROM faces WHERE review_status='identity_review')
+                 OR EXISTS (SELECT 1 FROM person_metadata WHERE person_id IN selected AND confidence='high')
+                 OR EXISTS (SELECT 1 FROM faces GROUP BY photo_id HAVING COUNT(DISTINCT person_id)>1)
+                 OR EXISTS (SELECT 1 FROM face_constraints c
+                    JOIN faces a ON a.embedding_path=printf('%08x.npy',(c.photo_id_1<<8)|c.face_index_1)
+                    JOIN faces b ON b.embedding_path=printf('%08x.npy',(c.photo_id_2<<8)|c.face_index_2)
+                    WHERE c.constraint_type='cannot_link' AND a.person_id<>b.person_id)",
+            [&ids_json], |row| row.get(0),
+        )?;
+        if conflicts {
+            continue;
+        }
         let target = counts
             .iter()
             .max_by_key(|(_, count)| *count)
@@ -761,7 +832,7 @@ pub fn apply_automatic_merge_groups(
         for id in &ids {
             if *id != target {
                 tx.execute(
-                    "UPDATE face_detections SET person_id = ?1 WHERE person_id = ?2",
+                    "UPDATE face_detections SET person_id = ?1, review_status = CASE WHEN review_status = 'identity_review' THEN 'active' ELSE review_status END WHERE person_id = ?2",
                     params![target, id],
                 )?;
                 tx.execute("DELETE FROM person_metadata WHERE person_id = ?1", [id])?;
@@ -873,12 +944,20 @@ pub fn get_best_face_key_for_cluster(
     conn: &rusqlite::Connection,
     cluster_id: i64,
 ) -> AppResult<Option<i64>> {
+    get_other_face_key_for_cluster(conn, cluster_id, None)
+}
+
+fn get_other_face_key_for_cluster(
+    conn: &rusqlite::Connection,
+    cluster_id: i64,
+    except: Option<i64>,
+) -> AppResult<Option<i64>> {
     let path = match conn.query_row(
         "SELECT embedding_path FROM face_detections
-         WHERE person_id = ?1 AND embedding_path IS NOT NULL
+         WHERE person_id = ?1 AND embedding_path IS NOT NULL AND (?2 IS NULL OR id <> ?2)
          ORDER BY COALESCE(quality_score, 0) DESC,
-                  COALESCE(detection_confidence, 0) DESC LIMIT 1",
-        [cluster_id],
+                  COALESCE(detection_confidence, 0) DESC, id LIMIT 1",
+        params![cluster_id, except],
         |row| row.get::<_, String>(0),
     ) {
         Ok(path) => path,
@@ -919,6 +998,21 @@ pub fn get_unassigned_faces_limited(
         .filter_map(|r| r.ok())
         .collect();
     Ok(rows)
+}
+
+pub fn get_unassigned_embedding_qualities(
+    conn: &rusqlite::Connection,
+    limit: i64,
+) -> AppResult<std::collections::HashMap<String, f64>> {
+    let mut stmt = conn.prepare(
+        "SELECT fd.embedding_path, COALESCE(fd.quality_score, 0)
+         FROM face_detections fd JOIN photos p ON p.id = fd.photo_id
+         WHERE fd.person_id IS NULL AND fd.embedding_path IS NOT NULL
+           AND COALESCE(fd.review_status, 'active') = 'active' AND p.deleted = 0
+         ORDER BY fd.id LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect::<Result<_, _>>().map_err(Into::into)
 }
 
 pub fn get_suspected_faces(
@@ -977,7 +1071,7 @@ pub fn get_embedding_cluster_assignments(
     let mut stmt = conn.prepare(
         "SELECT fd.embedding_path, fd.person_id FROM face_detections fd \
          JOIN photos p ON p.id = fd.photo_id \
-         WHERE fd.person_id IS NOT NULL AND fd.embedding_path IS NOT NULL AND COALESCE(fd.review_status, 'active') = 'active' AND p.deleted = 0",
+         WHERE fd.person_id IS NOT NULL AND fd.embedding_path IS NOT NULL AND COALESCE(fd.review_status, 'active') IN ('active', 'identity_review') AND p.deleted = 0",
     )?;
     let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -991,12 +1085,24 @@ pub fn get_embedding_cluster_prototypes(
     per_cluster: i64,
 ) -> AppResult<Vec<(String, i64)>> {
     let mut stmt = conn.prepare(
-        "SELECT embedding_path,person_id FROM (
-             SELECT fd.embedding_path,fd.person_id,
-                    ROW_NUMBER() OVER(PARTITION BY fd.person_id ORDER BY COALESCE(fd.quality_score,0) DESC,COALESCE(fd.detection_confidence,0) DESC,fd.id) AS rank
+        "WITH ranked AS (
+             SELECT fd.embedding_path, fd.person_id, fd.id,
+                    COALESCE(fd.quality_score,0) AS quality,
+                    COALESCE(fd.detection_confidence,0) AS confidence,
+                    ROW_NUMBER() OVER(PARTITION BY fd.person_id, fd.photo_id
+                       ORDER BY COALESCE(fd.quality_score,0) DESC, fd.id) AS photo_rank,
+                    CASE WHEN fd.pose_yaw < -15 THEN -1 WHEN fd.pose_yaw > 15 THEN 1 ELSE 0 END AS pose
              FROM face_detections fd JOIN photos p ON p.id=fd.photo_id
              WHERE fd.person_id IS NOT NULL AND fd.embedding_path IS NOT NULL
                AND COALESCE(fd.review_status,'active')='active' AND p.deleted=0
+         ), poses AS (
+             SELECT *, ROW_NUMBER() OVER(PARTITION BY person_id, pose ORDER BY quality DESC, confidence DESC, id) AS pose_rank
+             FROM ranked WHERE photo_rank=1
+         )
+         SELECT embedding_path,person_id FROM (
+             SELECT *, ROW_NUMBER() OVER(PARTITION BY person_id
+               ORDER BY (quality > 0 AND quality < 0.55), pose_rank, quality DESC, confidence DESC, id) AS rank
+             FROM poses
          ) WHERE rank<=?1",
     )?;
     let rows = stmt.query_map([per_cluster.clamp(1, 8)], |row| {
@@ -1020,7 +1126,8 @@ pub fn get_unnamed_embedding_cluster_assignments(
            AND fd.person_id IS NOT NULL
            AND p.deleted = 0
            AND COALESCE(fd.review_status, 'active') = 'active'
-           AND TRIM(COALESCE(fc.name, pm.user_name, '')) = ''",
+           AND TRIM(COALESCE(fc.name, pm.user_name, '')) = ''
+           AND COALESCE(pm.confidence,'') <> 'high'",
     )?;
     let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
     Ok(rows.filter_map(Result::ok).collect())
@@ -1120,7 +1227,7 @@ pub fn restore_all_ignored_faces(conn: &rusqlite::Connection) -> AppResult<usize
 pub fn apply_cluster_assignments(
     conn: &rusqlite::Connection,
     new_cluster_ids: &[i64],
-    assignments: &[(i64, i64)],
+    assignments: &[(i64, i64, bool)],
 ) -> AppResult<()> {
     let tx = conn.unchecked_transaction()?;
     let now = Utc::now().timestamp();
@@ -1134,9 +1241,13 @@ pub fn apply_cluster_assignments(
     }
     {
         let mut assign =
-            tx.prepare_cached("UPDATE face_detections SET person_id = ?1 WHERE id = ?2")?;
-        for (face_id, cluster_id) in assignments {
-            assign.execute(params![cluster_id, face_id])?;
+            tx.prepare_cached("UPDATE face_detections SET person_id = ?1, review_status = ?3 WHERE id = ?2 AND person_id IS NULL AND COALESCE(review_status, 'active') = 'active'")?;
+        for (face_id, cluster_id, review) in assignments {
+            assign.execute(params![
+                cluster_id,
+                face_id,
+                if *review { "identity_review" } else { "active" }
+            ])?;
         }
     }
     tx.execute(
@@ -1171,6 +1282,43 @@ pub fn update_face_quality(
 #[cfg(test)]
 mod merge_tests {
     use super::*;
+
+    #[test]
+    fn manual_face_move_remembers_both_identities() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::db::schema::CREATE_TABLES)
+            .unwrap();
+        for id in 1..=3i64 {
+            conn.execute("INSERT INTO photos (id,path,filename,file_size,file_mtime,imported_at) VALUES (?1,?2,?2,0,0,0)", params![id, format!("/{id}.jpg")]).unwrap();
+        }
+        for id in [10, 11] {
+            conn.execute(
+                "INSERT INTO face_clusters(id,created_at) VALUES (?1,0)",
+                [id],
+            )
+            .unwrap();
+        }
+        for (id, person) in [(1, 10), (2, 10), (3, 11)] {
+            conn.execute("INSERT INTO face_detections(id,photo_id,person_id,embedding_path,created_at,bbox_x,bbox_y,bbox_w,bbox_h) VALUES(?1,?1,?2,?3,0,10,10,20,20)",
+                params![id, person, format!("{:08x}.npy",id << 8)]).unwrap();
+        }
+        reassign_face_to_person(&conn, 1, 11).unwrap();
+        assert_eq!(
+            crate::db::constraint_dao::get_must_links(&conn).unwrap(),
+            vec![(0x100, 0x300)]
+        );
+        assert_eq!(
+            crate::db::constraint_dao::get_cannot_links(&conn).unwrap(),
+            vec![(0x100, 0x200)]
+        );
+        prepare_face_reanalysis(&conn).unwrap();
+        assert_eq!(
+            get_faces_for_photo(&conn, 1).unwrap()[0]
+                .embedding_path
+                .as_deref(),
+            Some("00000100.npy")
+        );
+    }
 
     #[test]
     fn batch_merge_named_people_removes_source_metadata_before_cluster() {
@@ -1863,13 +2011,40 @@ pub fn get_unassigned_face_count(conn: &rusqlite::Connection) -> AppResult<i64> 
 /// Split: move specified faces to a new cluster.
 pub fn split_person(
     conn: &rusqlite::Connection,
-    _person_id: i64,
+    person_id: i64,
     face_ids: &[i64],
 ) -> AppResult<i64> {
-    let new_cluster_id = create_cluster(conn)?;
-    for face_id in face_ids {
-        assign_face_to_person(conn, *face_id, Some(new_cluster_id))?;
+    let tx = conn.unchecked_transaction()?;
+    let selected: std::collections::HashSet<_> = face_ids.iter().copied().collect();
+    let mut stmt = tx.prepare(
+        "SELECT id FROM face_detections WHERE person_id=?1 ORDER BY quality_score DESC,id",
+    )?;
+    let ids = stmt
+        .query_map([person_id], |row| row.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    if selected.is_empty()
+        || !selected.iter().all(|id| ids.contains(id))
+        || selected.len() == ids.len()
+    {
+        return Err(crate::error::AppError::Project(
+            "请选择此人物分组中的部分人脸".into(),
+        ));
     }
-    update_cluster_face_counts(conn)?;
+    let retained = ids.into_iter().find(|id| !selected.contains(id));
+    let retained_key = match retained {
+        Some(id) => face_embedding_key(&tx, id)?,
+        None => None,
+    };
+    let new_cluster_id = create_cluster(&tx)?;
+    for face_id in face_ids {
+        if let (Some(key), Some(other)) = (face_embedding_key(&tx, *face_id)?, retained_key) {
+            crate::db::constraint_dao::set_constraint_by_face_keys(&tx, key, other, "cannot_link")?;
+        }
+        assign_face_to_person(&tx, *face_id, Some(new_cluster_id))?;
+    }
+    set_cluster_confidence(&tx, new_cluster_id, "high")?;
+    update_cluster_face_counts(&tx)?;
+    tx.commit()?;
     Ok(new_cluster_id)
 }

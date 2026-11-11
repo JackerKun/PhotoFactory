@@ -45,6 +45,11 @@ if ($WorkerPlatform.Trim() -ne "win-amd64") {
 }
 
 Write-Host "Installing AI runtime and packager..."
+# Both wheels write the same onnxruntime module. Clean legacy CPU wheels before installing DirectML.
+& $VenvPython -m pip uninstall -y onnxruntime onnxruntime-gpu
+Assert-NativeSuccess "Remove conflicting ONNX runtimes"
+& $VenvPython -m pip install --disable-pip-version-check --force-reinstall --no-deps --only-binary=:all: "onnxruntime-directml>=1.18,<2"
+Assert-NativeSuccess "DirectML installation"
 & $VenvPython -m pip install --disable-pip-version-check --only-binary=:all: -r "ai_worker\requirements.txt"
 Assert-NativeSuccess "AI dependency installation"
 & $VenvPython -m pip install --disable-pip-version-check "pyinstaller>=6,<7"
@@ -79,6 +84,7 @@ $env:PYINSTALLER_CONFIG_DIR = Join-Path $ProjectDir "ai_worker\.pyinstaller-wind
     --hidden-import "face_clusterer" `
     --collect-all "pillow_heif" `
     --collect-all "tokenizers" `
+    --collect-binaries "onnxruntime" `
     "ai_worker\server.py"
 Assert-NativeSuccess "Windows AI Worker build"
 
@@ -86,6 +92,9 @@ $WorkerExe = Join-Path $ProjectDir "ai_worker\dist\photofactory-ai\photofactory-
 if (-not (Test-Path $WorkerExe)) {
     throw "PyInstaller did not produce $WorkerExe"
 }
+
+& $WorkerExe --check-directml
+Assert-NativeSuccess "Bundled DirectML provider check"
 
 # ARM64 NSIS is supported by Tauri; avoid the x64-only WiX v3 toolchain.
 $Bundles = if ($Target -eq "aarch64-pc-windows-msvc") { "nsis" } else { "msi,nsis" }

@@ -123,3 +123,66 @@ describe("PhotoCard", () => {
     expect(onDoubleClick).toHaveBeenCalledOnce();
   });
 });
+
+describe("thumbnail loading recovery", () => {
+  async function observeVisibleCard() {
+    const { act } = await import("@testing-library/react");
+    const { getThumbnailPath } = await import("../api/tauri");
+    let visible: IntersectionObserverCallback = () => {};
+    const observer = { observe: vi.fn(), unobserve: vi.fn(), disconnect: vi.fn() };
+    vi.stubGlobal("IntersectionObserver", vi.fn((callback: IntersectionObserverCallback) => {
+      visible = callback;
+      return observer;
+    }));
+    const view = render(<PhotoCard photo={mockPhoto} onClick={() => {}} size={200} />);
+    await act(async () => {
+      visible([{ isIntersecting: true, target: view.container.firstElementChild! } as IntersectionObserverEntry], observer as unknown as IntersectionObserver);
+    });
+    return { ...view, getThumbnailPath, act, visible, observer };
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.clearAllMocks();
+  });
+
+  it("retries when native thumbnail decoder slots are temporarily full", async () => {
+    vi.useFakeTimers();
+    const api = await import("../api/tauri");
+    vi.mocked(api.getThumbnailPath)
+      .mockRejectedValueOnce("Too many concurrent thumbnail generations, try again later")
+      .mockResolvedValue("/mock/recovered.webp");
+    const { container, act, getThumbnailPath } = await observeVisibleCard();
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(getThumbnailPath).toHaveBeenCalledTimes(2);
+    expect(container.querySelector("img")?.getAttribute("src")).toContain("recovered.webp");
+  });
+
+  it("reloads a failed card after background generation completes", async () => {
+    const api = await import("../api/tauri");
+    vi.mocked(api.getThumbnailPath).mockRejectedValueOnce("decoder not ready").mockResolvedValue("/mock/completed.webp");
+    const { container, act, observer, getThumbnailPath } = await observeVisibleCard();
+    const { useStore } = await import("../hooks/usePhotos");
+    await act(async () => {
+      useStore.setState({ thumbnailProcessingStatus: {
+        running: true, batch_size: 100, total_pending: 1, processed: 1,
+        succeeded: 1, failed: 0, current_file: null, last_error: null,
+      } });
+    });
+    // The new effect registers a new visibility callback.
+    const callback = vi.mocked(IntersectionObserver).mock.calls.at(-1)![0];
+    await act(async () => { callback([{ isIntersecting: true } as IntersectionObserverEntry], observer as unknown as IntersectionObserver); });
+    expect(getThumbnailPath).toHaveBeenCalledTimes(2);
+    expect(container.querySelector("img")?.getAttribute("src")).toContain("completed.webp");
+  });
+  it("shows an inaccessible source and retries that card without remounting", async () => {
+    const api = await import("../api/tauri");
+    vi.mocked(api.getThumbnailPath).mockRejectedValueOnce("No such file or directory").mockResolvedValue("/mock/restored.webp");
+    const { container, act } = await observeVisibleCard();
+    expect(screen.getByText("原文件无法访问")).toBeInTheDocument();
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "重试" })); });
+    const callback = vi.mocked(IntersectionObserver).mock.calls.at(-1)![0];
+    await act(async () => { callback([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver); });
+    expect(container.querySelector("img")?.getAttribute("src")).toContain("restored.webp");
+  });
+});

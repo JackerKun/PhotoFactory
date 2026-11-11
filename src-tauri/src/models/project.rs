@@ -83,6 +83,9 @@ impl Project {
     pub fn large_thumbnails_path(&self) -> std::path::PathBuf {
         self.pf_path().join("thumbnails/large")
     }
+    pub fn offline_maps_path(&self) -> std::path::PathBuf {
+        self.pf_path().join("maps/offline")
+    }
     pub fn tiles_path(&self) -> std::path::PathBuf {
         self.pf_path().join("maps/tiles")
     }

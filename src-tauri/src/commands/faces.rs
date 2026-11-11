@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use tauri::State;
 
 use crate::commands::ai::AiWorkerState;
-use crate::commands::project::{get_conn, AppState};
+use crate::commands::project::{current_project, get_conn, AppState};
 use crate::db::face_dao;
 use crate::db::photo_dao;
 use crate::error::{AppError, AppResult};
@@ -170,11 +170,14 @@ pub async fn cmd_run_face_clustering_inner(
 
     // One query instead of one query per cluster (the old N+1 path also silently
     // capped each person at 1000 faces, weakening centroids for large libraries).
-    let existing: HashMap<String, i64> = face_dao::get_embedding_cluster_prototypes(&conn, 3)?
+    let existing: HashMap<String, i64> = face_dao::get_embedding_cluster_prototypes(&conn, 5)?
+        .into_iter()
+        .collect();
+    let memberships: HashMap<String, i64> = face_dao::get_embedding_cluster_assignments(&conn)?
         .into_iter()
         .collect();
     let known_assigned_cluster_ids: std::collections::HashSet<i64> =
-        existing.values().copied().collect();
+        memberships.values().copied().collect();
 
     // Get unassigned faces
     let unassigned = face_dao::get_unassigned_faces_limited(&conn, 1000)?;
@@ -188,7 +191,7 @@ pub async fn cmd_run_face_clustering_inner(
                 .map(|p| (p.clone(), f.id.unwrap_or(0)))
         })
         .collect();
-    if unassigned.is_empty() && existing.is_empty() {
+    if unassigned.is_empty() {
         return Ok("No faces to cluster".into());
     }
 
@@ -213,6 +216,8 @@ pub async fn cmd_run_face_clustering_inner(
         must_links: Some(must_links),
         cannot_links: Some(cannot_links),
         candidate_files: Some(face_id_by_path.keys().cloned().collect()),
+        memberships,
+        qualities: face_dao::get_unassigned_embedding_qualities(&conn, 1000)?,
     };
 
     let response = client.cluster_faces_v2(&req).await?;
@@ -261,13 +266,18 @@ pub async fn cmd_run_face_clustering_inner(
     // Resolve response entries to unassigned database rows, then write all changes
     // in one transaction rather than one UPDATE per face.
     let mut assignments = Vec::new();
+    let review_files: std::collections::HashSet<_> = response.review_files.iter().collect();
     for (embedding_file, cluster_id) in &response.clusters {
         if let Some(&face_id) = face_id_by_path.get(embedding_file) {
             let resolved_cluster_id = collision_remap
                 .get(cluster_id)
                 .copied()
                 .unwrap_or(*cluster_id);
-            assignments.push((face_id, resolved_cluster_id));
+            assignments.push((
+                face_id,
+                resolved_cluster_id,
+                review_files.contains(embedding_file),
+            ));
             assigned_count += 1;
         }
     }
@@ -276,7 +286,11 @@ pub async fn cmd_run_face_clustering_inner(
     Ok(format!(
         "Clustered {} faces into {} clusters",
         assigned_count,
-        response.clusters.len()
+        assignments
+            .iter()
+            .map(|(_, id, _)| id)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
     ))
 }
 
@@ -518,97 +532,75 @@ pub async fn cmd_get_cluster_face_thumbnail(
     cluster_id: i64,
     state: State<'_, AppState>,
 ) -> AppResult<String> {
-    let conn = get_conn(state.clone())?;
-    let project = {
-        let guard = state.project.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| AppError::Project("No project open".into()))?
-            .clone()
-    };
-
-    // Get the first face assigned to this cluster
-    let faces = face_dao::get_faces_for_person(&conn, cluster_id, 1)?;
-    let face = faces
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::NotFound("No faces in this cluster".into()))?;
-
-    // Get the photo path
-    let photo = photo_dao::get_photo_by_id(&conn, face.photo_id)?
-        .ok_or_else(|| AppError::NotFound(format!("Photo {} not found", face.photo_id)))?;
-
-    // Build cache path: .pf/ai_cache/face_thumbnails/
-    let cache_dir = project
+    let project = current_project(&state)?;
+    let cache_path = project
         .faces_cache_path()
         .parent()
         .unwrap()
-        .join("face_thumbnails");
-    std::fs::create_dir_all(&cache_dir)?;
-    let thumb_path = cache_dir.join(format!(
-        "cluster_{}_{}.jpg",
-        cluster_id, FACE_THUMBNAIL_CACHE_VERSION
-    ));
-
-    // Try to read cached file first
-    if thumb_path.exists() {
-        let data = std::fs::read(&thumb_path)?;
-        println!(
-            "Face thumb: cluster {} returning cached thumb ({} bytes)",
-            cluster_id,
-            data.len()
-        );
-        return Ok(format!(
-            "data:image/jpeg;base64,{}",
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data)
+        .join("face_thumbnails")
+        .join(format!(
+            "cluster_{cluster_id}_{FACE_THUMBNAIL_CACHE_VERSION}.jpg"
         ));
-    }
+    cached_face_thumbnail(project, cache_path, 160, move |conn| {
+        face_dao::get_faces_for_person(conn, cluster_id, 1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::NotFound("No faces in this cluster".into()))
+    })
+    .await
+}
 
-    // Generate and save
-    let photo_path = std::path::Path::new(&photo.path);
-    println!(
-        "Face thumb: cluster={} photo_id={} photo_path={:?} bbox=({},{},{},{}) img_size=({}x{})",
-        cluster_id,
-        face.photo_id,
-        photo.path,
-        face.bbox_x,
-        face.bbox_y,
-        face.bbox_w,
-        face.bbox_h,
-        photo.width.unwrap_or(0),
-        photo.height.unwrap_or(0)
-    );
+async fn cached_face_thumbnail(
+    project: crate::models::Project,
+    cache_path: std::path::PathBuf,
+    size: u32,
+    face: impl FnOnce(&rusqlite::Connection) -> AppResult<FaceDetection> + Send + 'static,
+) -> AppResult<String> {
+    use base64::Engine;
+    use std::io::Write;
 
-    let jpeg_bytes = generator::generate_face_thumbnail(
-        photo_path,
-        face.bbox_x as u32,
-        face.bbox_y as u32,
-        face.bbox_w as u32,
-        face.bbox_h as u32,
-        160,
-    );
-
-    match jpeg_bytes {
-        Ok(bytes) => {
-            println!(
-                "Face thumb: cluster {} generated {} bytes",
-                cluster_id,
-                bytes.len()
-            );
-            std::fs::write(&thumb_path, &bytes)?;
-            Ok(format!(
-                "data:image/jpeg;base64,{}",
-                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
-            ))
-        }
-        Err(e) => {
-            eprintln!(
-                "Face thumb generation FAILED for cluster {}: {}",
-                cluster_id, e
-            );
-            Err(e)
-        }
-    }
+    static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let permit = SLOTS
+        .acquire()
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let bytes = match std::fs::read(&cache_path) {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            _ => {
+                let (face, photo) = {
+                    let conn = crate::db::connection::open_read_db(&project.db_path())?;
+                    let face = face(&conn)?;
+                    let photo =
+                        photo_dao::get_photo_by_id(&conn, face.photo_id)?.ok_or_else(|| {
+                            AppError::NotFound(format!("Photo {} not found", face.photo_id))
+                        })?;
+                    (face, photo)
+                };
+                let bytes = generator::generate_face_thumbnail(
+                    std::path::Path::new(&photo.path),
+                    face.bbox_x.max(0) as u32,
+                    face.bbox_y.max(0) as u32,
+                    face.bbox_w.max(1) as u32,
+                    face.bbox_h.max(1) as u32,
+                    size,
+                )?;
+                let directory = cache_path.parent().unwrap();
+                std::fs::create_dir_all(directory)?;
+                let mut temp = tempfile::NamedTempFile::new_in(directory)?;
+                temp.write_all(&bytes)?;
+                temp.persist(cache_path).map_err(|error| error.error)?;
+                bytes
+            }
+        };
+        Ok(format!(
+            "data:image/jpeg;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        ))
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("人脸缩略图任务中断：{error}")))?
 }
 
 #[tauri::command]
@@ -764,39 +756,16 @@ pub fn cmd_delete_all_suspected_faces(state: State<'_, AppState>) -> AppResult<u
 }
 
 #[tauri::command]
-pub fn cmd_get_face_thumbnail(face_id: i64, state: State<'_, AppState>) -> AppResult<String> {
-    let project = state
-        .project
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| AppError::Project("No project open".into()))?;
-    let cache_dir = project.faces_cache_path().join("thumbnails");
-    let cache_path = cache_dir.join(format!("face_{face_id}_{FACE_THUMBNAIL_CACHE_VERSION}.jpg"));
-    if let Ok(bytes) = std::fs::read(&cache_path) {
-        return Ok(format!(
-            "data:image/jpeg;base64,{}",
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
-        ));
-    }
-    let conn = get_conn(state)?;
-    let face = face_dao::get_face_by_id(&conn, face_id)?;
-    let photo = photo_dao::get_photo_by_id(&conn, face.photo_id)?
-        .ok_or_else(|| AppError::NotFound(format!("Photo {} not found", face.photo_id)))?;
-    let bytes = generator::generate_face_thumbnail(
-        std::path::Path::new(&photo.path),
-        face.bbox_x.max(0) as u32,
-        face.bbox_y.max(0) as u32,
-        face.bbox_w.max(1) as u32,
-        face.bbox_h.max(1) as u32,
-        128,
-    )?;
-    std::fs::create_dir_all(&cache_dir)?;
-    std::fs::write(cache_path, &bytes)?;
-    Ok(format!(
-        "data:image/jpeg;base64,{}",
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
-    ))
+pub async fn cmd_get_face_thumbnail(face_id: i64, state: State<'_, AppState>) -> AppResult<String> {
+    let project = current_project(&state)?;
+    let cache_path = project
+        .faces_cache_path()
+        .join("thumbnails")
+        .join(format!("face_{face_id}_{FACE_THUMBNAIL_CACHE_VERSION}.jpg"));
+    cached_face_thumbnail(project, cache_path, 128, move |conn| {
+        face_dao::get_face_by_id(conn, face_id)
+    })
+    .await
 }
 
 #[tauri::command]

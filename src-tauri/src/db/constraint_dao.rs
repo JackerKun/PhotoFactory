@@ -53,6 +53,32 @@ pub fn add_constraint_by_face_keys(
     )
 }
 
+/// A fresh manual correction supersedes an earlier decision for this exact pair.
+pub fn set_constraint_by_face_keys(
+    conn: &Connection,
+    left: i64,
+    right: i64,
+    kind: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "DELETE FROM face_constraints WHERE constraint_type <> ?3 AND (
+          (((photo_id_1 << 8) | face_index_1) = ?1 AND ((photo_id_2 << 8) | face_index_2) = ?2)
+          OR (((photo_id_1 << 8) | face_index_1) = ?2 AND ((photo_id_2 << 8) | face_index_2) = ?1))",
+        params![left, right, kind],
+    )?;
+    add_constraint_by_face_keys(conn, left, right, kind)?;
+    Ok(())
+}
+
+pub fn reserved_slots_for_photo(conn: &Connection, photo_id: i64) -> AppResult<Vec<usize>> {
+    let mut stmt = conn.prepare(
+        "SELECT face_index_1 FROM face_constraints WHERE photo_id_1=?1
+         UNION SELECT face_index_2 FROM face_constraints WHERE photo_id_2=?1",
+    )?;
+    let slots = stmt.query_map([photo_id], |row| row.get(0))?;
+    slots.collect::<Result<_, _>>().map_err(Into::into)
+}
+
 /// Remove a constraint by ID.
 pub fn remove_constraint(conn: &Connection, constraint_id: i64) -> AppResult<()> {
     conn.execute(

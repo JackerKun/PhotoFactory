@@ -84,3 +84,54 @@ pub async fn cmd_set_album_cover(
     let conn = get_conn(state)?;
     smart_album_dao::set_album_cover(&conn, album_id, photo_id)
 }
+
+#[derive(serde::Serialize)]
+pub struct GroupPhotoItem {
+    photo: crate::models::Photo,
+    people_count: i64,
+    unconfirmed_count: i64,
+}
+
+#[tauri::command]
+pub async fn cmd_get_group_photos(
+    size: Option<i64>,
+    person_ids: Vec<i64>,
+    exact: bool,
+    cursor: Option<i64>,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<GroupPhotoItem>> {
+    let conn = get_conn(state)?;
+    let mut people = person_ids;
+    people.sort_unstable();
+    people.dedup();
+    let rows = smart_album_dao::get_group_photos(
+        &conn,
+        &people,
+        size.unwrap_or(0).clamp(0, 4),
+        exact && !people.is_empty(),
+        cursor,
+        60,
+    )?;
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(photo) = crate::db::photo_dao::get_photo_by_id(&conn, row.photo_id)? {
+            items.push(GroupPhotoItem {
+                photo,
+                people_count: row.people_count,
+                unconfirmed_count: row.unconfirmed_count,
+            });
+        }
+    }
+    Ok(items)
+}
+
+#[tauri::command]
+pub fn cmd_create_person_combination(
+    name: String,
+    person_ids: Vec<i64>,
+    exact: bool,
+    state: State<'_, AppState>,
+) -> AppResult<i64> {
+    let conn = get_conn(state)?;
+    smart_album_dao::create_person_combination(&conn, &name, person_ids, exact)
+}

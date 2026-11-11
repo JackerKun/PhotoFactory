@@ -8,6 +8,8 @@ absolute .npy paths.  Only listed faces are evaluated; no project data is change
 import argparse
 import csv
 import json
+import re
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -41,22 +43,31 @@ def main():
 
     embeddings_root = args.project_root / ".pf" / "ai_cache" / "faces"
     rows = []
+    seen = set()
     with args.labels_csv.open(newline="", encoding="utf-8-sig") as source:
         for row in csv.DictReader(source):
             path = Path(row["embedding_path"])
             if not path.is_absolute():
                 path = embeddings_root / path
-            if path.exists() and row.get("person_label", "").strip():
+            if path.is_file() and row.get("person_label", "").strip() and path.resolve() not in seen:
                 rows.append((path, row["person_label"].strip()))
+                seen.add(path.resolve())
     if len(rows) < 2:
         raise SystemExit("Need at least two valid labeled embeddings")
 
     with tempfile.TemporaryDirectory(prefix="photofactory-face-eval-") as directory:
         evaluation_dir = Path(directory)
         filenames = []
+        photo_keys = {}
         for index, (source, _) in enumerate(rows):
-            filename = f"{index:08x}.npy"
-            (evaluation_dir / filename).symlink_to(source)
+            stem = source.stem
+            encoded = re.fullmatch(r"[0-9a-fA-F]{8,}", stem)
+            photo = (source.parent.resolve(), int(stem, 16) >> 8) if encoded else ("unencoded", index)
+            photo_id = photo_keys.setdefault(photo, len(photo_keys) + 1)
+            face_index = int(stem, 16) & 255 if encoded else 0
+            filename = f"{(photo_id << 8) | face_index:08x}.npy"
+            # Copy works on Windows without Developer Mode or symlink permissions.
+            shutil.copyfile(source, evaluation_dir / filename)
             filenames.append(filename)
         assignments = cluster_faces_v2(str(evaluation_dir), threshold=args.threshold)
 

@@ -39,8 +39,8 @@ export default React.memo(function PhotoSortMenu() {
           {(Object.keys(labels) as PhotoSortBy[]).map((key) => (
             <div key={key} className="flex items-center rounded-lg hover:bg-surface-primary">
               <span className="flex-1 px-2 py-2 text-xs">{labels[key]}</span>
-              <button type="button" className={`px-2 py-2 text-xs ${sortBy === key && direction === "asc" ? "text-accent-primary" : "text-text-muted"}`} onClick={() => select(key, "asc")} title="升序">↑</button>
-              <button type="button" className={`px-2 py-2 text-xs ${sortBy === key && direction === "desc" ? "text-accent-primary" : "text-text-muted"}`} onClick={() => select(key, "desc")} title="降序">↓</button>
+              <button type="button" className={`px-2 py-2 text-xs ${sortBy === key && direction === "asc" ? "text-accent-link" : "text-text-muted"}`} onClick={() => select(key, "asc")} title="升序">↑</button>
+              <button type="button" className={`px-2 py-2 text-xs ${sortBy === key && direction === "desc" ? "text-accent-link" : "text-text-muted"}`} onClick={() => select(key, "desc")} title="降序">↓</button>
             </div>
           ))}
         </div>

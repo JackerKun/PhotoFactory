@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use rayon::prelude::*;
 
@@ -9,14 +10,55 @@ use crate::error::AppResult;
 use crate::models::Project;
 use crate::thumbnail::{eviction, generator};
 
-/// Number of worker threads for batch thumbnail generation.
-const THUMBNAIL_THREAD_COUNT: usize = 4;
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThumbnailPerformance {
+    Low,
+    #[default]
+    Balanced,
+    Full,
+}
+
+impl ThumbnailPerformance {
+    fn index(self) -> usize {
+        match self {
+            Self::Low => 0,
+            Self::Balanced => 1,
+            Self::Full => 2,
+        }
+    }
+
+    pub fn workers(self) -> usize {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        match self {
+            Self::Low => 1,
+            Self::Balanced => (cores / 2).clamp(1, 4),
+            Self::Full => cores.clamp(1, 8),
+        }
+    }
+
+    pub fn foreground_limit(self) -> usize {
+        match self {
+            Self::Low => 1,
+            Self::Balanced => 2,
+            Self::Full => 4,
+        }
+    }
+
+    fn settings_path() -> std::path::PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| ".".into())
+            .join("PhotoFactory")
+            .join("thumbnail_performance.json")
+    }
+}
 
 /// Tracks the status of a background thumbnail processing run.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProcessingStatus {
     pub running: bool,
     pub batch_size: usize,
+    pub gpu_backend: Option<String>,
     pub total_pending: usize,
     pub processed: usize,
     pub succeeded: usize,
@@ -35,19 +77,12 @@ pub struct ThumbnailProcessor {
     pub batch_size: usize,
     pub current_file: Arc<std::sync::Mutex<Option<String>>>,
     pub last_error: Arc<std::sync::Mutex<Option<String>>>,
-    pool: Arc<rayon::ThreadPool>,
+    performance: Mutex<ThumbnailPerformance>,
+    pools: [OnceLock<rayon::ThreadPool>; 3],
 }
 
 impl ThumbnailProcessor {
     pub fn new(batch_size: usize) -> Self {
-        let pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(THUMBNAIL_THREAD_COUNT)
-                .thread_name(|idx| format!("thumb-worker-{}", idx))
-                .build()
-                .expect("failed to build thumbnail thread pool"),
-        );
-
         Self {
             running: AtomicBool::new(false),
             total_pending: AtomicI64::new(0),
@@ -57,8 +92,45 @@ impl ThumbnailProcessor {
             batch_size,
             current_file: Arc::new(std::sync::Mutex::new(None)),
             last_error: Arc::new(std::sync::Mutex::new(None)),
-            pool,
+            performance: Mutex::new(ThumbnailPerformance::default()),
+            pools: std::array::from_fn(|_| OnceLock::new()),
         }
+    }
+
+    pub fn with_saved_performance(self) -> Self {
+        if let Ok(bytes) = std::fs::read(ThumbnailPerformance::settings_path()) {
+            if let Ok(mode) = serde_json::from_slice(&bytes) {
+                *self.performance.lock().unwrap() = mode;
+            }
+        }
+        self
+    }
+
+    pub fn performance(&self) -> ThumbnailPerformance {
+        *self.performance.lock().unwrap()
+    }
+
+    pub fn set_performance(&self, mode: ThumbnailPerformance) -> AppResult<()> {
+        use std::io::Write;
+        let mut preference = self.performance.lock().unwrap();
+        let path = ThumbnailPerformance::settings_path();
+        let directory = path.parent().unwrap();
+        std::fs::create_dir_all(directory)?;
+        let mut file = tempfile::NamedTempFile::new_in(directory)?;
+        file.write_all(&serde_json::to_vec(&mode)?)?;
+        file.persist(path).map_err(|error| error.error)?;
+        *preference = mode;
+        Ok(())
+    }
+
+    fn pool(&self, mode: ThumbnailPerformance) -> &rayon::ThreadPool {
+        self.pools[mode.index()].get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(mode.workers())
+                .thread_name(|index| format!("thumb-worker-{index}"))
+                .build()
+                .expect("failed to build thumbnail thread pool")
+        })
     }
 
     /// Check if processing is currently running.
@@ -71,6 +143,7 @@ impl ThumbnailProcessor {
         ProcessingStatus {
             running: self.running.load(Ordering::SeqCst),
             batch_size: self.batch_size,
+            gpu_backend: generator::gpu_backend_used().map(str::to_owned),
             total_pending: self.total_pending.load(Ordering::SeqCst) as usize,
             processed: self.processed.load(Ordering::SeqCst),
             succeeded: self.succeeded.load(Ordering::SeqCst),
@@ -91,105 +164,96 @@ impl ThumbnailProcessor {
     }
 
     /// Process all pending thumbnails in batches until none remain or cancelled.
-    pub async fn process_all(&self, project: &Project) {
+    pub fn process_all(&self, project: &Project) {
         if self.running.swap(true, Ordering::SeqCst) {
             return; // already running
         }
         self.reset();
 
-        loop {
-            let batch = match self.process_batch(project) {
-                Ok(count) => count,
-                Err(e) => {
-                    *self.last_error.lock().unwrap() = Some(e.to_string());
-                    self.failed.fetch_add(1, Ordering::SeqCst);
-                    self.processed.fetch_add(1, Ordering::SeqCst);
-                    0
+        let result = (|| -> AppResult<()> {
+            let mut conn = init_db(&project.db_path())?;
+            loop {
+                let pending: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM photos WHERE thumbnail_status=0 AND deleted=0",
+                    [],
+                    |row| row.get(0),
+                )?;
+                self.total_pending.store(pending, Ordering::SeqCst);
+                if pending == 0 || self.process_batch(project, &mut conn)? == 0 {
+                    break;
                 }
-            };
-            if batch == 0 {
-                break;
             }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            *self.last_error.lock().unwrap() = Some(error.to_string());
+            self.failed.fetch_add(1, Ordering::SeqCst);
         }
-
+        *self.current_file.lock().unwrap() = None;
+        let _ = eviction::evict_lru(
+            &project.small_thumbnails_path(),
+            eviction::THUMBNAIL_CACHE_MAX_BYTES,
+        );
         self.running.store(false, Ordering::SeqCst);
     }
 
     /// Process a single batch of pending thumbnails in parallel.
-    /// Returns number of photos processed.
-    fn process_batch(&self, project: &Project) -> AppResult<usize> {
-        let conn = init_db(&project.db_path())?;
-        let photos = photo_dao::get_pending_thumbnails(&conn, self.batch_size as i64)?;
-
+    fn process_batch(
+        &self,
+        project: &Project,
+        conn: &mut rusqlite::Connection,
+    ) -> AppResult<usize> {
+        let photos = photo_dao::get_pending_thumbnails(conn, self.batch_size as i64)?;
         if photos.is_empty() {
             return Ok(0);
         }
 
-        self.total_pending
-            .store(photos.len() as i64, Ordering::SeqCst);
-
-        // Extract data needed for parallel processing (owned copies, no DB connection).
-        let items: Vec<(i64, String, String)> = photos
-            .iter()
-            .map(|p| (p.id.unwrap_or(0), p.path.clone(), p.filename.clone()))
-            .collect();
-
-        // Parallel thumbnail generation using fixed 4-thread pool.
-        let results: Vec<(i64, String, bool, Option<String>)> = self.pool.install(|| {
-            items
+        let out_dir = project.small_thumbnails_path();
+        let mode = self.performance();
+        let results: Vec<_> = self.pool(mode).install(|| {
+            photos
                 .par_iter()
-                .map(|(photo_id, path, filename)| {
-                    let source = Path::new(path);
-                    let out_dir = project.small_thumbnails_path();
-
-                    {
-                        let mut cur = self.current_file.lock().unwrap();
-                        *cur = Some(filename.clone());
+                .map(|photo| {
+                    *self.current_file.lock().unwrap() = Some(photo.filename.clone());
+                    let result = generator::generate_thumbnail_with_mode(
+                        Path::new(&photo.path),
+                        &out_dir,
+                        generator::THUMBNAIL_SIZE_SMALL,
+                        mode,
+                    );
+                    if mode == ThumbnailPerformance::Low {
+                        std::thread::sleep(Duration::from_millis(25));
                     }
-
-                    let success = generator::generate_small_thumbnail(source, &out_dir).is_ok();
-
-                    // Yield CPU time after each photo to reduce sustained CPU load
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-
-                    let error = if success {
-                        None
-                    } else {
-                        Some(filename.clone())
-                    };
-                    (*photo_id, filename.clone(), success, error)
+                    (photo.id.unwrap_or(0), &photo.filename, result)
                 })
                 .collect()
         });
 
-        // Write results back to DB in a single connection (serial).
-        let conn = init_db(&project.db_path())?;
-        let mut succeeded_count = 0usize;
-        let mut failed_count = 0usize;
-        for (photo_id, _filename, success, error) in &results {
-            let status = if *success { 1i32 } else { -1i32 };
-            let _ = photo_dao::update_thumbnail_status(&conn, *photo_id, status);
-            if *success {
-                succeeded_count += 1;
-            } else {
-                failed_count += 1;
-                if let Some(ref err_file) = error {
-                    *self.last_error.lock().unwrap() = Some(err_file.clone());
+        let tx = conn.transaction()?;
+        let mut succeeded = 0;
+        let mut failed = 0;
+        for (photo_id, filename, result) in &results {
+            let status = match result {
+                Ok(_) => {
+                    succeeded += 1;
+                    1
                 }
-            }
+                Err(error) => {
+                    failed += 1;
+                    *self.last_error.lock().unwrap() = Some(format!("{filename}: {error}"));
+                    -1
+                }
+            };
+            tx.execute(
+                "UPDATE photos SET thumbnail_status = ?1 WHERE id = ?2 AND thumbnail_status = 0",
+                rusqlite::params![status, photo_id],
+            )?;
         }
-
-        self.succeeded.fetch_add(succeeded_count, Ordering::SeqCst);
-        self.failed.fetch_add(failed_count, Ordering::SeqCst);
+        tx.commit()?;
+        self.succeeded.fetch_add(succeeded, Ordering::SeqCst);
+        self.failed.fetch_add(failed, Ordering::SeqCst);
         self.processed.fetch_add(results.len(), Ordering::SeqCst);
-
-        // Trigger LRU eviction for small thumbnail directory
-        let small_dir = project.small_thumbnails_path();
-        let _ = eviction::maybe_evict(&small_dir);
-
-        // Cool down between batches to prevent sustained CPU load
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
+        let _ = eviction::maybe_evict(&out_dir);
         Ok(results.len())
     }
 }
@@ -213,7 +277,13 @@ mod tests {
     #[test]
     fn test_thread_pool_has_correct_thread_count() {
         let proc = ThumbnailProcessor::new(50);
-        assert_eq!(proc.pool.current_num_threads(), THUMBNAIL_THREAD_COUNT);
+        for mode in [
+            ThumbnailPerformance::Low,
+            ThumbnailPerformance::Balanced,
+            ThumbnailPerformance::Full,
+        ] {
+            assert_eq!(proc.pool(mode).current_num_threads(), mode.workers());
+        }
     }
 
     #[test]
@@ -251,6 +321,7 @@ mod tests {
         let status = ProcessingStatus {
             running: false,
             batch_size: 100,
+            gpu_backend: None,
             total_pending: 50,
             processed: 10,
             succeeded: 8,

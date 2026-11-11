@@ -11,6 +11,26 @@ use crate::models::{Project, ScanResult};
 use crate::thumbnail::processor::ThumbnailProcessor;
 use crate::{create_project, load_project, save_project_json};
 
+/// Authorize the opened library, including .pf caches and additional disks/NAS.
+pub fn allow_project_assets(app: &tauri::AppHandle, project: &Project) -> AppResult<()> {
+    allow_asset_directory(app, &project.root_path)?;
+    let conn = init_db(&project.db_path())?;
+    let mut stmt = conn.prepare("SELECT path FROM storage_sources")?;
+    let paths = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    for path in paths {
+        allow_asset_directory(app, &path?)?;
+    }
+    Ok(())
+}
+
+pub fn allow_asset_directory(app: &tauri::AppHandle, path: &str) -> AppResult<()> {
+    app.asset_protocol_scope()
+        .allow_directory(path, true)
+        .map_err(|error| {
+            AppError::InvalidPath(format!("Cannot authorize photo directory: {error}"))
+        })
+}
+
 fn last_project_path_file() -> std::path::PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -23,12 +43,29 @@ pub struct AppState {
     pub thumbnail_processor: Arc<ThumbnailProcessor>,
 }
 
+pub fn current_project(state: &AppState) -> AppResult<Project> {
+    state
+        .project
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| AppError::Project("No project open".into()))
+}
+
 pub fn get_conn(state: State<'_, AppState>) -> AppResult<Connection> {
-    let guard = state.project.lock().unwrap();
-    let project = guard
-        .as_ref()
-        .ok_or_else(|| crate::error::AppError::NotFound("No database connection".to_string()))?;
-    init_db(&project.db_path())
+    init_db(&current_project(&state)?.db_path())
+}
+
+pub async fn read_project_db<T: Send + 'static>(
+    project: Project,
+    query: impl FnOnce(&Connection) -> AppResult<T> + Send + 'static,
+) -> AppResult<T> {
+    tokio::task::spawn_blocking(move || {
+        let conn = crate::db::connection::open_read_db(&project.db_path())?;
+        query(&conn)
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("照片库读取中断：{error}")))?
 }
 
 fn add_to_recent(root_path: &str) {
@@ -49,9 +86,11 @@ fn add_to_recent(root_path: &str) {
 pub async fn cmd_create_project(
     root_path: String,
     name: String,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<Project> {
     let project = create_project(&root_path, &name)?;
+    allow_project_assets(&app, &project)?;
     *state.project.lock().unwrap() = Some(project.clone());
     std::fs::write(last_project_path_file(), &root_path).ok();
     add_to_recent(&root_path);
@@ -59,8 +98,13 @@ pub async fn cmd_create_project(
 }
 
 #[tauri::command]
-pub async fn cmd_open_project(root_path: String, state: State<'_, AppState>) -> AppResult<Project> {
+pub async fn cmd_open_project(
+    root_path: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<Project> {
     let project = load_project(&root_path)?;
+    allow_project_assets(&app, &project)?;
     *state.project.lock().unwrap() = Some(project.clone());
     std::fs::write(last_project_path_file(), &root_path).ok();
     add_to_recent(&root_path);
@@ -379,34 +423,80 @@ pub async fn cmd_trigger_auto_ai(
         }
     };
 
-    if pending == 0 && unassigned_faces == 0 {
-        let conn = get_conn(state.clone())?;
-        crate::db::ai_task_dao::set_pipeline_state(&conn, "done", "done", 0, 0, 0, None)?;
+    if worker_state
+        .pipeline_running
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Ok("AI pipeline is already running in the background".into());
+    }
+    let conn = get_conn(state.clone())?;
+    if pending == 0
+        && unassigned_faces == 0
+        && !crate::db::ai_task_dao::needs_ai_finalization(&conn)?
+    {
+        let failed =
+            crate::db::ai_task_dao::stage_counts(&conn, crate::db::ai_task_dao::FACE_STAGE)?.2
+                + crate::db::ai_task_dao::stage_counts(
+                    &conn,
+                    crate::db::ai_task_dao::CLASSIFICATION_STAGE,
+                )?
+                .2;
+        if crate::db::ai_task_dao::pipeline_control_status(&conn)? != "done" {
+            crate::db::ai_task_dao::set_pipeline_state(&conn, "done", "done", 0, 0, failed, None)?;
+        }
         return Ok("No pending AI work".into());
     }
-
-    crate::db::ai_task_dao::set_pipeline_control(&get_conn(state.clone())?, "running")?;
-
+    let db_path = state
+        .project
+        .lock()
+        .unwrap()
+        .as_ref()
+        .ok_or_else(|| AppError::Project("No project open".into()))?
+        .db_path();
     if worker_state
         .pipeline_running
         .swap(true, std::sync::atomic::Ordering::SeqCst)
     {
         return Ok("AI pipeline is already running in the background".into());
     }
+    if let Err(error) = crate::db::ai_task_dao::set_pipeline_control(&conn, "running") {
+        worker_state
+            .pipeline_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        return Err(error);
+    }
 
-    // Clone app_handle for the spawned task
     let handle = app_handle.clone();
-
-    // Spawn AI pipeline in background
     tokio::spawn(async move {
-        let app_state = handle.try_state::<AppState>().unwrap();
-        let worker = handle
-            .try_state::<crate::commands::ai::AiWorkerState>()
-            .unwrap();
-        let handle2 = handle.clone();
-        let _ = crate::commands::ai::run_auto_ai_pipeline_inner(app_state, worker.clone(), handle2)
-            .await;
-        worker
+        let pipeline_handle = handle.clone();
+        let result = tokio::spawn(async move {
+            let app_state = pipeline_handle.state::<AppState>();
+            let worker = pipeline_handle.state::<crate::commands::ai::AiWorkerState>();
+            crate::commands::ai::run_auto_ai_pipeline_inner(
+                app_state,
+                worker,
+                pipeline_handle.clone(),
+            )
+            .await
+        })
+        .await;
+        let error = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(error) => Some(format!("智能分析任务中断：{error}")),
+        };
+        if let Some(error) = error {
+            eprintln!("AI pipeline: {error}");
+            if let Ok(conn) = init_db(&db_path) {
+                let _ = conn.execute(
+                    "UPDATE ai_pipeline_state SET status='error',last_error=?1,updated_at=?2
+                     WHERE id=1 AND status NOT IN ('canceled','paused')",
+                    rusqlite::params![error, chrono::Utc::now().timestamp()],
+                );
+            }
+        }
+        handle
+            .state::<crate::commands::ai::AiWorkerState>()
             .pipeline_running
             .store(false, std::sync::atomic::Ordering::SeqCst);
     });

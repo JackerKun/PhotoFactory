@@ -6,6 +6,7 @@
 <p align="center">
   简体中文 · <a href="README.en.md">English</a> ·
   <a href="https://github.com/JackerKun/PhotoFactory">GitHub</a> ·
+  <a href="https://github.com/JackerKun/PhotoFactory/releases">安装包</a> ·
   <a href="#界面导览">界面导览</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="docs/USER_GUIDE.md">使用手册</a> ·
@@ -27,9 +28,9 @@ _截图为真实 React 组件的浏览器演示，使用独立模拟命令接口
 | --- | --- |
 | **Photos / 照片** | 目录扫描与增量更新、方格 / 原比例网格、滚动年月导航、关键词与 EXIF 组合筛选、多字段排序、收藏及 0–5 星评分。 |
 | **大图与详情** | 缩放和平移、底部胶片条、器材与 GPS 信息、标签、自定义属性，以及已有的人脸结果。 |
-| **People / 人物** | 本地人脸分析、命名、手工合并、待审核与忽略 / 恢复；未命名自动合并有预览、冲突约束和撤销入口。 |
+| **人物** | 本地人脸分析、命名、合并、待审核与忽略 / 恢复。可按人数和人物组合查找合影，也可预览并撤销未命名人物的自动合并。 |
 | **Tags / 标签** | Places365 场景和 CLIP 多标签结果按类别 / 来源展示；可编辑标签独立管理，允许人工修正。 |
-| **Map / 地图** | 已有 GPS 照片浏览、标准 / 卫星图层、完整地址检索、聚合预览、单张与批量坐标编辑。 |
+| **地图** | 标准和卫星图层、离线地图导入和导出、GPS 照片预览、拍摄轨迹、地址检索及批量坐标编辑。 |
 | **相册** | 按人物、时间、地点和内容组织智能相册；支持搜索、分类、排序和分页查看。 |
 | **智能工具** | 任务、智能检索、相似照片、RAW+JPEG 堆栈、故事、回收站、编辑参数、XMP 和附加只读存储源。 |
 
@@ -51,7 +52,7 @@ _截图为真实 React 组件的浏览器演示，使用独立模拟命令接口
 
 ### 人物：自动分组后，仍能人工整理
 
-进入 **People** 查看已命名、未命名和待审核分组。可以命名、确认、合并或忽略结果；自动合并未命名人物先预览候选，再决定是否应用。完整重建会保留已命名人物，更多细节见[使用手册](docs/USER_GUIDE.md)。
+进入 **人物** 查看已命名、未命名和待审核分组。可以命名、确认、合并或忽略结果。自动合并未命名人物时可先预览候选。点 **合影** 按人数或所选人物查找照片。完整重建会保留已命名人物。更多细节见[使用手册](docs/USER_GUIDE.md)。
 
 ![人物演示：使用虚构姓名和图形头像展示分组入口，非识别结果](docs/screenshots/people.webp)
 
@@ -67,9 +68,11 @@ _截图为真实 React 组件的浏览器演示，使用独立模拟命令接口
 
 ![相册演示：预置月度、主题与人物分组](docs/screenshots/albums.webp)
 
-### 地图：找地点，查看已有 GPS 照片
+### 地图：查看 GPS 照片与拍摄轨迹
 
-进入 **Map**，切换标准 / 卫星图层，用地址候选定位，点击聚合或照片预览。详情里的 Location 可跳到附近照片；坐标编辑区支持共享坐标或逐张填写。地图瓦片和地址查询需要联网，已缓存区域可复用。
+进入 **地图**，切换标准或卫星图层，点击聚合点查看照片。首次打开显示世界地图，后续恢复上次的位置和缩放。优先使用本地瓦片，覆盖不足时尝试联网补充。地址搜索需要联网。
+
+点右上角的 **拍摄轨迹**，框选范围，按需指定日期后生成轨迹。轨迹按拍摄时间连接 GPS 照片，可保存到当前照片库。点轨迹上的圆点会展开附近照片的缩略图，每张缩略图都有细线连回拍摄位置，点击可看大图。点面板标题旁的箭头可折叠面板，继续在地图上浏览轨迹。底图加载失败时，可点左下角的刷新图标重试。
 
 ![地图演示：预置上海坐标与在线底图，保留地图署名](docs/screenshots/map.webp)
 
@@ -78,6 +81,8 @@ _截图为真实 React 组件的浏览器演示，使用独立模拟命令接口
 进入“智能工具”，按页切换任务、检索、相似分组、堆栈、故事、回收站与设置。编辑页当前保存旋转、曝光、对比度、色温等参数，不能把它等同于完整 RAW 显影或成品渲染导出流程。
 
 ![智能工具演示：任务及整理入口](docs/screenshots/tools.webp)
+
+侧栏的 **后台任务** 集中显示缩略图和 AI 分析进度。缩略图提供低速、均衡和全速三档。兼容设备可用 GPU 缩放预览，并在不支持时回退到 CPU。侧栏底部可切换浅色、深色或跟随系统主题。
 
 ## 快速开始
 
@@ -93,7 +98,7 @@ _截图为真实 React 组件的浏览器演示，使用独立模拟命令接口
 
 ### 从源码开发
 
-准备 Node.js（项目工作流使用 20）、Rust stable、Python 3.10 / 3.11，以及操作系统所需的 Tauri 原生构建依赖。Windows 还需要 C++ Build Tools 与 WebView2，macOS 需要 Xcode Command Line Tools；完整清单见[构建指南](docs/BUILDING.md)。
+准备 Node.js（项目工作流使用 22）、Rust stable、Python 3.10 / 3.11，以及操作系统所需的 Tauri 原生构建依赖。Windows 还需要 C++ Build Tools 与 WebView2，macOS 需要 Xcode Command Line Tools。完整清单见[构建指南](docs/BUILDING.md)。
 
 ```bash
 cd PhotoFactory
@@ -107,7 +112,23 @@ ai_worker/.venv/bin/python ai_worker/download_models.py
 npm run tauri dev
 ```
 
+也可以在根目录一键准备并启动完整桌面开发环境：
+
+```bash
+./start.sh
+# 仅检查本机依赖和模型，不安装或启动
+./start.sh --check
+```
+
+Windows 请使用 **Git Bash**，并安装原生 Windows Node.js、Rust/MSVC、Python 3.11 x64、WebView2（详见 [构建指南](docs/BUILDING.md)）；不要在 WSL 中启动 Windows 桌面验证。脚本会安装前端/Python 依赖、下载或校验 AI 模型，并启动 Tauri 桌面程序；人脸和场景分析由应用按需启动 AI Worker，退出应用时关闭。首次运行需要联网下载依赖和模型。OCR 需要 Tesseract 及 `eng`、`chi_sim` 语言包，EXIF/GPS 回写需要 ExifTool；缺少时脚本会提示，相应功能需补齐依赖后验证。
+
+Windows 图片显示修复涵盖 `http://asset.localhost`、项目目录/额外存储源授权及 `.pf` 隐藏缓存；HEIC/RAW 使用 Worker 内置的跨平台解码器生成预览。验证时请打开位于 D:/E: 或网络盘的照片库，查看缩略图、双击大图并运行人脸识别。已经安装的旧版本需重新运行 `build-windows.ps1` 构建并安装，`start.sh` 则直接验证当前源码。
+
 Windows 虚拟环境使用 `ai_worker\.venv\Scripts\python.exe`，其余步骤参阅构建指南。`npm run dev` 只启动前端服务，原生扫描、SQLite、文件对话框和 AI 由 Tauri / Worker 提供；直接打开前端不等于完整桌面程序。
+
+## 离线地图
+
+在联网电脑运行 `./startOffline.sh`，浏览器会打开独立工具。缩放和平移即可保存已浏览的瓦片，也可以框选范围。选择标准或卫星图层可导出 `.mbtiles`，选择两种地图可导出 `.pfmap`。在 **地图 → 离线地图 → 导入离线地图包** 中导入后，包存入当前照片库的 `.pf/maps/offline/`。也可以从 PhotoFactory 导出已导入和已缓存的瓦片。详见[打包和导入指南](docs/OFFLINE_MAPS.md)。
 
 ## 安装包与构建
 
@@ -133,6 +154,7 @@ Windows 虚拟环境使用 `ai_worker\.venv\Scripts\python.exe`，其余步骤�
 ├── photos.db
 ├── thumbnails/{small,medium,large}/
 ├── maps/tiles/
+├── maps/offline/
 └── ai_cache/{faces,tags}/
 ```
 
@@ -161,7 +183,7 @@ cd src-tauri
 cargo test --lib
 ```
 
-本次文档更新在 macOS 上通过前端 **11 个测试文件 / 29 项测试**及 TypeScript / Vite 构建。未把这次文档截图计作原生 AI、Windows 安装器、真实大型图库或全格式媒体测试。前端构建仍有现有的分块体积提示。
+GitHub 上的安装包构建、测试结果和临时下载文件可在 [Actions](https://github.com/JackerKun/PhotoFactory/actions/workflows/release.yml) 查看。
 
 ## 项目结构
 
@@ -174,6 +196,8 @@ docs/BUILDING.md       环境准备、Worker 与安装包构建
 docs/screenshots/     演示截图、来源与复现说明
 build.sh              macOS / Windows Git Bash 构建入口
 build-windows.ps1     Windows PowerShell 构建入口
+start.sh              桌面开发启动入口
+startOffline.sh       浏览器离线地图工具入口
 .github/workflows/    macOS / Windows 四架构构建与 Release
 ```
 

@@ -6,7 +6,6 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::thread;
 use std::time::Duration;
 use tauri::State;
@@ -158,8 +157,12 @@ fn map_library_photo(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryPhoto> 
 const PHOTO_SELECT: &str = "SELECT p.id,p.path,p.filename,p.rating,p.is_favorite,p.taken_at,i.ocr_text,i.quality_score,i.duplicate_group,i.stack_key,i.best_in_group,i.is_private,i.is_sensitive,t.trashed_at FROM photos p LEFT JOIN photo_intelligence i ON i.photo_id=p.id LEFT JOIN photo_trash t ON t.photo_id=p.id";
 
 #[tauri::command]
-pub fn cmd_get_library_jobs(state: State<'_, AppState>) -> AppResult<Vec<LibraryJob>> {
-    let conn = get_conn(state)?;
+pub async fn cmd_get_library_jobs(state: State<'_, AppState>) -> AppResult<Vec<LibraryJob>> {
+    use crate::commands::project::{current_project, read_project_db};
+    read_project_db(current_project(&state)?, read_library_jobs).await
+}
+
+fn read_library_jobs(conn: &rusqlite::Connection) -> AppResult<Vec<LibraryJob>> {
     let mut stmt = conn.prepare("SELECT id,job_type,status,progress,total,message,error,created_at,updated_at FROM library_jobs ORDER BY id DESC LIMIT 50")?;
     let rows = stmt
         .query_map([], |r| {
@@ -236,7 +239,7 @@ fn ocr_text(path: &str) -> String {
         return String::new();
     }
     let run = |lang: &str| {
-        Command::new("tesseract")
+        crate::process::background_command("tesseract")
             .arg(path)
             .arg("stdout")
             .arg("-l")
@@ -863,6 +866,7 @@ pub fn cmd_get_storage_sources(state: State<'_, AppState>) -> AppResult<Vec<Stor
 
 #[tauri::command]
 pub fn cmd_add_storage_source(
+    app: tauri::AppHandle,
     path: String,
     label: String,
     read_only: bool,
@@ -874,6 +878,7 @@ pub fn cmd_add_storage_source(
         "local"
     };
     let conn = get_conn(state)?;
+    crate::commands::project::allow_asset_directory(&app, &path)?;
     conn.execute("INSERT INTO storage_sources(path,label,kind,status,read_only,last_seen) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(path) DO UPDATE SET label=excluded.label,read_only=excluded.read_only,last_seen=excluded.last_seen",params![path,label,kind,if Path::new(&path).exists(){"online"}else{"offline"},read_only as i64,now()])?;
     let id = conn.query_row(
         "SELECT id FROM storage_sources WHERE path=?1",

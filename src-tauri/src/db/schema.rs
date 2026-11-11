@@ -175,6 +175,11 @@ CREATE TABLE IF NOT EXISTS photo_trash (
     photo_id INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
     reason TEXT NOT NULL DEFAULT '', trashed_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS photo_tracks (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    settings TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS photo_edits (
     photo_id INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
     crop_json TEXT NOT NULL DEFAULT '', rotation REAL NOT NULL DEFAULT 0,
@@ -236,6 +241,7 @@ CREATE INDEX IF NOT EXISTS idx_photos_rating ON photos(rating, deleted);
 CREATE INDEX IF NOT EXISTS idx_photos_gps ON photos(latitude, longitude) WHERE latitude IS NOT NULL AND deleted = 0;
 CREATE INDEX IF NOT EXISTS idx_ai_classifications_photo ON ai_classifications(photo_id);
 CREATE INDEX IF NOT EXISTS idx_ai_classifications_label ON ai_classifications(label);
+CREATE INDEX IF NOT EXISTS idx_photos_pending_thumbnails ON photos(id) WHERE thumbnail_status = 0 AND deleted = 0;
 CREATE INDEX IF NOT EXISTS idx_face_detections_photo ON face_detections(photo_id);
 CREATE INDEX IF NOT EXISTS idx_face_detections_person ON face_detections(person_id);
 CREATE INDEX IF NOT EXISTS idx_face_detections_person_photo ON face_detections(person_id, photo_id);

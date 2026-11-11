@@ -1,7 +1,9 @@
 // src/components/DirectoryTree.tsx
 import React, { useEffect, useState, useCallback, useMemo } from "react";
 import { useStore } from "../hooks/usePhotos";
+import Icon from "./Icon";
 import * as api from "../api/tauri";
+import { readPhotoData } from "../utils/photoRequests";
 
 interface DirNode {
   name: string;
@@ -89,7 +91,7 @@ function DirNodeItem({ node, rootPath }: { node: DirNode; rootPath: string }) {
         <span className="w-4 text-center text-xs shrink-0">
           {hasChildren ? (expanded ? "▾" : "▸") : " "}
         </span>
-        <span className="truncate">📁 {node.name}</span>
+        <Icon name="folder" size={16} /><span className="truncate">{node.name}</span>
       </button>
       {expanded && hasChildren && (
         <div className="ml-4">
@@ -106,6 +108,9 @@ interface Props { rootPath: string }
 
 export default React.memo(function DirectoryTree({ rootPath }: Props) {
   const [dirs, setDirs] = useState<string[]>([]);
+  const [directoryStatus, setDirectoryStatus] = useState<"loading" | "ready" | "error">("loading");
+  const [attempt, setAttempt] = useState(0);
+  const projectPhotoCount = useStore((state) => state.project?.total_photos);
   const { filter, clearPhotoFilters } = useStore();
   const isAllPhotos = !filter.directory
     && !filter.tag
@@ -127,14 +132,19 @@ export default React.memo(function DirectoryTree({ rootPath }: Props) {
     && filter.rating_max == null;
 
   useEffect(() => {
-    api.getPhotoDirectories().then(setDirs).catch(console.error);
-  }, []);
+    let live = true;
+    setDirectoryStatus("loading");
+    readPhotoData(api.getPhotoDirectories, () => live).then((next) => {
+      if (live) { setDirs(next); setDirectoryStatus("ready"); }
+    }).catch(() => { if (live) setDirectoryStatus("error"); });
+    return () => { live = false; };
+  }, [rootPath, projectPhotoCount, attempt]);
 
   const tree = useMemo(() => buildTree(dirs), [dirs]);
 
   return (
     <div className="overflow-y-auto h-full p-2">
-      <h3 className="text-xs font-semibold text-text-muted uppercase px-2 py-1">Folders</h3>
+      <h3 className="text-xs font-semibold text-text-muted uppercase px-2 py-1">文件夹</h3>
       <button
         onClick={clearPhotoFilters}
         className={`w-full text-left px-2 py-1 text-sm rounded transition-colors truncate ${
@@ -143,8 +153,10 @@ export default React.memo(function DirectoryTree({ rootPath }: Props) {
             : "text-text-secondary hover:bg-surface-primary"
         }`}
       >
-        All Photos
+        全部照片
       </button>
+      {directoryStatus === "loading" && <p role="status" className="px-2 py-2 text-xs text-text-secondary">正在读取文件夹…</p>}
+      {directoryStatus === "error" && <button type="button" className="ui-button mt-2" onClick={() => setAttempt((value) => value + 1)}>重新读取文件夹</button>}
       {tree.map(node => (
         <DirNodeItem key={node.relPath} node={node} rootPath={rootPath} />
       ))}

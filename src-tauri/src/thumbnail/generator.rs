@@ -2,9 +2,12 @@ use hex;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+use super::processor::ThumbnailPerformance;
 use crate::error::{AppError, AppResult};
+use image::DynamicImage;
+use std::sync::{LazyLock, Mutex};
 
-const THUMBNAIL_SIZE_SMALL: u32 = 256;
+pub(crate) const THUMBNAIL_SIZE_SMALL: u32 = 256;
 const THUMBNAIL_SIZE_MEDIUM: u32 = 512;
 const THUMBNAIL_SIZE_LARGE: u32 = 1024;
 
@@ -28,7 +31,7 @@ fn needs_conversion(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Convert a RAW file to JPEG. On macOS uses sips; on other platforms tries image crate.
+/// Convert RAW/HEIF to JPEG using ImageIO on macOS or the bundled Python codecs.
 fn raw_to_jpeg(raw_path: &Path) -> AppResult<PathBuf> {
     let temp_dir = std::env::temp_dir().join("photofactory_raw");
     std::fs::create_dir_all(&temp_dir)?;
@@ -72,14 +75,41 @@ fn raw_to_jpeg(raw_path: &Path) -> AppResult<PathBuf> {
         )));
     }
 
-    // Other platforms: no sips available
+    // The bundled worker provides pillow-heif/libraw on Windows and Linux.
+    // CLI conversion does not start the HTTP server or load any AI models.
     #[cfg(not(target_os = "macos"))]
     {
-        Err(AppError::Image(image::ImageError::IoError(
-            std::io::Error::other(format!(
-                "RAW format not supported by image crate: {:?}",
-                raw_path
-            )),
+        use crate::commands::ai::{ai_worker_python, find_ai_worker_dir};
+        let dir = find_ai_worker_dir().ok_or_else(|| {
+            AppError::AiWorker(
+                "HEIC/RAW decoder missing; prepare or reinstall the AI worker".into(),
+            )
+        })?;
+        let executable = dir.join(if cfg!(windows) {
+            "photofactory-ai.exe"
+        } else {
+            "photofactory-ai"
+        });
+        let mut command = if executable.is_file() {
+            crate::process::background_command(executable)
+        } else {
+            let mut command = crate::process::background_command(ai_worker_python(&dir));
+            command.arg(dir.join("server.py"));
+            command
+        };
+        let output = command
+            .arg("--convert-image")
+            .arg(raw_path)
+            .arg(&jpeg_path)
+            .output()?;
+        if output.status.success() && jpeg_path.is_file() {
+            return Ok(jpeg_path);
+        }
+        let _ = std::fs::remove_file(&jpeg_path);
+        Err(AppError::AiWorker(format!(
+            "HEIC/RAW conversion failed for {}: {}",
+            raw_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
         )))
     }
 }
@@ -90,34 +120,129 @@ fn path_hash(path: &str) -> String {
     hex::encode(&hasher.finalize()[..8])
 }
 
-pub fn generate_thumbnail(source_path: &Path, output_dir: &Path, size: u32) -> AppResult<PathBuf> {
-    std::fs::create_dir_all(output_dir)?;
+fn decode_scaled_jpeg(source: &Path, size: u32) -> Option<DynamicImage> {
+    use jpeg_decoder::{Decoder, PixelFormat};
+    let file = std::fs::File::open(source).ok()?;
+    let mut decoder = Decoder::new(std::io::BufReader::new(file));
+    decoder.set_max_decoding_buffer_size(512 * 1024 * 1024);
+    let target = u16::try_from(size).ok()?;
+    decoder.scale(target, target).ok()?;
+    let info = decoder.info()?;
+    let width = u32::from(info.width);
+    let height = u32::from(info.height);
+    let pixels = decoder.decode().ok()?;
+    match info.pixel_format {
+        PixelFormat::RGB24 => {
+            image::RgbImage::from_raw(width, height, pixels).map(DynamicImage::ImageRgb8)
+        }
+        PixelFormat::L8 => {
+            image::GrayImage::from_raw(width, height, pixels).map(DynamicImage::ImageLuma8)
+        }
+        _ => None,
+    }
+}
 
-    // RAW and HEIC/HEIF files are not decoded reliably by the image crate on
-    // every platform. Convert them to a temporary JPEG first. The HEIC branch
-    // used to be missing here, which made the original/lightbox work in WebKit
-    // while every cached thumbnail failed to generate.
-    let img = if is_raw_format(source_path) || needs_conversion(source_path) {
-        let jpeg_path = raw_to_jpeg(source_path)?;
-        let result = image::open(&jpeg_path).map_err(|e| AppError::Image(e));
-        // Clean up temp JPEG
+fn decode_thumbnail_source(source: &Path, size: u32) -> AppResult<DynamicImage> {
+    let extension = source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    if extension.eq_ignore_ascii_case("jpeg") || extension.eq_ignore_ascii_case("jpg") {
+        if let Some(image) = decode_scaled_jpeg(source, size) {
+            return Ok(image);
+        }
+    }
+    if is_raw_format(source) || needs_conversion(source) {
+        #[cfg(target_os = "macos")]
+        if let Some(image) = super::image_io::thumbnail(source, size) {
+            return Ok(image);
+        }
+        let jpeg_path = raw_to_jpeg(source)?;
+        let result = image::open(&jpeg_path).map_err(AppError::Image);
         let _ = std::fs::remove_file(&jpeg_path);
-        result?
-    } else {
-        image::open(source_path).map_err(|e| AppError::Image(e))?
-    };
+        return result;
+    }
+    image::open(source).map_err(AppError::Image)
+}
 
-    let thumb = img.thumbnail(size, size);
+fn resize_thumbnail(img: DynamicImage, size: u32, _mode: ThumbnailPerformance) -> DynamicImage {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        // A small thumbnail rarely repays the upload and readback cost.
+        let min_pixels = match _mode {
+            ThumbnailPerformance::Low => u64::MAX,
+            ThumbnailPerformance::Balanced if size >= 1024 => 4_000_000,
+            ThumbnailPerformance::Full if size >= 512 => 2_000_000,
+            _ => u64::MAX,
+        };
+        let (width, height) = (img.width(), img.height());
+        if u64::from(width) * u64::from(height) >= min_pixels
+            && (size + 1..=8192).contains(&width.max(height))
+        {
+            let longest = u64::from(width.max(height));
+            let scaled = |length| {
+                ((u64::from(length) * u64::from(size) + longest / 2) / longest).max(1) as u32
+            };
+            if let Some(result) = super::gpu::resize(&img, scaled(width), scaled(height)) {
+                return result;
+            }
+        }
+    }
+    img.thumbnail(size, size)
+}
+
+pub fn gpu_backend_used() -> Option<&'static str> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        super::gpu::backend_used()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+pub fn generate_thumbnail(source_path: &Path, output_dir: &Path, size: u32) -> AppResult<PathBuf> {
+    generate_thumbnail_with_mode(
+        source_path,
+        output_dir,
+        size,
+        ThumbnailPerformance::Balanced,
+    )
+}
+
+pub fn generate_thumbnail_with_mode(
+    source_path: &Path,
+    output_dir: &Path,
+    size: u32,
+    mode: ThumbnailPerformance,
+) -> AppResult<PathBuf> {
     let hash = path_hash(&source_path.to_string_lossy());
     let shard_dir = output_dir.join(&hash[..2]);
+    let out_path = shard_dir.join(format!("{hash}.webp"));
+    // Coalesce concurrent requests for the same source and cache directory.
+    static LOCKS: LazyLock<[Mutex<()>; 256]> =
+        LazyLock::new(|| std::array::from_fn(|_| Mutex::new(())));
+    let lock_index = u8::from_str_radix(&hash[..2], 16).unwrap() as usize;
+    let _lock = LOCKS[lock_index].lock().unwrap();
+    let source_modified = source_path.metadata()?.modified().ok();
+    if let Some(cached) = find_thumbnail_path(&source_path.to_string_lossy(), output_dir) {
+        let cached_modified = cached.metadata().and_then(|meta| meta.modified()).ok();
+        if source_modified
+            .zip(cached_modified)
+            .is_some_and(|(source, cached)| cached >= source)
+        {
+            return Ok(cached);
+        }
+    }
     std::fs::create_dir_all(&shard_dir)?;
-    let out_path = shard_dir.join(format!("{}.webp", hash));
     // Never expose a partially encoded WebP to WKWebView. Concurrent callers
     // write complete unique files, then atomically publish one of them.
     let temp_path = shard_dir.join(format!(".{}-{}.webp", hash, uuid::Uuid::new_v4()));
-    if let Err(error) = thumb.save_with_format(&temp_path, image::ImageFormat::WebP) {
+    let result = encode_thumbnail(source_path, &temp_path, size, mode);
+    if let Err(error) = result {
         let _ = std::fs::remove_file(&temp_path);
-        return Err(AppError::Image(error));
+        return Err(error);
     }
     if let Err(error) = std::fs::rename(&temp_path, &out_path) {
         if out_path.exists() {
@@ -129,6 +254,23 @@ pub fn generate_thumbnail(source_path: &Path, output_dir: &Path, size: u32) -> A
         }
     }
     Ok(out_path)
+}
+
+fn encode_thumbnail(
+    source: &Path,
+    target: &Path,
+    size: u32,
+    mode: ThumbnailPerformance,
+) -> AppResult<()> {
+    #[cfg(target_os = "windows")]
+    if (is_raw_format(source) || needs_conversion(source))
+        && super::codec_worker::thumbnail(source, target, size)
+    {
+        return Ok(());
+    }
+    let image = decode_thumbnail_source(source, size)?;
+    resize_thumbnail(image, size, mode).save_with_format(target, image::ImageFormat::WebP)?;
+    Ok(())
 }
 
 pub fn generate_small_thumbnail(source_path: &Path, output_dir: &Path) -> AppResult<PathBuf> {
@@ -233,6 +375,19 @@ mod tests {
     use super::*;
     use image::DynamicImage;
     use std::fs;
+
+    #[test]
+    fn jpeg_thumbnail_decodes_at_reduced_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.jpg");
+        image::RgbImage::from_pixel(2000, 1000, image::Rgb([30, 60, 90]))
+            .save(&source)
+            .unwrap();
+        let decoded = decode_scaled_jpeg(&source, 256).unwrap();
+        assert!(decoded.width() >= 256 && decoded.width() < 2000);
+        let thumbnail = generate_small_thumbnail(&source, dir.path()).unwrap();
+        assert_eq!(image::image_dimensions(thumbnail).unwrap(), (256, 128));
+    }
 
     #[test]
     fn face_crop_adds_head_and_shoulder_context() {

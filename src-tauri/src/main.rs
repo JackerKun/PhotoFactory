@@ -19,7 +19,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             project: Mutex::new(initial_project),
-            thumbnail_processor: Arc::new(ThumbnailProcessor::new(50)),
+            thumbnail_processor: Arc::new(ThumbnailProcessor::new(50).with_saved_performance()),
         })
         .manage(AiWorkerState {
             client: Mutex::new(None),
@@ -28,6 +28,11 @@ fn main() {
             pipeline_running: AtomicBool::new(false),
         })
         .setup(|app| {
+            if let Some(project) = app.state::<AppState>().project.lock().unwrap().as_ref() {
+                if let Err(error) = project::allow_project_assets(app.handle(), project) {
+                    eprintln!("Could not restore photo directory access: {error}");
+                }
+            }
             let handle = app.handle().clone();
             app.listen("tauri://close-requested", move |_event| {
                 if let Some(state) = handle.try_state::<AiWorkerState>() {
@@ -55,6 +60,8 @@ fn main() {
             photos::cmd_get_photo_data_url,
             photos::cmd_start_thumbnail_batch,
             photos::cmd_get_thumbnail_processing_status,
+            photos::cmd_get_thumbnail_performance,
+            photos::cmd_set_thumbnail_performance,
             photos::cmd_rebuild_thumbnail_cache,
             photos::cmd_toggle_photo_favorite,
             photos::cmd_update_photo_gps,
@@ -112,14 +119,23 @@ fn main() {
             tags::cmd_delete_manual_tag,
             tags::cmd_set_photo_manual_tags,
             map::cmd_get_photos_with_gps,
+            map::cmd_get_track_photos,
+            map::cmd_list_photo_tracks,
+            map::cmd_save_photo_track,
+            map::cmd_delete_photo_track,
             map::cmd_get_photo_directories,
+            map::cmd_list_offline_maps,
+            map::cmd_import_offline_map,
+            map::cmd_export_offline_map,
             map::cmd_get_map_tile,
+            map::cmd_get_map_tile_status,
             map::cmd_has_map_tile,
             map::cmd_search_map_location,
             ai::cmd_start_ai_worker,
             ai::cmd_run_ai_classification,
             ai::cmd_run_face_detection,
             ai::cmd_worker_health,
+            ai::cmd_get_ai_runtime,
             ai::cmd_get_ai_pipeline_status,
             ai::cmd_auto_ai_pipeline,
             diagnostics::cmd_run_diagnostics,
@@ -142,6 +158,8 @@ fn main() {
             time_tags::cmd_run_device_tagging,
             time_tags::cmd_run_event_tagging,
             smart_albums::cmd_get_smart_albums,
+            smart_albums::cmd_get_group_photos,
+            smart_albums::cmd_create_person_combination,
             smart_albums::cmd_get_smart_album_photos,
             smart_albums::cmd_regenerate_smart_albums,
             smart_albums::cmd_create_manual_album,
@@ -218,7 +236,7 @@ pub fn shutdown_ai_worker(state: &AiWorkerState) {
         #[cfg(not(unix))]
         {
             // Windows: try taskkill /T /FI for graceful, then /F for force
-            let _ = std::process::Command::new("taskkill")
+            let _ = photofactory::process::background_command("taskkill")
                 .args(["/PID", &pid.to_string()])
                 .output();
             std::thread::sleep(Duration::from_secs(5));

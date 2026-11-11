@@ -1,5 +1,5 @@
 // src-tauri/src/db/connection.rs
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 
 use crate::db::schema::{
@@ -8,16 +8,23 @@ use crate::db::schema::{
 };
 use crate::error::AppResult;
 
+/// Browse a library whose schema has already been initialized on open.
+pub fn open_read_db(db_path: &Path) -> AppResult<Connection> {
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(conn)
+}
+
 pub fn init_db(db_path: &Path) -> AppResult<Connection> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(db_path)?;
     conn.pragma_update(None, "busy_timeout", "5000")?;
-    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
-    conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
-    conn.pragma_update(None, "cache_size", "-50000").unwrap();
-    conn.pragma_update(None, "temp_store", "MEMORY").unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "cache_size", "-50000")?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.execute_batch(CREATE_TABLES)?;
     // Migration: add is_favorite column to existing databases
     conn.execute(
@@ -197,6 +204,29 @@ pub fn init_db(db_path: &Path) -> AppResult<Connection> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn browsing_reads_committed_data_while_a_writer_is_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.db");
+        let mut writer = init_db(&path).unwrap();
+        let tx = writer.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO photos(path,filename,file_size,file_mtime,imported_at) VALUES('/new.jpg','new.jpg',1,1,1)",
+            [],
+        ).unwrap();
+        let reader = open_read_db(&path).unwrap();
+        let photo_count = || {
+            reader
+                .query_row("SELECT COUNT(*) FROM photos", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(photo_count(), 0);
+        tx.commit().unwrap();
+        assert_eq!(photo_count(), 1);
+    }
 
     #[test]
     fn test_init_db_creates_tables() {

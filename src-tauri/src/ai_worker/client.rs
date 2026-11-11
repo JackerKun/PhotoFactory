@@ -53,6 +53,18 @@ impl AiWorkerClient {
         }
     }
 
+    pub async fn runtime_info(&self) -> AppResult<serde_json::Value> {
+        Ok(self
+            .client
+            .get(format!("{}/runtime", self.base_url))
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
     pub async fn classify(&self, paths: Vec<String>, model: String) -> AppResult<ClassifyResponse> {
         let req = ClassifyRequest { paths, model };
         let resp = self
@@ -70,10 +82,12 @@ impl AiWorkerClient {
         &self,
         paths: Vec<String>,
         cache_dir: &str,
+        previews: std::collections::HashMap<String, String>,
     ) -> AppResult<DetectFacesResponse> {
         let req = DetectFacesRequest {
             paths,
             cache_dir: cache_dir.to_string(),
+            previews,
         };
         let resp = self
             .long_client

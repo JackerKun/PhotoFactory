@@ -36,12 +36,16 @@ export async function invoke(cmd:string,a:any={}) : Promise<any> {
  case 'cmd_get_cluster_page':return {items:a.tab==='named'?clusters:[],total:a.tab==='named'?2:0,named_count:2,unnamed_count:0,review_count:0};
  case 'cmd_get_face_detection_count':return 12;
  case 'cmd_get_face_ai_version_status':return {upgrade_available:false};
+ case 'cmd_get_thumbnail_performance':return 'balanced';
+ case 'cmd_set_thumbnail_performance':return null;
  case 'cmd_worker_health':return false;
  case 'cmd_get_person_detail':return {person_id:id,user_name:`示例人物 ${id===2?'B':'A'}`,face_count:6,confidence:'high',first_seen:'2025-01-01',last_seen:'2025-06-20',cover_photo_id:id};
  case 'cmd_get_person_timeline':case 'cmd_get_person_scene_tags':return [];
  case 'cmd_get_smart_albums':return albums;
  case 'cmd_get_photos_with_gps':return photos.filter(p=>p.latitude!=null);
  case 'cmd_search_map_location':return [{lat:31.234,lng:121.475,display_name:'上海市 · 演示定位（模拟接口）'}];
+ case 'cmd_list_offline_maps':return [];
+ case 'cmd_get_map_tile_status':return {url:`https://tile.openstreetmap.org/${a.z}/${a.x}/${a.y}.png`,source:'cache'};
  case 'cmd_get_map_tile':return `https://tile.openstreetmap.org/${a.z}/${a.x}/${a.y}.png`;
  case 'cmd_get_library_jobs':return [];
  case 'cmd_get_duplicate_groups':case 'cmd_get_raw_jpeg_stacks':case 'cmd_get_trashed_photos':case 'cmd_get_ignored_faces':return page([]);

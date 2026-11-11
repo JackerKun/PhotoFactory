@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::process::Command;
 
 /// Write GPS coordinates to a photo file's EXIF using exiftool.
 /// Returns an error string if exiftool fails.
@@ -19,7 +18,7 @@ pub fn write_gps_exif(
         let lat_abs = lat.abs();
         let lng_abs = lng.abs();
 
-        Command::new("exiftool")
+        crate::process::background_command("exiftool")
             .args([
                 "-overwrite_original",
                 &format!("-GPSLatitude={:.8}", lat_abs),
@@ -32,7 +31,7 @@ pub fn write_gps_exif(
             .map_err(|e| format!("Failed to run exiftool: {}", e))?
     } else {
         // Clear GPS data
-        Command::new("exiftool")
+        crate::process::background_command("exiftool")
             .args([
                 "-overwrite_original",
                 "-GPSLatitude=",
@@ -106,7 +105,7 @@ mod tests {
         let result = write_gps_exif(path.to_str().unwrap(), Some(39.9042), Some(116.4074));
         assert!(result.is_ok());
 
-        let verify = Command::new("exiftool")
+        let verify = crate::process::background_command("exiftool")
             .args([
                 "-c",
                 "%.6f",
@@ -132,7 +131,7 @@ mod tests {
         let path = dir.join("test2.jpg");
         minimal_jpeg(&path);
         // First add GPS data
-        Command::new("exiftool")
+        crate::process::background_command("exiftool")
             .args([
                 "-GPSLatitude=39.9",
                 "-GPSLongitude=116.4",
@@ -144,7 +143,7 @@ mod tests {
         let result = write_gps_exif(path.to_str().unwrap(), None, None);
         assert!(result.is_ok());
 
-        let verify = Command::new("exiftool")
+        let verify = crate::process::background_command("exiftool")
             .args(["-GPSLatitude", "-s", path.to_str().unwrap()])
             .output()
             .unwrap();

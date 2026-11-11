@@ -14,7 +14,7 @@ export default React.memo(function StarRating({ value, onChange, size = "md", di
   return (
     <div className="inline-flex items-center gap-0.5" aria-label={`${value} 星`} onMouseLeave={() => setHovered(null)}>
       {showClear && onChange && (
-        <button type="button" disabled={disabled} onClick={() => onChange(0)} className="mr-1 text-[11px] text-text-muted hover:text-text-primary disabled:opacity-40" title="清除星级">0</button>
+        <button type="button" disabled={disabled} onClick={() => onChange(0)} className="mr-1 text-xs text-text-muted hover:text-text-primary disabled:opacity-40" title="清除星级">0</button>
       )}
       {[1, 2, 3, 4, 5].map((star) => (
         <button
@@ -25,7 +25,7 @@ export default React.memo(function StarRating({ value, onChange, size = "md", di
           onFocus={() => onChange && setHovered(star)}
           onBlur={() => setHovered(null)}
           onClick={() => onChange?.(star)}
-          className={`${size === "sm" ? "text-sm" : "text-xl"} leading-none transition-colors disabled:cursor-default ${star <= active ? "text-yellow-400" : "text-text-muted/30"}`}
+          className={`${size === "sm" ? "text-sm" : "text-xl"} min-h-7 min-w-5 leading-none transition-colors disabled:cursor-default ${star <= active ? "text-yellow-400" : "text-text-muted/65"}`}
           aria-label={`设为 ${star} 星`}
         >★</button>
       ))}

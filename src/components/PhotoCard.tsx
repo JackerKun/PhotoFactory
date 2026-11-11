@@ -2,7 +2,10 @@ import React, { useEffect, useState, useCallback, useRef } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { Photo } from "../types";
 import * as api from "../api/tauri";
+import Icon from "./Icon";
+import { imageErrorMessage } from "../utils/imageError";
 import ContextMenu from "./ContextMenu";
+import { useStore } from "../hooks/usePhotos";
 
 interface Props {
   photo: Photo;
@@ -18,6 +21,10 @@ interface Props {
 }
 
 export default React.memo(function PhotoCard({ photo, onClick, onDoubleClick, size, height, shape = "square", isSelected = false, ratingSelectionMode = false, ratingSelected = false, onToggleRatingSelection }: Props) {
+  const thumbnailProgress = useStore((state) => state.thumbnailProcessingStatus?.processed ?? 0);
+  const [thumbnailRetry, setThumbnailRetry] = useState(0);
+  const [imageError, setImageError] = useState("图片加载失败");
+  const [imageReady, setImageReady] = useState(false);
   const [smallUrl, setSmallUrl] = useState<string | null>(null);
   const [mediumUrl, setMediumUrl] = useState<string | null>(null);
   const [thumbState, setThumbState] = useState<"placeholder" | "loading" | "loaded" | "upgrading" | "error">("placeholder");
@@ -40,38 +47,60 @@ export default React.memo(function PhotoCard({ photo, onClick, onDoubleClick, si
     };
   }, []);
 
+  // A failed visible card must recover when the background batch creates its cache.
+  useEffect(() => {
+    if (thumbStateRef.current === "error") setThumbnailRetry((value) => value + 1);
+  }, [thumbnailProgress]);
+
   useEffect(() => {
     if (!photo.id) return;
     const node = ref.current;
     if (!node) return;
     cancelledRef.current = false;
+    let cancelled = false;
+    let started = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    setSmallUrl(null);
+    setMediumUrl(null);
+    setImageReady(false);
+    setThumbState("placeholder");
 
+    const load = async (attempt = 0) => {
+      setThumbState("loading");
+      try {
+        const path = await api.getThumbnailPath(photo.id!, "small");
+        if (!cancelled) {
+          setSmallUrl(convertFileSrc(path));
+          setThumbState("loaded");
+        }
+      } catch (error) {
+        if (cancelled) return;
+        setImageError(imageErrorMessage(error));
+        // Fast scrolling can exhaust the native decoder slots temporarily.
+        if (String(error).includes("Too many concurrent") && attempt < 8) {
+          retryTimer = setTimeout(() => { void load(attempt + 1); }, Math.min(250 * 2 ** attempt, 2000));
+        } else {
+          setThumbState("error");
+        }
+      }
+    };
     const observer = new IntersectionObserver(
       (entries) => {
-        for (const entry of entries) {
-          if (entry.isIntersecting && thumbStateRef.current === "placeholder") {
-            observer.unobserve(entry.target);
-            setThumbState("loading");
-            api.getThumbnailPath(photo.id!, "small").then((path) => {
-              if (!cancelledRef.current) {
-                setSmallUrl(convertFileSrc(path));
-                setThumbState("loaded");
-              }
-            }).catch(() => {
-              // No base64 fallback — if thumbnail doesn't exist, the batch
-              // processor will generate it. Stop retrying until this card remounts.
-              if (!cancelledRef.current) setThumbState("error");
-            });
-            return;
-          }
+        if (!started && entries.some((entry) => entry.isIntersecting)) {
+          started = true;
+          observer.disconnect();
+          void load();
         }
       },
       { rootMargin: "200px" },
     );
-
     observer.observe(node);
-    return () => { observer.disconnect(); };
-  }, [photo.id, photo.path]);
+    return () => {
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      observer.disconnect();
+    };
+  }, [photo.id, photo.path, photo.thumbnail_status, thumbnailRetry]);
 
   const handleMouseEnter = useCallback(() => {
     if (!mediumUrl && thumbStateRef.current === "loaded") {
@@ -171,22 +200,28 @@ export default React.memo(function PhotoCard({ photo, onClick, onDoubleClick, si
           }`}
           loading="lazy"
           decoding="async"
+          onLoad={() => setImageReady(true)}
           onError={() => {
             // Thumbnail file not found (e.g. cache deleted) — clear URL, show placeholder
             setSmallUrl(null);
             setMediumUrl(null);
+            setImageError("缩略图加载失败");
             setThumbState("error");
           }}
         />
       ) : thumbState === "error" ? (
-        <div className="w-full h-full flex items-center justify-center text-text-muted/60 text-2xl" aria-label="Thumbnail unavailable">
-          ◇
+        <div className="flex h-full w-full flex-col items-center justify-center gap-2 p-2 text-center text-xs text-text-secondary" role="status">
+          <Icon name="photos" size={24} />
+          <span>{imageError}</span>
+          <button type="button" className="ui-button" onDoubleClick={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); setThumbnailRetry((value) => value + 1); }}><Icon name="retry" size={14} />重试</button>
         </div>
       ) : (
-        <div className="w-full h-full flex items-center justify-center">
+        <div className="flex h-full w-full flex-col items-center justify-center gap-2 text-xs text-text-secondary" role="status">
           <div className="h-6 w-6 animate-spin rounded-full border-2 border-accent-primary/25 border-t-accent-primary" />
+          <span>{photo.thumbnail_status === 0 ? "正在生成缩略图…" : "正在加载图片…"}</span>
         </div>
       )}
+      {displayUrl && !imageReady && <span className="absolute left-2 top-2 rounded bg-black/60 px-2 py-1 text-xs text-white" role="status">正在加载图片…</span>}
       {ratingSelectionMode && (
         <div className={`absolute left-1 top-1 flex h-5 w-5 items-center justify-center rounded-full border-2 text-xs shadow ${ratingSelected ? "border-yellow-400 bg-yellow-400 text-black" : "border-white bg-black/35 text-transparent"}`}>✓</div>
       )}
@@ -196,12 +231,12 @@ export default React.memo(function PhotoCard({ photo, onClick, onDoubleClick, si
         </div>
       )}
       {photo.rating > 0 && (
-        <div className="absolute bottom-5 left-1 rounded bg-black/55 px-1 text-[10px] text-yellow-300" title={`${photo.rating} 星`}>
+        <div className="absolute bottom-5 left-1 rounded bg-black/55 px-1 text-xs text-yellow-300" title={`${photo.rating} 星`}>
           ★ {photo.rating}
         </div>
       )}
       <div className="absolute bottom-0 left-0 right-0 bg-black/60 px-1 py-0.5">
-        <p className="text-white text-[10px] truncate">{photo.filename}</p>
+        <p className="text-white text-xs truncate">{photo.filename}</p>
       </div>
 
       {menuPos && (
@@ -209,7 +244,7 @@ export default React.memo(function PhotoCard({ photo, onClick, onDoubleClick, si
           x={menuPos.x}
           y={menuPos.y}
           items={[
-            { label: "Open in File Manager", action: handleReveal },
+            { label: "在文件管理器中显示", action: handleReveal },
             {
               label: photo.is_favorite ? "Remove from Favorites" : "Add to Favorites",
               action: handleToggleFavorite,

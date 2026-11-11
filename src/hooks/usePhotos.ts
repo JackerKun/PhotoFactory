@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { AiProcessingStatus, Photo, PhotoCursor, PhotoFilter, Project, ThumbnailProcessingStatus } from "../types";
 import * as api from "../api/tauri";
+import { readPhotoData } from "../utils/photoRequests";
 
 interface AppState {
   project: Project | null;
@@ -11,6 +12,7 @@ interface AppState {
   cursor: PhotoCursor | null;
   filter: PhotoFilter;
   loading: boolean;
+  photoLoadError: { message: string; page: "first" | "next" } | null;
   thumbnailShape: "square" | "proportional";
   thumbnailSize: number;
   photoRoute: string;
@@ -32,14 +34,13 @@ interface AppState {
   requestMapFocus: (lat: number, lng: number, photoId: number) => void;
   clearMapFocusRequest: () => void;
   aiProcessingStatus: AiProcessingStatus | null;
-  aiPipelineComplete: boolean;
   thumbnailProcessingStatus: ThumbnailProcessingStatus | null;
   setThumbnailProcessingStatus: (status: ThumbnailProcessingStatus | null) => void;
   preloadQueue: number[];
   queuePreload: (photoIds: number[]) => void;
   clearPreloadQueue: () => void;
   _photoRequestGeneration: number;
-  setFilter: (filter: Partial<PhotoFilter>) => void;
+  setFilter: (filter: Partial<PhotoFilter>, replace?: boolean) => void;
   clearPhotoFilters: () => void;
   setThumbnailShape: (shape: "square" | "proportional") => void;
   setThumbnailSize: (size: number) => void;
@@ -48,7 +49,6 @@ interface AppState {
   setLightboxPhotoId: (id: number | null) => void;
   setSelectedPhotoId: (id: number | null) => void;
   setAiProcessingStatus: (status: AiProcessingStatus | null) => void;
-  setAiPipelineComplete: (flag: boolean) => void;
   updatePhotoInList: (photoId: number, updates: Partial<Photo>) => void;
   updatePhotosInList: (photoIds: number[], updates: Partial<Photo>) => void;
   loadPhotos: () => Promise<void>;
@@ -58,13 +58,21 @@ interface AppState {
 
 export const useStore = create<AppState>((set, get) => ({
   project: null,
-  setProject: (p) => set({ project: p }),
+  setProject: (p) => set((state) => {
+    if (p?.root_path === state.project?.root_path) return { project: p };
+    return {
+      project: p, photos: [], totalPhotos: 0, cursor: null, hasNext: false,
+      loading: false, photoLoadError: null,
+      _photoRequestGeneration: state._photoRequestGeneration + 1,
+    };
+  }),
   photos: [],
   totalPhotos: 0,
   hasNext: false,
   cursor: null,
   filter: {},
   loading: false,
+  photoLoadError: null,
   thumbnailShape: "square",
   thumbnailSize: 200,
   photoRoute: "/",
@@ -92,12 +100,11 @@ export const useStore = create<AppState>((set, get) => ({
   }),
   clearMapFocusRequest: () => set({ mapFocusRequest: null }),
   aiProcessingStatus: null,
-  aiPipelineComplete: false,
   thumbnailProcessingStatus: null,
   preloadQueue: [],
   _photoRequestGeneration: 0,
-  setFilter: (partial) => set((state) => {
-    const nextFilter = { ...state.filter, ...partial };
+  setFilter: (partial, replace = false) => set((state) => {
+    const nextFilter = replace ? { ...partial } : { ...state.filter, ...partial };
     if (JSON.stringify(nextFilter) === JSON.stringify(state.filter)) return state;
     return {
       filter: nextFilter,
@@ -106,6 +113,7 @@ export const useStore = create<AppState>((set, get) => ({
       cursor: null,
       hasNext: false,
       loading: false,
+      photoLoadError: null,
       preloadQueue: [],
       ratingSelection: [],
       photoGridScrollOffsets: { square: 0, proportional: 0 },
@@ -144,7 +152,6 @@ export const useStore = create<AppState>((set, get) => ({
   setLightboxPhotoId: (id) => set({ lightboxPhotoId: id }),
   setSelectedPhotoId: (id) => set({ selectedPhotoId: id }),
   setAiProcessingStatus: (status) => set({ aiProcessingStatus: status }),
-  setAiPipelineComplete: (flag) => set({ aiPipelineComplete: flag }),
   setThumbnailProcessingStatus: (status) => set({ thumbnailProcessingStatus: status }),
   queuePreload: (photoIds: number[]) => {
     const { preloadQueue } = get();
@@ -154,6 +161,7 @@ export const useStore = create<AppState>((set, get) => ({
       set({ preloadQueue: [...preloadQueue, ...newIds] });
       newIds.forEach((id) => {
         api.getThumbnailPath(id, "small")
+          .catch(() => {})
           .finally(() => {
             const { preloadQueue: currentQueue } = get();
             set({ preloadQueue: currentQueue.filter((q) => q !== id) });
@@ -174,16 +182,10 @@ export const useStore = create<AppState>((set, get) => ({
     const filter = { ...get().filter };
     // A refresh always starts at the first page. Reusing the previous cursor
     // here made "All Photos" silently replace page one with a later page.
-    set({
-      loading: true,
-      photos: [],
-      totalPhotos: 0,
-      cursor: null,
-      hasNext: false,
-      _photoRequestGeneration: generation,
-    });
+    set({ loading: true, photoLoadError: null, _photoRequestGeneration: generation });
+    const isCurrent = () => get()._photoRequestGeneration === generation;
     try {
-      const page = await api.getPhotos(null, 200, filter);
+      const page = await readPhotoData(() => api.getPhotos(null, 200, filter), isCurrent);
       if (get()._photoRequestGeneration !== generation) return;
       set({
         photos: page.photos,
@@ -194,7 +196,7 @@ export const useStore = create<AppState>((set, get) => ({
       });
     } catch (error) {
       console.error("Failed to load photos:", error);
-      if (get()._photoRequestGeneration === generation) set({ loading: false });
+      if (isCurrent()) set({ loading: false, photoLoadError: { message: String(error), page: "first" } });
     }
   },
   loadMore: async () => {
@@ -204,9 +206,10 @@ export const useStore = create<AppState>((set, get) => ({
     const generation = state._photoRequestGeneration;
     const cursor = state.cursor;
     const filter = { ...state.filter };
-    set({ loading: true });
+    const isCurrent = () => get()._photoRequestGeneration === generation;
+    set({ loading: true, photoLoadError: null });
     try {
-      const page = await api.getPhotos(cursor, 200, filter);
+      const page = await readPhotoData(() => api.getPhotos(cursor, 200, filter), isCurrent);
       if (get()._photoRequestGeneration !== generation) return;
       set((current) => {
         const knownIds = new Set(current.photos.map((photo) => photo.id));
@@ -221,7 +224,7 @@ export const useStore = create<AppState>((set, get) => ({
       });
     } catch (error) {
       console.error("Failed to load more photos:", error);
-      if (get()._photoRequestGeneration === generation) set({ loading: false });
+      if (isCurrent()) set({ loading: false, photoLoadError: { message: String(error), page: "next" } });
     }
   },
   reset: () => {
@@ -233,9 +236,10 @@ export const useStore = create<AppState>((set, get) => ({
       showGpsBatchEditor: false, batchEditorPhotoId: 0, batchGpsPending: new Map(),
       mapFocusRequest: null,
       photoRoute: "/", photoGridScrollOffsets: { square: 0, proportional: 0 },
-      aiProcessingStatus: null, aiPipelineComplete: false,
+      aiProcessingStatus: null,
       _photoRequestGeneration: state._photoRequestGeneration + 1,
       loading: false,
+      photoLoadError: null,
       preloadQueue: [],
     });
   },

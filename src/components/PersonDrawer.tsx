@@ -68,8 +68,8 @@ export default function PersonDrawer({ personId, onClose, onSelectPhoto: _onSele
                 className="flex-1 rounded border px-2 py-1 text-sm bg-surface-primary text-text-primary"
                 autoFocus
               />
-              <button onClick={handleSaveName} className="text-accent-primary text-sm">Save</button>
-              <button onClick={() => setEditing(false)} className="text-text-muted text-sm">Cancel</button>
+              <button onClick={handleSaveName} className="text-accent-link text-sm">保存</button>
+              <button onClick={() => setEditing(false)} className="text-text-muted text-sm">取消</button>
             </div>
           ) : (
             <>
@@ -104,7 +104,7 @@ export default function PersonDrawer({ personId, onClose, onSelectPhoto: _onSele
                       className="w-full bg-accent-primary rounded-t"
                       style={{ height: `${Math.max(4, (count / maxCount) * 64)}px` }}
                     />
-                    <span className="text-[9px] text-text-muted mt-1">
+                    <span className="text-xs text-text-muted mt-1">
                       {month.slice(2)} {/* Show YY-MM */}
                     </span>
                   </div>
@@ -130,7 +130,7 @@ export default function PersonDrawer({ personId, onClose, onSelectPhoto: _onSele
             </div>
           )}
 
-          {/* View All Photos */}
+          {/* View 全部照片 */}
           <button
             onClick={handleViewAllPhotos}
             className="w-full rounded bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90"

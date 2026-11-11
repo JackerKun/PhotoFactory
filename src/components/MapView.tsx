@@ -10,15 +10,19 @@ import L from "leaflet";
 import CachedTileLayer from "./CachedTileLayer";
 import MapLayerToggle from "./MapLayerToggle";
 import MapSearch from "./MapSearch";
-import type { MapLayerStyle } from "../api/tauri";
+import OfflineMapPanel from "./OfflineMapPanel";
+import PhotoTrackPanel from "./PhotoTrackPanel";
+import Icon from "./Icon";
+import type { OfflineMapPackage } from "../api/tauri";
 import type { MapSearchResult } from "../api/tauri";
 import { useStore } from "../hooks/usePhotos";
+import { useOfflineMapPackages, useOfflineMapStore } from "../hooks/useOfflineMaps";
 import { mapPinIcon } from "./mapPin";
+import { buildSpiderOffsets, photoThumbnailIcon } from "../utils/mapSpider";
 
 const thumbnailCache = new Map<number, string>();
 const MAX_MARKER_THUMBNAILS = 256;
 const SPIDER_PAGE_SIZE = 20;
-const SPIDER_THUMBNAIL_SIZE = 52;
 
 function rememberThumbnail(photoId: number, url: string) {
   if (thumbnailCache.has(photoId)) thumbnailCache.delete(photoId);
@@ -30,13 +34,27 @@ function rememberThumbnail(photoId: number, url: string) {
   }
 }
 
-let savedMapView = {
-  center: [20, 0] as [number, number],
-  zoom: 2,
-  bounds: null as { sw: [number, number]; ne: [number, number] } | null,
-  photos: [] as Photo[],
-};
-let savedMapLayer: MapLayerStyle = "standard";
+type Viewport = { center: L.LatLngTuple; zoom: number };
+const WORLD_VIEW: Viewport = { center: [20, 0], zoom: 2 };
+const VIEWPORT_KEY = "photofactory.mapViewport";
+let sessionViewport = WORLD_VIEW;
+
+function readViewport(): Viewport {
+  try {
+    const value = localStorage.getItem(VIEWPORT_KEY);
+    if (!value) return sessionViewport;
+    const saved: Partial<Viewport> | null = JSON.parse(value);
+    const { center, zoom } = saved ?? {};
+    if (Array.isArray(center) && center.length === 2 && center.every(Number.isFinite) &&
+        Math.abs(center[0]) <= 90 && Math.abs(center[1]) <= 180 &&
+        typeof zoom === "number" && zoom >= 0 && zoom <= 19) {
+      return { center, zoom };
+    }
+  } catch {
+    return sessionViewport;
+  }
+  return WORLD_VIEW;
+}
 
 interface Props {
   onSelectPhoto: (id: number) => void;
@@ -44,34 +62,33 @@ interface Props {
   photoDetailsOpen?: boolean;
 }
 
-function MapStateRestore({ onBoundsChange }: { onBoundsChange: (bounds: L.LatLngBounds) => void }) {
-  const map = useMap();
-  useMapEvents({
-    moveend: (e) => {
-      const b = e.target.getBounds();
-      const c = e.target.getCenter();
-      const z = e.target.getZoom();
-      const sw = b.getSouthWest();
-      const ne = b.getNorthEast();
-      savedMapView.center = [c.lat, c.lng];
-      savedMapView.zoom = z;
-      savedMapView.bounds = { sw: [sw.lat, sw.lng], ne: [ne.lat, ne.lng] };
-      onBoundsChange(b);
+function MapViewport({ onBoundsChange }: { onBoundsChange: (bounds: L.LatLngBounds) => void }) {
+  const map = useMapEvents({
+    moveend: () => {
+      const { lat, lng } = map.wrapLatLng(map.getCenter());
+      sessionViewport = { center: [lat, lng], zoom: map.getZoom() };
+      try { localStorage.setItem(VIEWPORT_KEY, JSON.stringify(sessionViewport)); }
+      catch { /* Keep the session position when storage is unavailable. */ }
+      onBoundsChange(map.getBounds());
     },
   });
 
   useEffect(() => {
-    if (savedMapView.photos.length > 0 && savedMapView.bounds) {
-      const { sw, ne } = savedMapView.bounds;
-      onBoundsChange(L.latLngBounds([sw[0], sw[1]], [ne[0], ne[1]]));
-    } else {
-      // Leaflet does not emit moveend merely because the map was mounted. Query
-      // the initial viewport explicitly so a freshly opened project is not blank.
-      onBoundsChange(map.getBounds());
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    // Leaflet doesn't emit moveend on mount. Load photos in the initial view.
+    onBoundsChange(map.getBounds());
+  }, [map, onBoundsChange]);
 
+  return null;
+}
+
+function OfflinePackageFocus({ target }: { target: OfflineMapPackage | null }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!target?.bounds) return;
+    const [west, south, east, north] = target.bounds;
+    map.fitBounds([[south, west], [north, east]], { maxZoom: target.max_zoom, padding: [16, 16], animate: false });
+    if (map.getZoom() < target.min_zoom) map.setZoom(target.min_zoom, { animate: false });
+  }, [map, target]);
   return null;
 }
 
@@ -116,35 +133,6 @@ function clusterIconHtml(count: number): string {
   return `<div style="background:${color};border:2px solid white;border-radius:50%;width:40px;height:40px;display:flex;align-items:center;justify-content:center;color:white;font-weight:700;font-size:14px;box-shadow:0 2px 6px rgba(0,0,0,0.3)">${count}</div>`;
 }
 
-export function buildSpiderOffsets(count: number): Array<[number, number]> {
-  if (count <= 0) return [];
-
-  const offsets: Array<[number, number]> = [];
-  let remaining = count;
-  let ring = 0;
-  while (remaining > 0) {
-    const capacity = ring === 0 ? 8 : 12;
-    const items = Math.min(remaining, capacity);
-    const radius = ring === 0 ? 76 : 132 + (ring - 1) * 62;
-    const phase = ring % 2 === 0 ? -Math.PI / 2 : -Math.PI / 2 + Math.PI / items;
-    for (let index = 0; index < items; index += 1) {
-      const angle = phase + (index * Math.PI * 2) / items;
-      offsets.push([Math.cos(angle) * radius, Math.sin(angle) * radius]);
-    }
-    remaining -= items;
-    ring += 1;
-  }
-  return offsets;
-}
-
-function escapeHtmlAttribute(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
 function PhotoMarker({ photo, onSelectPhoto, onOpenLightbox, map, thumbnailMarker, photoDetailsOpen }: {
   photo: Photo;
   onSelectPhoto: (id: number) => void;
@@ -168,19 +156,10 @@ function PhotoMarker({ photo, onSelectPhoto, onOpenLightbox, map, thumbnailMarke
     }).catch(console.error);
   }, [needsThumbnail, photoId, thumbUrl]);
 
-  const thumbnailIcon = useMemo(() => {
-    if (!thumbnailMarker) return undefined;
-    const content = thumbUrl
-      ? `<img src="${escapeHtmlAttribute(thumbUrl)}" alt="" draggable="false" style="width:100%;height:100%;object-fit:cover;border-radius:11px;display:block" />`
-      : '<div style="width:100%;height:100%;border-radius:11px;background:#e5e7eb;display:flex;align-items:center;justify-content:center;color:#9ca3af;font-size:10px">...</div>';
-    return L.divIcon({
-      className: "",
-      html: `<div style="width:${SPIDER_THUMBNAIL_SIZE}px;height:${SPIDER_THUMBNAIL_SIZE}px;padding:3px;background:white;border-radius:14px;box-shadow:0 5px 16px rgba(15,23,42,.28);border:1px solid rgba(255,255,255,.85)">${content}</div>`,
-      iconSize: [SPIDER_THUMBNAIL_SIZE, SPIDER_THUMBNAIL_SIZE],
-      iconAnchor: [SPIDER_THUMBNAIL_SIZE / 2, SPIDER_THUMBNAIL_SIZE / 2],
-      popupAnchor: [0, -SPIDER_THUMBNAIL_SIZE / 2],
-    });
-  }, [thumbUrl, thumbnailMarker]);
+  const thumbnailIcon = useMemo(
+    () => thumbnailMarker ? photoThumbnailIcon(thumbUrl) : undefined,
+    [thumbUrl, thumbnailMarker],
+  );
 
   const stopPopupEvent = (event: React.MouseEvent<HTMLButtonElement>) => {
     event.preventDefault();
@@ -225,12 +204,12 @@ function PhotoMarker({ photo, onSelectPhoto, onOpenLightbox, map, thumbnailMarke
               <img src={thumbUrl} alt={photo.filename} className="w-full h-24 object-cover rounded" />
             </button>
           ) : (
-            <div className="w-full h-24 bg-gray-800 rounded mb-1 flex items-center justify-center text-gray-500 text-xs">Loading...</div>
+            <div className="w-full h-24 bg-gray-800 rounded mb-1 flex items-center justify-center text-gray-500 text-xs">正在加载…</div>
           )}
           <p className="font-medium text-xs truncate">{photo.filename}</p>
           <div className="flex gap-2 mt-2 justify-center">
             <button
-              className="h-8 w-8 rounded-full bg-gray-100 hover:bg-blue-100 text-blue-600 inline-flex items-center justify-center transition-colors"
+              className="h-8 w-8 rounded-full bg-gray-100 hover:bg-blue-100 text-blue-600 dark:text-blue-300 inline-flex items-center justify-center transition-colors"
               title="查看详情"
               aria-label="查看详情"
               onClick={(event) => { stopPopupEvent(event); map.closePopup(); onSelectPhoto(photo.id!); }}
@@ -239,7 +218,7 @@ function PhotoMarker({ photo, onSelectPhoto, onOpenLightbox, map, thumbnailMarke
             </button>
             {onOpenLightbox && (
               <button
-                className="h-8 w-8 rounded-full bg-gray-100 hover:bg-blue-100 text-blue-600 inline-flex items-center justify-center transition-colors"
+                className="h-8 w-8 rounded-full bg-gray-100 hover:bg-blue-100 text-blue-600 dark:text-blue-300 inline-flex items-center justify-center transition-colors"
                 title="大图预览"
                 aria-label="大图预览"
                 onClick={(event) => { stopPopupEvent(event); map.closePopup(); onOpenLightbox(photo.id!); }}
@@ -282,7 +261,7 @@ function ExpandedClusterPager({ expanded, pageCount, onPageChange, onClose }: {
   return (
     <div
       ref={controlRef}
-      className="leaflet-control absolute bottom-6 left-1/2 z-[1000] flex -translate-x-1/2 items-center gap-2 rounded-full border border-white/80 bg-white/95 px-2 py-1.5 text-sm text-gray-700 shadow-xl backdrop-blur"
+      className="leaflet-control absolute bottom-6 left-1/2 z-[1000] flex -translate-x-1/2 items-center gap-2 rounded-full border border-white/80 bg-bg-secondary/95 px-2 py-1.5 text-sm text-gray-700 shadow-xl backdrop-blur"
     >
       <button
         type="button"
@@ -472,22 +451,23 @@ function ClusterLayer({ photos, onSelectPhoto, onOpenLightbox, photoDetailsOpen 
 }
 
 export default React.memo(function MapView({ onSelectPhoto, onOpenLightbox, photoDetailsOpen = false }: Props) {
-  const [mapLayer, setMapLayer] = useState<MapLayerStyle>(() => savedMapLayer);
-  const [photos, setPhotos] = useState<Photo[]>(() => savedMapView.photos);
-  const [bounds, setBounds] = useState<L.LatLngBounds | null>(
-    savedMapView.bounds ? L.latLngBounds(savedMapView.bounds.sw, savedMapView.bounds.ne) : null
-  );
+  const [initialViewport] = useState(readViewport);
+  const mapLayer = useOfflineMapStore((state) => state.layer);
+  const setMapLayer = useOfflineMapStore((state) => state.setLayer);
+  const [photos, setPhotos] = useState<Photo[]>([]);
+  const [bounds, setBounds] = useState<L.LatLngBounds | null>(null);
   const [searchTarget, setSearchTarget] = useState<MapSearchResult | null>(null);
+  const [offlineTarget, setOfflineTarget] = useState<OfflineMapPackage | null>(null);
+  const [trackOpen, setTrackOpen] = useState(false);
+  const projectPath = useStore((state) => state.project?.root_path);
   const mapFocusRequest = useStore((state) => state.mapFocusRequest);
   const clearMapFocusRequest = useStore((state) => state.clearMapFocusRequest);
 
-  useEffect(() => {
-    savedMapView.photos = photos;
-  }, [photos]);
-
-  useEffect(() => {
-    savedMapLayer = mapLayer;
-  }, [mapLayer]);
+  const offlineMaps = useOfflineMapPackages();
+  const viewOfflinePack = useCallback((pack: OfflineMapPackage) => {
+    setMapLayer(pack.layer);
+    setOfflineTarget({ ...pack });
+  }, [setMapLayer]);
 
   useEffect(() => {
     if (!bounds) return;
@@ -509,23 +489,32 @@ export default React.memo(function MapView({ onSelectPhoto, onOpenLightbox, phot
 
   return (
     <div className="relative isolate h-full">
-      <MapContainer center={savedMapView.center} zoom={savedMapView.zoom} className="absolute inset-0 z-0 h-full w-full">
+      <MapContainer center={initialViewport.center} zoom={initialViewport.zoom} className="absolute inset-0 z-0 h-full w-full">
         <CachedTileLayer layer={mapLayer} />
-        <MapStateRestore onBoundsChange={setBounds} />
+        <MapViewport onBoundsChange={setBounds} />
         <RequestedPhotoFocus request={mapFocusRequest} onHandled={clearMapFocusRequest} />
         <SearchTarget target={searchTarget} />
-        <ClusterLayer
+        <OfflinePackageFocus target={offlineTarget} />
+        {trackOpen && projectPath ? <PhotoTrackPanel key={projectPath}
+          onClose={() => setTrackOpen(false)}
+          onViewPhoto={onOpenLightbox ?? onSelectPhoto}
+        /> : <ClusterLayer
           photos={photos}
           onSelectPhoto={onSelectPhoto}
           onOpenLightbox={onOpenLightbox}
           photoDetailsOpen={photoDetailsOpen}
-        />
+        />}
       </MapContainer>
       <MapSearch
-        className="absolute left-1/2 top-3 z-[1200] w-[min(620px,calc(100%-190px))] -translate-x-1/2"
+        className="absolute left-1/2 top-3 z-[1200] w-[min(620px,calc(100%-250px))] -translate-x-1/2"
         onSelect={setSearchTarget}
       />
-      <MapLayerToggle value={mapLayer} onChange={setMapLayer} />
+      <MapLayerToggle value={mapLayer} onChange={setMapLayer}>
+        <OfflineMapPanel maps={offlineMaps} layer={mapLayer} onView={viewOfflinePack} />
+        <button type="button" title="拍摄轨迹" aria-label="拍摄轨迹" aria-expanded={trackOpen} disabled={!projectPath}
+          className={`flex h-8 items-center rounded-md px-2.5 disabled:opacity-50 ${trackOpen ? "bg-accent-primary text-white" : "text-gray-600 hover:bg-text-primary/5"}`}
+          onClick={() => setTrackOpen((open) => !open)}><Icon name="route" size={17} /></button>
+      </MapLayerToggle>
     </div>
   );
 });
