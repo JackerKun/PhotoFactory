@@ -86,9 +86,11 @@ def assemble(root, value):
         shutil.copy2(path, out / path.name)
     (out / 'SHA256SUMS.txt').write_text(''.join(f"{e['sha256']}  {p.name}\n" for p, e in verified))
     (out / 'build-manifest.json').write_text(json.dumps(manifests, indent=2) + '\n')
+    changes = root / 'docs' / 'releases' / f'v{value}.md'
+    notes = changes.read_text(encoding='utf-8').strip() + '\n\n' if changes.is_file() else ''
     (out / 'NOTES.md').write_text(f'''PhotoFactory {value}
 
-| System | Architecture | Installer |
+{notes}| System | Architecture | Installer |
 | --- | --- | --- |
 | macOS | Apple Silicon / ARM64 | macOS_arm64.dmg |
 | macOS | Intel / x64 | macOS_x64.dmg |
@@ -102,7 +104,7 @@ Verify downloads with SHA256SUMS.txt; build-manifest.json records targets and Wo
 macOS builds are ad-hoc signed (not notarized); Windows builds have no publisher certificate.
 OCR and writing GPS to original files still require optional Tesseract / ExifTool.
 See the repository README and docs/BUILDING.md for usage and limitations.
-''')
+''', encoding='utf-8')
 
 
 def main():

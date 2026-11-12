@@ -1,6 +1,6 @@
 // src-tauri/src/commands/ai.rs
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{atomic::AtomicBool, Mutex};
 use std::time::Duration;
@@ -101,6 +101,7 @@ pub struct AiPipelineStatus {
     pub photos_per_second: f64,
     pub eta_seconds: Option<i64>,
     pub last_error: Option<String>,
+    pub updated_at: i64,
 }
 
 #[tauri::command]
@@ -120,6 +121,24 @@ pub async fn cmd_get_task_errors(
         task_error_dao::page(conn, stage.as_deref(), before)
     })
     .await
+}
+
+#[tauri::command]
+pub async fn cmd_clear_task_error_history(
+    project_path: String,
+    through: i64,
+    state: State<'_, AppState>,
+) -> AppResult<usize> {
+    let project = crate::commands::project::current_project(&state)?;
+    if project.root_path != project_path {
+        return Err(AppError::Project("照片库已切换，请重新打开后台任务。".into()));
+    }
+    tokio::task::spawn_blocking(move || {
+        let conn = crate::db::connection::init_db(&project.db_path())?;
+        task_error_dao::clear_history(&conn, through)
+    })
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))?
 }
 
 #[tauri::command]
@@ -251,6 +270,7 @@ fn read_pipeline_status(conn: &rusqlite::Connection) -> AppResult<AiPipelineStat
         stage_started_at,
         stage_base_processed,
         last_error,
+        updated_at,
     ): (
         String,
         String,
@@ -260,10 +280,11 @@ fn read_pipeline_status(conn: &rusqlite::Connection) -> AppResult<AiPipelineStat
         Option<i64>,
         i64,
         Option<String>,
+        i64,
     ) = conn.query_row(
-        "SELECT status,stage,processed,total,failed,stage_started_at,stage_base_processed,last_error FROM ai_pipeline_state WHERE id=1",
+        "SELECT status,stage,processed,total,failed,stage_started_at,stage_base_processed,last_error,updated_at FROM ai_pipeline_state WHERE id=1",
         [],
-        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
     )?;
     let (total, processed, failed) = match stage.as_str() {
         ai_task_dao::FACE_STAGE | ai_task_dao::CLASSIFICATION_STAGE => {
@@ -301,6 +322,7 @@ fn read_pipeline_status(conn: &rusqlite::Connection) -> AppResult<AiPipelineStat
         photos_per_second,
         eta_seconds,
         last_error,
+        updated_at,
     })
 }
 
@@ -368,22 +390,18 @@ pub async fn cmd_start_ai_worker(port: u16, state: State<'_, AiWorkerState>) -> 
         port
     );
 
-    // Capture Python stderr in a background thread so we can see tracebacks
     if let Some(stderr) = child.stderr.take() {
         std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                eprintln!("[AI worker stderr] {}", line);
-            }
+            drain_worker_log(BufReader::new(stderr), |line| {
+                let _ = writeln!(std::io::stderr().lock(), "[AI worker stderr] {line}");
+            });
         });
     }
-    // Also capture stdout for debug prints
     if let Some(stdout) = child.stdout.take() {
         std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                println!("[AI worker stdout] {}", line);
-            }
+            drain_worker_log(BufReader::new(stdout), |line| {
+                let _ = writeln!(std::io::stdout().lock(), "[AI worker stdout] {line}");
+            });
         });
     }
 
@@ -414,6 +432,25 @@ pub async fn cmd_start_ai_worker(port: u16, state: State<'_, AiWorkerState>) -> 
             "AI worker failed to start. Check that Python dependencies are installed and model files exist.".into()
         ))
     }
+}
+
+fn drain_worker_log(mut reader: impl BufRead, mut log: impl FnMut(&str)) {
+    // Windows libraries can write in the system code page. A decoding error
+    // must never close the pipe while the worker still has output to write.
+    let mut bytes = Vec::new();
+    while let Ok(1..) = reader.read_until(b'\n', &mut bytes) {
+        log(String::from_utf8_lossy(&bytes).trim_end_matches(['\r', '\n']));
+        bytes.clear();
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn worker_log_keeps_draining_after_non_utf8_output() {
+    let mut lines = Vec::new();
+    drain_worker_log(&b"\xd6\xd0\xce\xc4\r\nclassification done\n"[..], |line| lines.push(line.to_owned()));
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[1], "classification done");
 }
 
 pub(crate) fn ai_worker_python(ai_worker_dir: &std::path::Path) -> std::path::PathBuf {
@@ -1281,7 +1318,6 @@ async fn finish_ai_tags(
         crate::geo_tagger::GeoTagger::new().tag_photos_with_progress(
             &conn,
             100,
-            true,
             |processed, total| {
                 loop {
                     match ai_task_dao::pipeline_control_status(&conn)?.as_str() {

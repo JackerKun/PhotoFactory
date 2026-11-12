@@ -15,10 +15,11 @@ vi.mock("../api/tauri", () => ({
   controlAiPipeline: vi.fn(async () => {}),
   retryLibraryAnalysis: vi.fn(),
   getTaskErrors: vi.fn(async () => ({
-    groups: [], stages: [], next_before: null, retryable: 0, failed_faces: 1, failed_classifications: 0, ignored_count: 0,
+    groups: [], stages: [], next_before: null, history_through: 0, retryable: 0, failed_faces: 1, failed_classifications: 0, ignored_count: 0,
     platform: "windows", architecture: "x86_64", version: "0.1.4",
   })),
   getTaskErrorPhotos: vi.fn(),
+  clearTaskErrorHistory: vi.fn(),
   getIgnoredTaskPhotos: vi.fn(),
   ignoreTaskErrorPhotos: vi.fn(),
   restoreTaskPhoto: vi.fn(),
@@ -68,14 +69,14 @@ it("groups repeated failures and lets the user inspect, ignore and restore photo
   try {
     vi.mocked(api.getAiPipelineStatus).mockResolvedValueOnce({ status: "running", stage: "face_detection", processed: 655, total: 3560, failed: 1 });
     const key = { stage: "face_detection", reason: "HTTP error", through: 5 };
-    const photo = { photo_id: 42, filename: "DSC001.jpg", path: "D:\\Photos\\DSC001.jpg", attempts: 2 };
+    const photo = { photo_id: 42, filename: "DSC001.jpg", path: "D:\\Photos\\DSC001.jpg", attempts: 2, occurred_at: 1759999999 };
     const details = { photos: [{ ...photo, ignored: false, can_ignore: true }], total: 1, can_ignore: 1, next_after: null };
     const page: api.TaskErrorPage = {
       groups: [{
-        key, occurrences: 5, occurred_at: 1760000000,
+        key, occurrences: 5, first_occurred_at: 1759999998, occurred_at: 1760000000,
         message: "原因：Connection reset by peer (os error 10054)",
       }],
-      stages: ["face_detection"], next_before: null, retryable: 0, failed_faces: 1, failed_classifications: 0, ignored_count: 0,
+      stages: ["face_detection"], next_before: null, history_through: 5, retryable: 0, failed_faces: 1, failed_classifications: 0, ignored_count: 0,
       platform: "windows", architecture: "x86_64", version: "0.1.4",
     };
     vi.mocked(api.getTaskErrors).mockResolvedValueOnce(page)
@@ -97,6 +98,7 @@ it("groups repeated failures and lets the user inspect, ignore and restore photo
     expect(screen.getByRole("button", { name: "重试失败" })).toBeDisabled();
     fireEvent.click(group);
     expect(await screen.findByText(photo.path)).toBeInTheDocument();
+    expect(screen.getByText("最近出错").querySelector("time")).toHaveAttribute("datetime", new Date(photo.occurred_at * 1000).toISOString());
     fireEvent.click(screen.getByRole("button", { name: "复制本页诊断" }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith(expect.stringContaining("Connection reset by peer")));
     expect(writeText).toHaveBeenCalledWith(expect.stringContaining(photo.path));
@@ -111,4 +113,21 @@ it("groups repeated failures and lets the user inspect, ignore and restore photo
     if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
     else Reflect.deleteProperty(navigator, "clipboard");
   }
+});
+
+it("clears the confirmed history snapshot and leaves the failed tasks available", async () => {
+  const emptyPage = await api.getTaskErrors(null, null);
+  vi.mocked(api.getTaskErrors).mockResolvedValueOnce({ ...emptyPage, history_through: 7 });
+  vi.mocked(api.clearTaskErrorHistory).mockResolvedValueOnce(7);
+  useStore.setState({ project: { root_path: "/test" } as Project });
+  render(<TaskCenter />);
+  fireEvent.click(screen.getByRole("button", { name: "后台任务" }));
+  const clear = screen.getByRole("button", { name: "清空错误历史" });
+  await waitFor(() => expect(clear).toBeEnabled());
+  fireEvent.click(clear);
+  expect(api.clearTaskErrorHistory).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "确认清空" }));
+  expect(await screen.findByText("已清空 7 条历史错误记录")).toBeInTheDocument();
+  expect(api.clearTaskErrorHistory).toHaveBeenCalledWith("/test", 7);
+  expect(screen.getByRole("button", { name: "重试失败" })).toBeEnabled();
 });

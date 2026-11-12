@@ -202,7 +202,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   gap: calc(var(--ui-gap) + 4px);
   padding: var(--workspace-inline);
 }
-.task-column { display: grid; min-width: 0; gap: var(--ui-gap); }
+.task-column { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; gap: var(--ui-gap); }
 .task-column-title { display: flex; min-height: var(--ui-control-height); align-items: center; }
 .task-card {
   border: 1px solid rgb(var(--surface-secondary));

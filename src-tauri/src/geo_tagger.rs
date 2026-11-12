@@ -6,6 +6,7 @@
 
 use rusqlite::Connection;
 use std::collections::HashMap;
+use std::error::Error;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,8 +18,7 @@ use crate::models::AiClassification;
 const NOMINATIM_URL: &str = "https://nominatim.openstreetmap.org/reverse";
 
 /// User-Agent required by Nominatim policy.
-const USER_AGENT: &str =
-    "PhotoFactory/0.2.0 (Photo management app; https://github.com/photofactory)";
+const USER_AGENT: &str = concat!("PhotoFactory/", env!("CARGO_PKG_VERSION"), " (https://github.com/JackerKun/PhotoFactory)");
 
 /// Global rate limiter: tracks the time of the last request.
 static LAST_REQUEST: Mutex<Option<Instant>> = Mutex::new(None);
@@ -39,6 +39,7 @@ impl GeoTagger {
         Self {
             client: reqwest::blocking::Client::builder()
                 .user_agent(USER_AGENT)
+                .connect_timeout(Duration::from_secs(5))
                 .timeout(Duration::from_secs(10))
                 .build()
                 .expect("Failed to build HTTP client"),
@@ -98,22 +99,12 @@ impl GeoTagger {
             NOMINATIM_URL, lat, lng
         );
 
-        let resp = self
-            .client
+        let resp = self.client
             .get(&url)
             .send()
-            .map_err(|e| AppError::Internal(format!("Nominatim request failed: {}", e)))?;
-
-        if !resp.status().is_success() {
-            return Err(AppError::Internal(format!(
-                "Nominatim returned status: {}",
-                resp.status()
-            )));
-        }
-
-        let json: serde_json::Value = resp.json().map_err(|e| {
-            AppError::Internal(format!("Failed to parse Nominatim response: {}", e))
-        })?;
+            .and_then(|response| response.error_for_status())
+            .map_err(reqwest::Error::without_url)?;
+        let json: serde_json::Value = resp.json().map_err(reqwest::Error::without_url)?;
 
         let label = parse_nominatim_response(&json);
 
@@ -131,14 +122,13 @@ impl GeoTagger {
     ///
     /// Returns the number of photos successfully tagged.
     pub fn tag_photos(&self, conn: &Connection, batch_size: usize) -> AppResult<usize> {
-        self.tag_photos_with_progress(conn, batch_size, false, |_, _| Ok(true))
+        self.tag_photos_with_progress(conn, batch_size, |_, _| Ok(true))
     }
 
     pub fn tag_photos_with_progress(
         &self,
         conn: &Connection,
         batch_size: usize,
-        fail_fast: bool,
         mut progress: impl FnMut(usize, usize) -> AppResult<bool>,
     ) -> AppResult<usize> {
         let query = "
@@ -166,6 +156,7 @@ impl GeoTagger {
         let total = rows.len();
         let mut tagged = 0;
         let mut consecutive_errors = 0;
+        let mut last_error = None;
         if !progress(0, total)? {
             return Ok(tagged);
         }
@@ -181,32 +172,53 @@ impl GeoTagger {
                         label,
                         confidence: 1.0,
                     };
-                    if insert_classification_with_type(conn, &classification, "geo_location")
-                        .is_ok()
-                    {
-                        tagged += 1;
-                    }
+                    insert_classification_with_type(conn, &classification, "geo_location")?;
+                    tagged += 1;
                 }
-                Err(e) => {
+                Err(error) => {
                     consecutive_errors += 1;
-                    if fail_fast && consecutive_errors >= 2 {
-                        return Err(AppError::Internal(format!(
-                            "地点标签查询连续失败，已结束本次联网查询：{e}"
-                        )));
+                    if consecutive_errors >= 2 || service_refused_request(&error) {
+                        return Err(location_lookup_error("地点标签联网查询已暂停", &error));
                     }
-                    eprintln!(
-                        "GeoTagger: failed to geocode photo {} ({}, {}): {}",
-                        photo_id, lat, lng, e
-                    );
+                    last_error = Some(error);
                 }
             }
             if !progress(index + 1, total)? {
-                break;
+                return Ok(tagged);
             }
         }
 
-        Ok(tagged)
+        match last_error {
+            Some(error) => Err(location_lookup_error("部分地点标签查询失败", &error)),
+            None => Ok(tagged),
+        }
     }
+}
+
+fn service_refused_request(error: &AppError) -> bool {
+    matches!(error, AppError::Http(http) if matches!(http.status(), Some(reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS)))
+}
+
+fn location_lookup_error(prefix: &str, error: &AppError) -> AppError {
+    let AppError::Http(http) = error else {
+        return AppError::LocationLookup(format!("{prefix}\n{error}"));
+    };
+    let reason = if http.is_timeout() {
+        "连接 Nominatim 超时，请检查网络后重试。".into()
+    } else if http.is_connect() {
+        "无法连接 Nominatim，请检查网络、DNS 或代理设置。".into()
+    } else if let Some(status) = http.status() {
+        format!("Nominatim 返回 HTTP {}，请稍后重试。", status.as_u16())
+    } else {
+        "无法读取 Nominatim 的响应，请稍后重试。".into()
+    };
+    let mut message = format!("{prefix}：{reason}");
+    let mut cause = http.source();
+    while let Some(source) = cause {
+        message.push_str(&format!("\n原因：{source}"));
+        cause = source.source();
+    }
+    AppError::LocationLookup(message)
 }
 
 /// Parse a Nominatim JSON response into a human-readable location label.

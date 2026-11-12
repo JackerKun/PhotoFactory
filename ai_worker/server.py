@@ -519,6 +519,11 @@ def _handle_shutdown(signum, frame):
 
 
 def main():
+    # The desktop process reads these pipes as UTF-8. Frozen Python builds
+    # may ignore PYTHONIOENCODING, so set it on the actual streams.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     port = int(os.environ.get("AI_WORKER_PORT", "9876"))
     # Register signal handlers for graceful shutdown
     signal.signal(signal.SIGTERM, _handle_shutdown)

@@ -502,6 +502,7 @@ export interface TaskErrorGroup {
   key: TaskErrorGroupKey;
   message: string;
   occurred_at: number;
+  first_occurred_at: number;
   occurrences: number;
 }
 
@@ -509,6 +510,7 @@ export interface TaskErrorPage {
   groups: TaskErrorGroup[];
   stages: string[];
   next_before: number | null;
+  history_through: number;
   retryable: number;
   failed_faces: number;
   failed_classifications: number;
@@ -524,6 +526,7 @@ export interface TaskErrorGroupPhotos {
     filename: string;
     path: string;
     attempts: number | null;
+    occurred_at: number;
     ignored: boolean;
     can_ignore: boolean;
   }[];
@@ -539,6 +542,10 @@ export interface IgnoredTaskPhotos {
 
 export function getTaskErrors(stage: string | null, before: number | null): Promise<TaskErrorPage> {
   return invoke("cmd_get_task_errors", { stage, before });
+}
+
+export function clearTaskErrorHistory(projectPath: string, through: number): Promise<number> {
+  return invoke("cmd_clear_task_error_history", { projectPath, through });
 }
 
 export function getTaskErrorPhotos(key: TaskErrorGroupKey, after: string | null): Promise<TaskErrorGroupPhotos> {

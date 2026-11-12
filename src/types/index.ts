@@ -185,6 +185,7 @@ export interface AiProcessingStatus {
   photos_per_second?: number;
   eta_seconds?: number | null;
   last_error?: string | null;
+  updated_at?: number;
 }
 
 // Layered thumbnail types

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import {
-  getIgnoredTaskPhotos, getTaskErrorPhotos, getTaskErrors, ignoreTaskErrorPhotos, restoreTaskPhoto,
+  clearTaskErrorHistory, getIgnoredTaskPhotos, getTaskErrorPhotos, getTaskErrors, ignoreTaskErrorPhotos, restoreTaskPhoto,
   type IgnoredTaskPhotos, type TaskErrorGroup, type TaskErrorGroupPhotos, type TaskErrorPage,
 } from "../api/tauri";
 import Icon from "./Icon";
@@ -8,10 +8,17 @@ import Icon from "./Icon";
 export interface CurrentTaskError {
   label: string;
   message: string;
+  occurredAt?: number;
 }
 
 function errorTime(timestamp: number) {
-  return new Date(timestamp * 1000).toLocaleString();
+  return new Date(timestamp * 1000).toLocaleString("zh-CN", {
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  });
+}
+
+function ErrorTimestamp({ timestamp }: { timestamp: number }) {
+  return <time className="tabular-nums" dateTime={new Date(timestamp * 1000).toISOString()}>{errorTime(timestamp)}</time>;
 }
 
 async function copyReport(report: string) {
@@ -60,6 +67,7 @@ export default function TaskErrorPanel({ projectPath, current, stages, runtime }
   const [actionMessage, setActionMessage] = useState("");
   const [actionError, setActionError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [clearThrough, setClearThrough] = useState<number | null>(null);
   const [refresh, setRefresh] = useState(0);
 
   useEffect(() => {
@@ -128,13 +136,13 @@ export default function TaskErrorPanel({ projectPath, current, stages, runtime }
     setDetailError("");
   }
 
-  async function act(operation: () => Promise<number>, success: (count: number) => string) {
+  async function act(operation: () => Promise<number>, success: (count: number) => string, empty = "没有需要更新的照片") {
     setBusy(true);
     setActionError("");
     setActionMessage("");
     try {
       const count = await operation();
-      setActionMessage(count ? success(count) : "没有需要更新的照片");
+      setActionMessage(count ? success(count) : empty);
       if (showIgnored) setIgnoredOffset(0);
       setRefresh((value) => value + 1);
     } catch (error) {
@@ -154,13 +162,25 @@ export default function TaskErrorPanel({ projectPath, current, stages, runtime }
     void act(() => restoreTaskPhoto(projectPath, taskStage, photoId), () => "已取消忽略，可重新处理这张照片");
   }
 
+  function clearHistory() {
+    if (!projectPath || clearThrough == null) return;
+    void act(async () => {
+      const count = await clearTaskErrorHistory(projectPath, clearThrough);
+      setClearThrough(null);
+      changePage(null);
+      return count;
+    }, (count) => `已清空 ${count} 条历史错误记录`, "没有可清空的历史错误记录");
+  }
+
   async function copy() {
-    const report = [platform, runtime, failureCounts, ...current.map(({ label, message }) => `${label}\n${message}`),
+    const report = [platform, runtime, failureCounts, ...current.map(({ label, message, occurredAt }) =>
+      `${occurredAt ? `${errorTime(occurredAt)} · ` : ""}${label}\n${message}`),
       ...groups.map((group) => [
-        `${errorTime(group.occurred_at)} · ${stageLabel(group.key.stage)} · ${group.occurrences} 条记录`,
+        `${stageLabel(group.key.stage)} · ${group.occurrences} 条记录`,
+        `首次 ${errorTime(group.first_occurred_at)} · 最近 ${errorTime(group.occurred_at)}`,
         group.message,
         ...(groupId(group) === selectedGroup ? groupPhotos?.photos ?? [] : []).map((photo) =>
-          `${photo.filename}${photo.attempts == null ? "" : `（第 ${photo.attempts} 次尝试）`}\n${photo.path}`),
+          `${errorTime(photo.occurred_at)} · ${photo.filename}${photo.attempts == null ? "" : `（第 ${photo.attempts} 次尝试）`}\n${photo.path}`),
       ].join("\n")),
     ].filter(Boolean).join("\n\n");
     try {
@@ -176,9 +196,20 @@ export default function TaskErrorPanel({ projectPath, current, stages, runtime }
     <div className="task-card">
       <header className="task-card-padding ui-toolbar min-h-[var(--ui-control-height)] justify-between border-b border-surface-secondary">
         {page && <p className="text-xs text-text-secondary">{platform}</p>}
-        {!showIgnored && <button type="button" className="ui-button" disabled={!current.length && !groups.length} onClick={() => void copy()}>复制本页诊断</button>}
+        {!showIgnored && <div className="ui-toolbar">
+          <button type="button" className="ui-button" disabled={!current.length && !groups.length} onClick={() => void copy()}>复制本页诊断</button>
+          <button type="button" className="ui-button" disabled={busy || !page?.history_through}
+            onClick={() => setClearThrough(page?.history_through ?? null)}>清空错误历史</button>
+        </div>}
       </header>
       <div className="task-card-padding space-y-[var(--ui-gap)]">
+        {clearThrough != null && <div className="space-y-2 rounded-lg border border-surface-secondary bg-surface-primary p-3 text-sm">
+          <p>清空此照片库当前的历史错误记录？失败任务仍可重试。</p>
+          <div className="ui-toolbar">
+            <button type="button" className="ui-button" disabled={busy} onClick={() => setClearThrough(null)}>取消</button>
+            <button type="button" className="ui-button text-red-500" disabled={busy} onClick={clearHistory}>确认清空</button>
+          </div>
+        </div>}
         {page && <p className="rounded-lg bg-surface-primary px-3 py-2 text-xs text-text-secondary">{failureCounts}</p>}
         {current.length > 0 && <details className="group rounded-lg border border-surface-secondary">
           <summary className="ui-button w-full cursor-pointer list-none justify-between border-0">
@@ -186,8 +217,8 @@ export default function TaskErrorPanel({ projectPath, current, stages, runtime }
             <Icon name="chevronUp" size={14} className="rotate-180 group-open:rotate-0" />
           </summary>
           <ul className="max-h-52 space-y-2 overflow-auto border-t border-surface-secondary px-3 py-2 text-xs">
-            {current.map(({ label, message }) => <li key={label}>
-              <p className="font-medium text-text-primary">{label}</p>
+            {current.map(({ label, message, occurredAt }) => <li key={label}>
+              <p className="flex flex-wrap items-baseline gap-x-2 text-text-secondary"><span className="font-medium text-text-primary">{label}</span>{occurredAt ? <ErrorTimestamp timestamp={occurredAt} /> : null}</p>
               <p className="mt-1 whitespace-pre-wrap break-words text-red-500">{message}</p>
             </li>)}
           </ul>
@@ -221,9 +252,10 @@ export default function TaskErrorPanel({ projectPath, current, stages, runtime }
               return <li key={id} className="min-w-0 rounded-xl border border-surface-secondary">
                 <button type="button" aria-expanded={expanded} onClick={() => toggleGroup(group)}
                   className="block w-full rounded-xl px-3 py-2.5 text-left hover:bg-surface-primary">
-                  <span className="flex flex-wrap items-center justify-between gap-x-2 text-sm font-medium">
-                    <span>{expanded ? "▾" : "▸"} {stageLabel(group.key.stage)} · {group.occurrences} 条记录</span>
-                    <time className="text-xs font-normal tabular-nums text-text-secondary" dateTime={new Date(group.occurred_at * 1000).toISOString()}>{errorTime(group.occurred_at)}</time>
+                  <span className="block text-sm font-medium">{expanded ? "▾" : "▸"} {stageLabel(group.key.stage)} · {group.occurrences} 条记录</span>
+                  <span className="mt-1 flex flex-wrap gap-x-3 text-xs text-text-secondary">
+                    {group.first_occurred_at !== group.occurred_at && <span>首次 <ErrorTimestamp timestamp={group.first_occurred_at} /></span>}
+                    <span>最近 <ErrorTimestamp timestamp={group.occurred_at} /></span>
                   </span>
                   <span className="mt-1 block truncate text-xs text-text-secondary" title={group.key.reason}>{group.key.reason}</span>
                 </button>
@@ -241,6 +273,7 @@ export default function TaskErrorPanel({ projectPath, current, stages, runtime }
                       {groupPhotos.photos.map((photo) => <li key={photo.path} className="flex items-center justify-between gap-2 py-2">
                         <div className="min-w-0">
                           <div className="break-words font-medium">{photo.filename}{photo.attempts != null && <span className="ml-2 font-normal text-text-secondary">第 {photo.attempts} 次尝试</span>}</div>
+                          <div className="text-text-secondary">最近出错 <ErrorTimestamp timestamp={photo.occurred_at} /></div>
                           <div className="break-all text-text-secondary">{photo.path}</div>
                         </div>
                         {photo.photo_id != null && photo.ignored && <span className="shrink-0 text-text-secondary">已忽略</span>}

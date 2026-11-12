@@ -127,11 +127,11 @@ export default function TaskCenter() {
   const currentErrors: CurrentTaskError[] = [...pollErrors];
   if (error) currentErrors.push({ label: "操作失败", message: error });
   if (performanceError) currentErrors.push({ label: "缩略图性能设置", message: performanceError });
-  if (ai?.last_error) currentErrors.push({ label: stages[ai.stage ?? "error"] ?? "智能分析", message: ai.last_error });
+  if (ai?.last_error) currentErrors.push({ label: stages[ai.stage ?? "error"] ?? "智能分析", message: ai.last_error, occurredAt: ai.updated_at });
   if (thumbs?.last_error) currentErrors.push({ label: "缩略图生成", message: thumbs.last_error });
   if (runtimeError && (ai?.status === "running" || ai?.status === "error")) currentErrors.push({ label: "AI 服务状态读取失败", message: runtimeError });
   for (const job of jobs) {
-    if (job.error) currentErrors.push({ label: `${job.job_type.includes("ocr") ? "文字识别" : "智能索引"} #${job.id}`, message: job.error });
+    if (job.error) currentErrors.push({ label: `${job.job_type.includes("ocr") ? "文字识别" : "智能索引"} #${job.id}`, message: job.error, occurredAt: job.updated_at });
   }
   const runtimeSummary = runtime ? Object.entries(runtime.models).map(([model, provider]) =>
     `${modelLabels[model] ?? model}：${providerLabels[provider] ?? provider}`).join(" · ") : "";

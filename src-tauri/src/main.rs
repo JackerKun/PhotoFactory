@@ -140,6 +140,7 @@ fn main() {
             ai::cmd_get_ai_runtime,
             ai::cmd_get_ai_pipeline_status,
             ai::cmd_get_task_errors,
+            ai::cmd_clear_task_error_history,
             ai::cmd_get_task_error_photos,
             ai::cmd_get_ignored_task_photos,
             ai::cmd_ignore_task_error_photos,

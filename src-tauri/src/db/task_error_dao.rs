@@ -22,6 +22,7 @@ pub struct TaskErrorGroup {
     pub key: TaskErrorGroupKey,
     pub message: String,
     pub occurrences: i64,
+    pub first_occurred_at: i64,
     pub occurred_at: i64,
 }
 
@@ -30,6 +31,7 @@ pub struct TaskErrorPage {
     pub groups: Vec<TaskErrorGroup>,
     pub stages: Vec<String>,
     pub next_before: Option<i64>,
+    pub history_through: i64,
     pub retryable: i64,
     pub failed_faces: i64,
     pub failed_classifications: i64,
@@ -45,6 +47,7 @@ pub struct TaskErrorGroupPhoto {
     pub filename: String,
     pub path: String,
     pub attempts: Option<i64>,
+    pub occurred_at: i64,
     pub ignored: bool,
     pub can_ignore: bool,
 }
@@ -128,15 +131,18 @@ pub fn page(
     before: Option<i64>,
 ) -> AppResult<TaskErrorPage> {
     const PAGE_SIZE: usize = 12;
+    let history_through = conn.query_row(
+        "SELECT COALESCE(MAX(id),0) FROM task_error_events", [], |row| row.get::<_, i64>(0),
+    )?;
     let mut stmt = conn.prepare(
         "WITH groups AS (
-            SELECT stage,reason,MAX(id) AS newest,COUNT(*) AS occurrences,
+            SELECT stage,reason,MAX(id) AS newest,COUNT(*) AS occurrences,MIN(occurred_at) AS first_at,
                    COALESCE(MAX(id) FILTER (WHERE instr(message,char(10))>0),MAX(id)) AS detail_id
             FROM task_error_reasons
-            WHERE (?1 IS NULL OR stage=?1)
+            WHERE (?1 IS NULL OR stage=?1) AND id<=?4
             GROUP BY stage,reason
          )
-         SELECT g.stage,g.reason,g.newest,g.occurrences,d.message,n.occurred_at
+         SELECT g.stage,g.reason,g.newest,g.occurrences,d.message,n.occurred_at,g.first_at
          FROM groups g
          JOIN task_error_events d ON d.id=g.detail_id
          JOIN task_error_events n ON n.id=g.newest
@@ -144,7 +150,7 @@ pub fn page(
     )?;
     let mut groups = stmt
         .query_map(
-            params![stage, before.unwrap_or(i64::MAX), PAGE_SIZE + 1],
+            params![stage, before.unwrap_or(i64::MAX), PAGE_SIZE + 1, history_through],
             |row| {
                 Ok(TaskErrorGroup {
                     key: TaskErrorGroupKey {
@@ -155,6 +161,7 @@ pub fn page(
                     occurrences: row.get(3)?,
                     message: row.get(4)?,
                     occurred_at: row.get(5)?,
+                    first_occurred_at: row.get(6)?,
                 })
             },
         )?
@@ -187,6 +194,7 @@ pub fn page(
         groups,
         stages,
         next_before,
+        history_through,
         retryable,
         failed_faces,
         failed_classifications,
@@ -197,17 +205,21 @@ pub fn page(
     })
 }
 
+pub fn clear_history(conn: &Connection, through: i64) -> AppResult<usize> {
+    Ok(conn.execute("DELETE FROM task_error_events WHERE id<=?1", [through])?)
+}
+
 // Use the newest event shown to the user as a boundary so a group action never
 // includes photos added to the group after it was displayed.
 const GROUP_PHOTOS: &str = "
     WITH affected AS (
         SELECT photo.value->>'path' AS path, MAX(photo.value->>'filename') AS filename,
-               MAX(photo.value->>'attempts') AS attempts
+               MAX(photo.value->>'attempts') AS attempts, MAX(e.occurred_at) AS occurred_at
         FROM task_error_reasons e, json_each(e.photos_json) photo
         WHERE e.stage=?1 AND e.reason=?2 AND e.id<=?3
         GROUP BY photo.value->>'path'
     ), related AS (
-        SELECT p.id AS photo_id, a.filename, a.path, a.attempts,
+        SELECT p.id AS photo_id, a.filename, a.path, a.attempts, a.occurred_at,
                i.photo_id IS NOT NULL AS ignored,
                CASE
                    WHEN i.photo_id IS NOT NULL THEN 0
@@ -233,7 +245,7 @@ pub fn group_photos(
         "{GROUP_PHOTOS}, counted AS (
              SELECT *,COUNT(*) OVER () AS total,SUM(can_ignore) OVER () AS eligible FROM related
          )
-         SELECT photo_id,filename,path,attempts,ignored,can_ignore,total,eligible
+         SELECT photo_id,filename,path,attempts,ignored,can_ignore,total,eligible,occurred_at
          FROM counted WHERE (?4 IS NULL OR path>?4) ORDER BY path LIMIT ?5"
     ))?;
     let mut rows = stmt.query(params![
@@ -251,6 +263,7 @@ pub fn group_photos(
             filename: row.get(1)?,
             path: row.get(2)?,
             attempts: row.get(3)?,
+            occurred_at: row.get(8)?,
             ignored: row.get(4)?,
             can_ignore: row.get(5)?,
         });
@@ -383,6 +396,31 @@ mod tests {
         assert_eq!(photos.total, 2);
         assert_eq!(photos.photos[1].attempts, Some(4));
         assert_eq!(photos.photos[1].path, "D:/Photos/two.jpg");
+    }
+
+    #[test]
+    fn clearing_history_preserves_new_errors_and_retry_state() {
+        let conn = library();
+        import_legacy_errors(&conn).unwrap();
+        ai_task_dao::claim_tasks(&conn, FACE_STAGE, 1).unwrap();
+        ai_task_dao::mark_task_failed(&conn, 1, FACE_STAGE, "HTTP error").unwrap();
+        conn.execute("UPDATE task_error_events SET occurred_at=100", []).unwrap();
+        record_task_error(&conn, FACE_STAGE, "HTTP error").unwrap();
+        conn.execute("UPDATE task_error_events SET occurred_at=200 WHERE id=2", []).unwrap();
+
+        let history = page(&conn, None, None).unwrap();
+        let group = &history.groups[0];
+        assert_eq!((group.first_occurred_at, group.occurred_at), (100, 200));
+        assert_eq!(group_photos(&conn, &group.key, None).unwrap().photos[0].occurred_at, 100);
+
+        record_task_error(&conn, FACE_STAGE, "new failure").unwrap();
+        assert_eq!(clear_history(&conn, history.history_through).unwrap(), 2);
+        import_legacy_errors(&conn).unwrap();
+        let after = page(&conn, None, None).unwrap();
+        assert_eq!(after.groups.len(), 1);
+        assert_eq!(after.groups[0].message, "new failure");
+        assert_eq!(after.failed_faces, 1);
+        assert_eq!(ai_task_dao::retry_failed(&conn).unwrap(), 1);
     }
 
     #[test]
