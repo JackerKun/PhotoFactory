@@ -115,6 +115,8 @@ const batchThumbCache = new Map<number, string>();
 export function GpsBatchEditor({
   photos,
   currentPhotoId,
+  initialMode = "single",
+  initialSelectedIds = [],
   photoLocations,
   onApply,
   onApplyIndividual,
@@ -122,6 +124,8 @@ export function GpsBatchEditor({
 }: {
   photos: Photo[];
   currentPhotoId: number;
+  initialMode?: "single" | "batch";
+  initialSelectedIds?: number[];
   photoLocations: Map<number, { lat: number; lng: number }>;
   onApply: (photoIds: number[], lat: number | null, lng: number | null) => Promise<void>;
   onApplyIndividual: (updates: Array<{ photoId: number; latitude: number | null; longitude: number | null }>) => Promise<void>;
@@ -140,7 +144,7 @@ export function GpsBatchEditor({
   const focusedIdx = editorPhotos.findIndex((photo) => photo.id === focusedPhotoId);
   const currentIdx = focusedIdx >= 0 ? focusedIdx : 0;
   const currentPhoto = editorPhotos[currentIdx] || null;
-  const [editMode, setEditMode] = useState<"single" | "batch">("single");
+  const [editMode, setEditMode] = useState(initialMode);
 
   // Preserve every coordinate observed during this editor session. App-level
   // photo refreshes may temporarily omit metadata; treating that transient gap
@@ -167,9 +171,12 @@ export function GpsBatchEditor({
   );
   const [targetLocation, setTargetLocation] = useState<{ lat: number; lng: number } | null>(initialLoc ?? null);
   const [draftLocations, setDraftLocations] = useState<Map<number, { lat: number; lng: number } | null>>(new Map());
-  const [selectedIds, setSelectedIds] = useState<Set<number>>(
-    () => new Set(currentPhoto?.id != null ? [currentPhoto.id] : [])
-  );
+  const [selectedIds, setSelectedIds] = useState(() => {
+    const ids = new Set(initialSelectedIds);
+    const selection = new Set(editorPhotos.flatMap((photo) => photo.id != null && ids.has(photo.id) ? [photo.id] : []));
+    if (selection.size === 0 && currentPhoto?.id != null) selection.add(currentPhoto.id);
+    return selection;
+  });
   const selectionAnchorRef = useRef(currentIdx);
   const [saving, setSaving] = useState(false);
   const [statusMessage, setStatusMessage] = useState("");
@@ -232,7 +239,12 @@ export function GpsBatchEditor({
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
-      if (target?.matches("input, textarea, [contenteditable='true']")) return;
+      if (e.key === "Escape" && !saving) {
+        e.preventDefault();
+        onClose();
+        return;
+      }
+      if (target?.matches("input, textarea, select, button, [contenteditable='true']")) return;
       switch (e.key) {
         case "ArrowRight": e.preventDefault(); navigate(1); break;
         case "ArrowLeft": e.preventDefault(); navigate(-1); break;
@@ -371,7 +383,7 @@ export function GpsBatchEditor({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [handleConfirm, handleClear]);
+  }, [handleConfirm, handleClear, onClose, saving]);
 
   // Auto-scroll filmstrip
   useEffect(() => {
@@ -391,24 +403,24 @@ export function GpsBatchEditor({
   return (
     <div className="fixed inset-0 bg-bg-primary z-[60] flex flex-col">
       {/* Top bar: search + close */}
-      <div className="flex items-center gap-2 p-3 border-b border-surface-secondary bg-bg-secondary flex-shrink-0">
-        <div className="flex rounded-lg bg-surface-primary p-0.5 text-xs">
-          <button type="button" onClick={() => setEditMode("single")} className={`rounded-md px-3 py-1.5 ${editMode === "single" ? "bg-bg-secondary text-text-primary shadow-sm" : "text-text-muted"}`}>逐张定位</button>
-          <button type="button" onClick={() => {
+      <div className="ui-toolbar shrink-0 border-b border-surface-secondary bg-bg-secondary p-[var(--ui-gap)]">
+        <div className="ui-segments" role="group" aria-label="坐标编辑模式">
+          <button type="button" aria-pressed={editMode === "single"} onClick={() => setEditMode("single")} className="ui-segment">逐张定位</button>
+          <button type="button" aria-pressed={editMode === "batch"} onClick={() => {
             setEditMode("batch");
             if (!targetLocation && currentSingleLocation) setTargetLocation(currentSingleLocation);
-          }} className={`rounded-md px-3 py-1.5 ${editMode === "batch" ? "bg-bg-secondary text-text-primary shadow-sm" : "text-text-muted"}`}>统一位置</button>
+          }} className="ui-segment">统一位置</button>
         </div>
         <MapSearch
-          className="flex-1"
+          className="min-w-[min(100%,12rem)] flex-1"
           onSelect={(result) => {
             handleGpsChange(result.lat, result.lng);
             setMapCenter([result.lat, result.lng]);
             mapInstance?.setView([result.lat, result.lng], 16, { animate: false });
           }}
         />
-        <button onClick={onClose}
-          className="text-text-muted hover:text-text-primary text-xl px-2" title="关闭（Esc）">
+        <button type="button" onClick={onClose} disabled={saving} aria-label="关闭坐标管理"
+          className="ui-button ui-icon-button text-xl" title="关闭（Esc）">
           &times;
         </button>
       </div>
@@ -1220,10 +1232,8 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
             newPending.set(photo.id!, { lat: pendingRef.current.lat, lng: pendingRef.current.lng });
             store.setBatchGpsPending(newPending);
           }
-          // Store the current photo ID before closing the drawer
-          useStore.getState().setBatchEditorPhotoId(photo.id!);
           onClose();
-          useStore.getState().setShowGpsBatchEditor(true);
+          useStore.getState().openGpsBatchEditor({ photoId: photo.id!, mode: "single", sourcePhoto: photo });
         }} />
 
         {/* Unified tags: AI-created and user-created tags are edited identically. */}

@@ -160,9 +160,15 @@ pub async fn cmd_get_thumbnail_path(
             .clone()
     };
     let processor = state.thumbnail_processor.clone();
-    let photo = read_project_db(project.clone(), move |conn| {
-        photo_dao::get_photo_by_id(conn, photo_id)?
-            .ok_or_else(|| AppError::NotFound(format!("Photo {photo_id} not found")))
+    let (photo, ignored) = read_project_db(project.clone(), move |conn| {
+        let photo = photo_dao::get_photo_by_id(conn, photo_id)?
+            .ok_or_else(|| AppError::NotFound(format!("Photo {photo_id} not found")))?;
+        let ignored = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM photo_task_ignores WHERE photo_id=?1 AND stage='thumbnail')",
+            [photo_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok((photo, ignored))
     })
     .await?;
 
@@ -175,6 +181,9 @@ pub async fn cmd_get_thumbnail_path(
     if let Some(thumb_path) = generator::find_thumbnail_path(&photo.path, &out_dir) {
         let _ = eviction::touch_thumbnail(&thumb_path);
         return Ok(thumb_path.to_string_lossy().to_string());
+    }
+    if ignored {
+        return Ok(photo.path);
     }
 
     // Thumbnail file not found on disk — regenerate on demand regardless of
@@ -307,7 +316,26 @@ pub async fn cmd_get_photo_data_url(photo_path: String) -> AppResult<String> {
 pub async fn cmd_get_thumbnail_processing_status(
     state: State<'_, AppState>,
 ) -> AppResult<ProcessingStatus> {
-    Ok(state.thumbnail_processor.get_status())
+    let mut status = state.thumbnail_processor.get_status();
+    let Ok(project) = current_project(&state) else {
+        return Ok(status);
+    };
+    read_project_db(project, move |conn| {
+        let (failed, last_failure_active) = conn.query_row(
+            "SELECT COUNT(*), COUNT(*) FILTER (WHERE id=?1) > 0
+             FROM photos WHERE thumbnail_status=-1 AND deleted=0 AND NOT EXISTS (
+                 SELECT 1 FROM photo_task_ignores i WHERE i.photo_id=photos.id AND i.stage='thumbnail'
+             )",
+            [status.last_error_photo_id],
+            |row| Ok((row.get::<_, usize>(0)?, row.get::<_, bool>(1)?)),
+        )?;
+        let task_error = status.last_error.is_some() && status.last_error_photo_id.is_none();
+        status.failed = failed + usize::from(task_error);
+        if status.last_error_photo_id.is_some() && !last_failure_active {
+            status.last_error = None;
+        }
+        Ok(status)
+    }).await
 }
 
 #[tauri::command]
@@ -347,18 +375,18 @@ pub async fn cmd_rebuild_thumbnail_cache(state: State<'_, AppState>) -> AppResul
             Ok(c) => c,
             Err(_) => return,
         };
-        let photos = match photo_dao::get_all_photo_paths(&conn) {
+        let photos = match photo_dao::get_thumbnail_rebuild_candidates(&conn) {
             Ok(p) => p,
             Err(_) => return,
         };
         let out_dir = project_clone.small_thumbnails_path();
         let threshold = project_clone.thumbnail_threshold_mb * 1024 * 1024;
         let mut pending = 0;
-        for (id, path, file_size) in &photos {
+        for (id, path, file_size, previously_failed) in &photos {
             let exists = crate::thumbnail::generator::find_thumbnail_path(path, &out_dir).is_some();
             let status = if exists {
                 1
-            } else if *file_size > threshold {
+            } else if *previously_failed || *file_size > threshold {
                 0
             } else {
                 1

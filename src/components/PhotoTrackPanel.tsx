@@ -300,7 +300,7 @@ export default function PhotoTrackPanel({ onClose, onViewPhoto }: {
         <div className="flex items-center justify-between gap-3">
           <h2 className="font-semibold">拍摄轨迹</h2>
           <div className="flex items-center gap-2">
-            <button type="button" className="ui-button h-8 w-8 p-0"
+            <button type="button" className="ui-button ui-icon-button"
               aria-label={collapsed ? "展开拍摄轨迹面板" : "折叠拍摄轨迹面板"}
               title={collapsed ? "展开面板" : "折叠面板"}
               aria-expanded={!collapsed} aria-controls={panelContentId} onClick={() => {
@@ -314,7 +314,7 @@ export default function PhotoTrackPanel({ onClose, onViewPhoto }: {
         </div>
         <div id={panelContentId} hidden={collapsed} className={collapsed ? undefined : "flex flex-col gap-3"}>
           {saved.length > 0 && <label className="flex items-center gap-2">已保存
-            <select className="ui-button min-w-0 flex-1" disabled={busy || drawing} value={savedId ?? ""} onChange={(event) => {
+            <select className="ui-select flex-1" disabled={busy || drawing} value={savedId ?? ""} onChange={(event) => {
               const track = saved.find((item) => item.id === Number(event.target.value));
               if (track) void loadTrack(track.settings, track);
               else {
@@ -335,20 +335,20 @@ export default function PhotoTrackPanel({ onClose, onViewPhoto }: {
             <span className="text-xs text-text-secondary">{drawing ? "在地图上拖出一个矩形" : bounds ? "已选定区域" : "先缩放到景区，再框选"}</span>
           </div>
           <div className="grid grid-cols-2 gap-2">
-            <label className="min-w-0">开始日期<input className="ui-button mt-1 w-full" type="date" disabled={busy} value={startDate}
+            <label className="min-w-0">开始日期<input className="ui-input mt-1 w-full" type="date" disabled={busy} value={startDate}
               onChange={(event) => { setStartDate(event.target.value); invalidateResult(); }} /></label>
-            <label className="min-w-0">结束日期<input className="ui-button mt-1 w-full" type="date" disabled={busy} min={startDate || undefined} value={endDate}
+            <label className="min-w-0">结束日期<input className="ui-input mt-1 w-full" type="date" disabled={busy} min={startDate || undefined} value={endDate}
               onChange={(event) => { setEndDate(event.target.value); invalidateResult(); }} /></label>
           </div>
           <p className="text-xs text-text-secondary">日期留空时，使用选区内所有拍摄日期。</p>
-          <button className="ui-button bg-accent-primary text-white" disabled={!settings || drawing || busy}
+          <button className="ui-button-primary" disabled={!settings || drawing || busy}
             onClick={() => { if (settings) void loadTrack(settings); }}>{busy ? "处理中…" : "生成轨迹"}</button>
           {error && <p role="alert" className="break-words text-sm text-red-600">{error}</p>}
           {notice && <p role="status" className="text-text-secondary">{notice}</p>}
           {day && settings && <>
             <div className="flex flex-wrap items-center justify-between gap-2">
               <label className="flex items-center gap-2">查看日期
-                <select className="ui-button" value={date} onChange={(event) => {
+                <select className="ui-select" value={date} onChange={(event) => {
                   const next = days.find((item) => item.date === event.target.value);
                   if (next) { setExpanded(null); setDate(next.date); setSelectedPhoto(next.points[0].photos[0].id); }
                 }}>

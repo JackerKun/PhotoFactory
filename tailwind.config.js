@@ -6,6 +6,14 @@ export default {
   theme: {
     fontSize: { xs: ["0.8125rem", "1.25rem"], sm: ["0.875rem", "1.4rem"], base: ["1rem", "1.5rem"], lg: ["1.125rem", "1.75rem"], xl: ["1.25rem", "1.75rem"], "2xl": ["1.5rem", "2rem"], "3xl": ["1.875rem", "2.25rem"] },
     extend: {
+      borderRadius: {
+        DEFAULT: "var(--ui-radius)",
+        md: "var(--ui-radius-md)",
+        lg: "var(--ui-radius-lg)",
+        xl: "var(--ui-radius-xl)",
+        "2xl": "var(--ui-radius-2xl)",
+        "3xl": "var(--ui-radius-3xl)",
+      },
       colors: {
         bg: { primary: "rgb(var(--bg-primary) / <alpha-value>)", secondary: "rgb(var(--bg-secondary) / <alpha-value>)", tertiary: "rgb(var(--bg-tertiary) / <alpha-value>)" },
         accent: { link: "rgb(var(--accent-link) / <alpha-value>)", primary: "rgb(var(--accent-primary) / <alpha-value>)", secondary: "#7774ed" },

@@ -1,11 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { Photo, PhotoCursor, PhotoTimelineBucket, SmartAlbum } from "../types";
 import * as api from "../api/tauri";
 import { useStore } from "../hooks/usePhotos";
 import PhotoCard from "./PhotoCard";
+import PhotoMemoriesView, { MemoryDetail } from "./PhotoMemoriesView";
+import AlbumCoverCard, { AlbumCoverThumbnail, albumGridStyle } from "./AlbumCoverCard";
+import { usePhotoMemories } from "../hooks/usePhotoMemories";
 import PhotoTimelineRail from "./PhotoTimelineRail";
 import { buildJustifiedRows } from "./ProportionalVirtualGrid";
 import { calculateColumnCount } from "../hooks/useVirtualGrid";
@@ -13,23 +15,9 @@ import { matchesTimeline, photoTimelinePosition, type TimelinePosition } from ".
 
 interface Props { onSelectPhoto: (id: number) => void; }
 const GAP = 4;
-const thumbCache = new Map<number, string>();
 const typeLabels: Record<SmartAlbum["album_type"], string> = {
   travel: "旅行", monthly: "月度精选", themed: "主题", person: "人物", manual: "手工相册", person_combination: "人物组合",
 };
-
-const Thumb = React.memo(function Thumb({ photoId }: { photoId: number }) {
-  const [url, setUrl] = useState<string | null>(() => thumbCache.get(photoId) ?? null);
-  useEffect(() => {
-    if (thumbCache.has(photoId)) return;
-    let cancelled = false;
-    api.getThumbnailPath(photoId, "small").then((path) => {
-      if (!cancelled) { const next = convertFileSrc(path); thumbCache.set(photoId, next); setUrl(next); }
-    }).catch(() => {});
-    return () => { cancelled = true; };
-  }, [photoId]);
-  return url ? <img src={url} alt="" className="h-full w-full object-cover" /> : <div className="h-full w-full animate-pulse bg-bg-tertiary" />;
-});
 
 function timelineBuckets(photos: Photo[]): PhotoTimelineBucket[] {
   const counts = new Map<string, PhotoTimelineBucket>();
@@ -103,6 +91,20 @@ function Dialog({ title, children, onClose }: { title: string; children: React.R
 }
 
 export default React.memo(function SmartAlbumView({ onSelectPhoto }: Props) {
+  const [section, setSection] = useState<"albums" | "memories">("albums");
+  const [memoryQuery, setMemoryQuery] = useState("");
+  const [memoryFilter, setMemoryFilter] = useState("all");
+  const [selectedMemoryId, setSelectedMemoryId] = useState<number>();
+  const root = useStore((state) => state.project?.root_path ?? null);
+  const memoryState = usePhotoMemories();
+  const selectedMemory = root === memoryState.root ? memoryState.memories.find((item) => item.id === selectedMemoryId) : undefined;
+  useEffect(() => setSelectedMemoryId(undefined), [root]);
+  const [generationFeedback, setGenerationFeedback] = useState<{ error: boolean; text: string }>();
+  useEffect(() => {
+    if (!generationFeedback) return;
+    const timeout = window.setTimeout(() => setGenerationFeedback(undefined), 6000);
+    return () => window.clearTimeout(timeout);
+  }, [generationFeedback]);
   const [albums, setAlbums] = useState<SmartAlbum[]>([]);
   const [selectedAlbum, setSelectedAlbum] = useState<SmartAlbum | null>(null);
   const [albumPhotos, setAlbumPhotos] = useState<Photo[]>([]);
@@ -190,14 +192,168 @@ export default React.memo(function SmartAlbumView({ onSelectPhoto }: Props) {
   const handlePhoto = (photo: Photo) => { if (selectionMode) return toggleSelection(photo); onSelectPhoto(photo.id!); setSelectedPhotoId(photo.id!); };
 
   if (selectedAlbum) return <div className="flex h-full flex-col">
-    <div className="flex min-h-14 items-center gap-3 border-b border-surface-secondary bg-bg-secondary px-4"><button onClick={() => { setSelectedAlbum(null); setSelectionMode(false); setSelection(new Set()); }} className="text-sm text-text-muted hover:text-text-primary">← 返回</button><h2 className="truncate text-xl font-bold">{selectedAlbum.name}</h2><span className="text-sm text-text-muted">{albumPhotos.length}/{selectedAlbum.photo_count} 张</span><span className="rounded-full bg-accent-primary/10 px-2 py-0.5 text-xs text-accent-link">{typeLabels[selectedAlbum.album_type]}</span><div className="ml-auto flex gap-1"><button onClick={() => void rename(selectedAlbum)} className="rounded-lg px-2 py-1 text-sm hover:bg-surface-primary">改名</button><button onClick={() => void removeAlbum(selectedAlbum)} className="rounded-lg px-2 py-1 text-sm text-red-500 hover:bg-red-50">删除</button></div></div>
-    <div className="flex min-h-14 flex-wrap items-center gap-2 border-b border-surface-secondary bg-bg-secondary px-3 py-2"><div className="flex h-9 rounded-xl bg-surface-primary p-1"><button onClick={() => setThumbnailShape("square")} className={`rounded-lg px-3 text-sm ${thumbnailShape === "square" ? "bg-bg-secondary text-accent-link shadow-sm" : "text-text-muted"}`}>▦ 方格</button><button onClick={() => setThumbnailShape("proportional")} className={`rounded-lg px-3 text-sm ${thumbnailShape === "proportional" ? "bg-bg-secondary text-accent-link shadow-sm" : "text-text-muted"}`}>▥ 原比例</button></div><input value={detailQuery} onChange={(e) => setDetailQuery(e.target.value)} className="h-9 min-w-[220px] flex-1 rounded-lg border border-surface-secondary bg-bg-secondary px-3 text-sm outline-none focus:ring-2 focus:ring-accent-primary/25" placeholder="搜索当前相册…" /><select value={detailSort} onChange={(e) => setDetailSort(e.target.value as typeof detailSort)} className="h-9 rounded-lg border border-surface-secondary bg-bg-secondary px-2 text-sm"><option value="date-desc">拍摄日期 · 降序</option><option value="date-asc">拍摄日期 · 升序</option><option value="name">名称</option></select>{selectedAlbum.album_type === "manual" && <button onClick={() => { setPickerOpen(true); setPickerSelection(new Set()); }} className="h-9 rounded-lg bg-accent-primary px-3 text-sm text-white">＋ 添加照片</button>}<button onClick={() => { setSelectionMode((v) => !v); setSelection(new Set()); }} className={`h-9 rounded-lg px-3 text-sm ${selectionMode ? "bg-accent-primary text-white" : "bg-surface-primary"}`}>{selectionMode ? `已选 ${selection.size}` : "管理"}</button>{selectionMode && selection.size > 0 && <><button onClick={async () => { await api.setAlbumCover(selectedAlbum.id, selection.values().next().value!); await refreshAlbums(); }} className="h-9 rounded-lg bg-surface-primary px-3 text-sm">设为封面</button>{selectedAlbum.album_type === "manual" && <button onClick={async () => { await api.removePhotosFromAlbum(selectedAlbum.id, [...selection]); setSelection(new Set()); await loadAlbumPhotos(selectedAlbum); await refreshAlbums(); }} className="h-9 rounded-lg bg-red-50 dark:bg-red-950/40 px-3 text-sm text-red-600 dark:text-red-300">移出相册</button>}</>}<span className="ml-auto text-xs text-text-muted">{detailPhotos.length} 张</span></div>
+    <header className="ui-toolbar border-b border-surface-secondary bg-bg-secondary px-[var(--workspace-inline)] py-[var(--ui-gap)]">
+      <button type="button" onClick={() => { setSelectedAlbum(null); setSelectionMode(false); setSelection(new Set()); }} className="ui-button">← 返回</button>
+      <h2 className="min-w-0 truncate text-xl font-bold">{selectedAlbum.name}</h2>
+      <span className="text-sm text-text-muted">{albumPhotos.length}/{selectedAlbum.photo_count} 张</span>
+      <span className="rounded bg-accent-primary/10 px-2 py-0.5 text-xs text-accent-link">{typeLabels[selectedAlbum.album_type]}</span>
+      <div className="ui-toolbar ml-auto">
+        <button type="button" onClick={() => void rename(selectedAlbum)} className="ui-button">改名</button>
+        <button type="button" onClick={() => void removeAlbum(selectedAlbum)} className="ui-button text-red-600 dark:text-red-300">删除</button>
+      </div>
+    </header>
+    <div className="ui-toolbar border-b border-surface-secondary bg-bg-secondary px-[var(--workspace-inline)] py-[var(--ui-gap)]">
+      <div className="ui-segments" role="group" aria-label="相册照片布局">
+        <button type="button" onClick={() => setThumbnailShape("square")} aria-pressed={thumbnailShape === "square"} className="ui-segment">方格</button>
+        <button type="button" onClick={() => setThumbnailShape("proportional")} aria-pressed={thumbnailShape === "proportional"} className="ui-segment">原比例</button>
+      </div>
+      <input value={detailQuery} onChange={(event) => setDetailQuery(event.target.value)} className="ui-input min-w-36 flex-1" aria-label="搜索当前相册" placeholder="搜索当前相册…" />
+      <select value={detailSort} onChange={(event) => setDetailSort(event.target.value as typeof detailSort)} className="ui-select" aria-label="照片排序">
+        <option value="date-desc">拍摄日期 · 降序</option>
+        <option value="date-asc">拍摄日期 · 升序</option>
+        <option value="name">名称</option>
+      </select>
+      {selectedAlbum.album_type === "manual" && <button type="button" onClick={() => { setPickerOpen(true); setPickerSelection(new Set()); }} className="ui-button-primary">＋ 添加照片</button>}
+      <button type="button" onClick={() => { setSelectionMode((value) => !value); setSelection(new Set()); }} aria-pressed={selectionMode} className="ui-button">{selectionMode ? `已选 ${selection.size}` : "管理"}</button>
+      {selectionMode && selection.size > 0 && <>
+        <button type="button" onClick={async () => { await api.setAlbumCover(selectedAlbum.id, selection.values().next().value!); await refreshAlbums(); }} className="ui-button">设为封面</button>
+        {selectedAlbum.album_type === "manual" && <button type="button" onClick={async () => {
+          await api.removePhotosFromAlbum(selectedAlbum.id, [...selection]);
+          setSelection(new Set());
+          await loadAlbumPhotos(selectedAlbum);
+          await refreshAlbums();
+        }} className="ui-button text-red-600 dark:text-red-300">移出相册</button>}
+      </>}
+      <span className="ml-auto text-xs text-text-muted">{detailPhotos.length} 张</span>
+    </div>
     <div className="flex min-h-0 flex-1">{loading && albumPhotos.length === 0 ? <div className="flex flex-1 items-center justify-center text-text-muted">正在加载相册…</div> : <AlbumPhotoGrid photos={detailPhotos} shape={thumbnailShape} size={thumbnailSize} selectedId={selectedPhotoId} selectionMode={selectionMode} selection={selection} jump={timelineJump} onVisible={setVisiblePhoto} onPhoto={handlePhoto} onDouble={(photo) => setLightboxPhotoId(photo.id!)} />}<PhotoTimelineRail buckets={buckets} ascending={detailSort === "date-asc"} active={photoTimelinePosition(visiblePhoto)} onJump={(position) => { setTimelineJump(null); requestAnimationFrame(() => setTimelineJump(position)); }} /></div>
-    {pickerOpen && <Dialog title="向相册添加照片" onClose={() => setPickerOpen(false)}><div className="flex h-[70vh] flex-col p-4"><input autoFocus value={pickerQuery} onChange={(e) => setPickerQuery(e.target.value)} className="mb-3 h-10 rounded-lg border border-surface-secondary px-3" placeholder="按文件名、日期、人物、标签或 EXIF 搜索…" /><div ref={pickerScrollRef} onScroll={(event) => { const element = event.currentTarget; if (pickerHasMore && !pickerLoading && element.scrollHeight - element.scrollTop - element.clientHeight < 500) void loadPicker(false); }} className="grid flex-1 auto-rows-max content-start grid-cols-4 gap-2 overflow-y-auto pr-1">{pickerPhotos.map((photo) => <button key={photo.id} onClick={() => setPickerSelection((current) => { const next = new Set(current); next.has(photo.id!) ? next.delete(photo.id!) : next.add(photo.id!); return next; })} className={`relative block w-full aspect-square self-start overflow-hidden rounded-lg border-2 ${pickerSelection.has(photo.id!) ? "border-accent-primary" : "border-transparent"}`}><Thumb photoId={photo.id!} /><span className="absolute bottom-0 left-0 right-0 truncate bg-black/55 px-1 py-0.5 text-left text-xs text-white">{photo.filename}</span></button>)}{pickerLoading && <div className="col-span-4 py-3 text-center text-sm text-text-muted">正在加载更多照片…</div>}{!pickerHasMore && pickerPhotos.length > 0 && <div className="col-span-4 py-3 text-center text-xs text-text-muted">已加载全部 {pickerPhotos.length} 张照片</div>}</div><div className="mt-3 flex items-center justify-between"><span className="text-xs text-text-muted">已加载 {pickerPhotos.length} 张 · 已选择 {pickerSelection.size} 张</span><div className="flex gap-2"><button onClick={() => setPickerOpen(false)} className="h-10 rounded-lg px-4">取消</button><button disabled={!pickerSelection.size} onClick={async () => { await api.addPhotosToAlbum(selectedAlbum.id, [...pickerSelection]); setPickerOpen(false); await loadAlbumPhotos(selectedAlbum); await refreshAlbums(); }} className="h-10 rounded-lg bg-accent-primary px-4 text-white disabled:opacity-50">添加 {pickerSelection.size} 张</button></div></div></div></Dialog>}
+    {pickerOpen && <Dialog title="向相册添加照片" onClose={() => setPickerOpen(false)}><div className="flex h-[70vh] flex-col p-4"><input autoFocus value={pickerQuery} onChange={(e) => setPickerQuery(e.target.value)} className="ui-input mb-3" placeholder="按文件名、日期、人物、标签或 EXIF 搜索…" /><div ref={pickerScrollRef} onScroll={(event) => { const element = event.currentTarget; if (pickerHasMore && !pickerLoading && element.scrollHeight - element.scrollTop - element.clientHeight < 500) void loadPicker(false); }} className="grid flex-1 auto-rows-max content-start grid-cols-4 gap-2 overflow-y-auto pr-1">{pickerPhotos.map((photo) => <button key={photo.id} onClick={() => setPickerSelection((current) => { const next = new Set(current); next.has(photo.id!) ? next.delete(photo.id!) : next.add(photo.id!); return next; })} className={`relative block w-full aspect-square self-start overflow-hidden rounded-lg border-2 ${pickerSelection.has(photo.id!) ? "border-accent-primary" : "border-transparent"}`}><AlbumCoverThumbnail photoId={photo.id!} /><span className="absolute bottom-0 left-0 right-0 truncate bg-black/55 px-1 py-0.5 text-left text-xs text-white">{photo.filename}</span></button>)}{pickerLoading && <div className="col-span-4 py-3 text-center text-sm text-text-muted">正在加载更多照片…</div>}{!pickerHasMore && pickerPhotos.length > 0 && <div className="col-span-4 py-3 text-center text-xs text-text-muted">已加载全部 {pickerPhotos.length} 张照片</div>}</div><div className="mt-3 flex items-center justify-between"><span className="text-xs text-text-muted">已加载 {pickerPhotos.length} 张 · 已选择 {pickerSelection.size} 张</span><div className="flex gap-2"><button onClick={() => setPickerOpen(false)} className="ui-button">取消</button><button disabled={!pickerSelection.size} onClick={async () => { await api.addPhotosToAlbum(selectedAlbum.id, [...pickerSelection]); setPickerOpen(false); await loadAlbumPhotos(selectedAlbum); await refreshAlbums(); }} className="ui-button-primary">添加 {pickerSelection.size} 张</button></div></div></div></Dialog>}
   </div>;
 
-  return <div className="flex h-full flex-col"><div className="space-y-3 border-b border-surface-secondary px-4 pb-3 pt-4"><div className="flex items-center justify-between"><div><h2 className="text-xl font-bold">智能相册</h2><p className="mt-0.5 text-xs text-text-muted">自动整理与手工相册统一管理 · {albums.length} 个相册</p></div><div className="flex gap-2"><button onClick={() => setCreateOpen(true)} className="h-10 rounded-lg bg-accent-primary px-4 text-sm text-white">＋ 新建相册</button><button onClick={async () => { setRegenerating(true); try { await api.regenerateSmartAlbums(); await refreshAlbums(); } finally { setRegenerating(false); } }} disabled={regenerating} className="h-10 rounded-lg bg-surface-primary px-4 text-sm disabled:opacity-50">{regenerating ? "生成中…" : "重新生成自动相册"}</button></div></div><div className="flex flex-wrap items-center gap-2"><input value={albumQuery} onChange={(e) => setAlbumQuery(e.target.value)} className="h-10 min-w-[220px] flex-1 rounded-lg border border-surface-secondary bg-bg-secondary px-3 text-sm outline-none focus:ring-2 focus:ring-accent-primary/25" placeholder="搜索相册…" /><select value={albumType} onChange={(e) => setAlbumType(e.target.value as typeof albumType)} className="h-10 rounded-lg border border-surface-secondary bg-bg-secondary px-3 text-sm"><option value="all">全部类型</option><option value="manual">手工相册</option><option value="travel">旅行</option><option value="monthly">月度精选</option><option value="themed">主题</option><option value="person">人物</option><option value="person_combination">人物组合</option></select><select value={albumSort} onChange={(e) => setAlbumSort(e.target.value as typeof albumSort)} className="h-10 rounded-lg border border-surface-secondary bg-bg-secondary px-3 text-sm"><option value="updated">最近更新</option><option value="name">名称</option><option value="count">照片数量</option></select><label className="flex h-10 items-center gap-2 rounded-lg bg-surface-primary px-3 text-xs text-text-muted"><span>封面</span><input type="range" min="140" max="320" step="20" value={albumCardSize} onChange={(e) => setAlbumCardSize(Number(e.target.value))} /></label></div></div>
-    <div className="flex-1 overflow-y-auto p-4">{visibleAlbums.length === 0 ? <div className="py-12 text-center text-text-muted">没有符合条件的相册</div> : <div className="grid gap-4" style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${albumCardSize}px, 1fr))` }}>{visibleAlbums.map((album) => <article key={album.id} onClick={() => setSelectedAlbum(album)} className="group cursor-pointer overflow-hidden rounded-xl bg-surface-primary transition hover:-translate-y-0.5 hover:shadow-md"><div className="relative aspect-square overflow-hidden bg-bg-tertiary">{album.cover_photo_id ? <Thumb photoId={album.cover_photo_id} /> : <div className="flex h-full items-center justify-center text-3xl text-text-muted">▧</div>}<div className="absolute right-2 top-2 hidden gap-1 group-hover:flex"><button onClick={(e) => { e.stopPropagation(); void rename(album); }} className="rounded-lg bg-black/60 px-2 py-1 text-xs text-white">编辑</button><button onClick={(e) => { e.stopPropagation(); void removeAlbum(album); }} className="rounded-lg bg-black/60 px-2 py-1 text-xs text-white">删除</button></div></div><div className="p-3"><div className="flex items-start justify-between gap-2"><h3 className="truncate text-sm font-medium">{album.name}</h3><span className="shrink-0 rounded bg-black/5 px-1.5 py-0.5 text-xs text-text-muted">{typeLabels[album.album_type]}</span></div><p className="mt-1 text-xs text-text-muted">{album.photo_count} 张照片</p></div></article>)}</div>}</div>
-    {createOpen && <Dialog title="新建手工相册" onClose={() => setCreateOpen(false)}><form className="p-5" onSubmit={async (e) => { e.preventDefault(); if (!newAlbumName.trim()) return; const id = await api.createManualAlbum(newAlbumName); setCreateOpen(false); setNewAlbumName(""); const nextAlbums = await api.getSmartAlbums() as SmartAlbum[]; setAlbums(nextAlbums); const next = nextAlbums.find((album) => album.id === id); if (next) setSelectedAlbum(next); }}><label className="text-sm text-text-muted">相册名称</label><input autoFocus value={newAlbumName} onChange={(e) => setNewAlbumName(e.target.value)} className="mt-2 h-11 w-full rounded-lg border border-surface-secondary px-3" placeholder="例如：家庭精选" /><div className="mt-5 flex justify-end gap-2"><button type="button" onClick={() => setCreateOpen(false)} className="h-10 rounded-lg px-4">取消</button><button className="h-10 rounded-lg bg-accent-primary px-4 text-white">创建并添加照片</button></div></form></Dialog>}
+  async function regenerate() {
+    setRegenerating(true);
+    setGenerationFeedback(undefined);
+    try {
+      const count = await api.regenerateSmartAlbums();
+      await refreshAlbums();
+      setGenerationFeedback({ error: false, text: `已生成 ${count} 个自动相册。` });
+    } catch (error) {
+      setGenerationFeedback({ error: true, text: `生成失败。${String(error)}` });
+    } finally {
+      setRegenerating(false);
+    }
+  }
+
+  if (section === "memories" && selectedMemory && root) {
+    return <div className="flex h-full flex-col">
+      <MemoryDetail key={selectedMemory.id} memory={selectedMemory} root={root} onBack={() => setSelectedMemoryId(undefined)} />
+    </div>;
+  }
+
+  const showingAlbums = section === "albums";
+  const memories = root === memoryState.root ? memoryState.memories : [];
+  const tags = [...new Set(memories.flatMap((memory) => memory.tags))].sort((a, b) => a.localeCompare(b, "zh-CN"));
+  const activeMemoryFilter = memoryFilter.startsWith("tag:") && !tags.includes(memoryFilter.slice(4)) ? "all" : memoryFilter;
+  const query = memoryQuery.trim().toLocaleLowerCase();
+  const visibleMemories = memories
+    .filter((memory) => {
+      const filterMatches = activeMemoryFilter === "all"
+        || (activeMemoryFilter === "favorite" && memory.favorite)
+        || memory.kind === activeMemoryFilter
+        || memory.tags.some((tag) => activeMemoryFilter === `tag:${tag}`);
+      return filterMatches && (!query || [memory.title, memory.scene, memory.location, ...memory.people, ...memory.tags]
+        .some((value) => value?.toLocaleLowerCase().includes(query)));
+    })
+    .sort((a, b) => {
+      if (albumSort === "name") return a.title.localeCompare(b.title, "zh-CN");
+      if (albumSort === "count") return b.photo_ids.length - a.photo_ids.length;
+      return Number(b.favorite) - Number(a.favorite) || b.start_at - a.start_at;
+    });
+  return <div className="flex h-full flex-col">
+    <header className="album-header relative z-10 grid shrink-0 gap-[var(--ui-gap)] border-b border-surface-secondary">
+      <div className="ui-toolbar justify-between">
+        <h2 className="text-xl font-bold">智能相册</h2>
+        <div className="ui-toolbar">
+          <span className="text-xs text-text-muted tabular-nums" role="status">
+            {showingAlbums ? `${albums.length} 个相册` : memoryState.loading ? "正在整理回忆…" : `${memories.length} 段回忆`}
+          </span>
+          <details key={section} className="relative">
+            <summary className="ui-button cursor-pointer list-none">生成依据</summary>
+            <div className="absolute right-0 top-full mt-1 w-[min(26rem,75vw)] rounded-xl border border-surface-secondary bg-bg-secondary p-4 text-sm leading-relaxed text-text-secondary shadow-lg">
+              {showingAlbums ? <ul className="space-y-1.5">
+                <li><strong>旅行</strong> · 同一地点标签至少覆盖 3 天和 20 张。</li>
+                <li><strong>月度精选</strong> · 按时间取该月最早的 50 张。</li>
+                <li><strong>主题</strong> · AI 场景标签达到 10 张时，收录该标签下的全部照片。</li>
+                <li><strong>人物</strong> · 每位已命名人物最多收录最近 200 张。</li>
+              </ul> : <p>按拍摄时间和坐标聚合，每段最多精选 24 张。参考收藏、星级、清晰度、相似图索引和已有的 AI 标签。往年此时取往年同日前后 3 天。</p>}
+            </div>
+          </details>
+        </div>
+      </div>
+      <div className="album-action-row items-start gap-[var(--ui-gap)]">
+        <nav aria-label="相册视图" className="ui-segments self-start">
+          <button type="button" aria-pressed={showingAlbums} onClick={() => setSection("albums")} className="ui-segment">全部相册</button>
+          <button type="button" aria-pressed={!showingAlbums} onClick={() => setSection("memories")} className="ui-segment">回忆</button>
+        </nav>
+        <div className="album-actions ui-toolbar justify-end">
+          {showingAlbums ? <>
+            <button type="button" onClick={() => setCreateOpen(true)} className="ui-button-primary">＋ 新建相册</button>
+            <button type="button" onClick={() => void regenerate()} disabled={regenerating} className="ui-button">{regenerating ? "生成中…" : "重新生成自动相册"}</button>
+          </> : <button type="button" onClick={() => void memoryState.load(root, "refresh")} disabled={memoryState.loading} className="ui-button">刷新回忆</button>}
+        </div>
+      </div>
+      <div className="ui-toolbar">
+        <input aria-label={showingAlbums ? "搜索相册" : "搜索回忆"} value={showingAlbums ? albumQuery : memoryQuery}
+          onChange={(event) => showingAlbums ? setAlbumQuery(event.target.value) : setMemoryQuery(event.target.value)}
+          className="ui-input min-w-36 flex-1"
+          placeholder={showingAlbums ? "搜索相册…" : "搜索回忆或标签…"} />
+        {showingAlbums ? <select aria-label="相册类型" value={albumType} onChange={(event) => setAlbumType(event.target.value as typeof albumType)} className="ui-select w-36">
+          <option value="all">全部类型</option>
+          {Object.entries(typeLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+        </select> : <select aria-label="回忆筛选" value={activeMemoryFilter} onChange={(event) => setMemoryFilter(event.target.value)} className="ui-select w-36">
+          <option value="all">全部类型</option>
+          <option value="favorite">已收藏</option>
+          <option value="event">拍摄回顾</option>
+          <option value="anniversary">往年此时</option>
+          {tags.length > 0 && <optgroup label="回忆标签">
+            {tags.map((tag) => <option key={tag} value={`tag:${tag}`}>{tag}</option>)}
+          </optgroup>}
+        </select>}
+        <select aria-label="排序" value={albumSort} onChange={(event) => setAlbumSort(event.target.value as typeof albumSort)} className="ui-select w-28">
+          <option value="updated">{showingAlbums ? "最近更新" : "拍摄日期"}</option>
+          <option value="name">名称</option>
+          <option value="count">照片数量</option>
+        </select>
+        <label className="ui-field text-text-secondary">
+          <span>封面尺寸</span>
+          <input type="range" min="140" max="320" step="20" value={albumCardSize} onChange={(event) => setAlbumCardSize(Number(event.target.value))} className="w-20 accent-accent-primary" />
+        </label>
+      </div>
+      {showingAlbums && generationFeedback && <p role={generationFeedback.error ? "alert" : "status"} className={`absolute right-4 top-full max-w-[min(28rem,85%)] break-words rounded-lg border border-surface-secondary bg-bg-secondary px-3 py-2 text-sm shadow-md ${generationFeedback.error ? "text-red-500" : "text-text-secondary"}`}>{generationFeedback.text}</p>}
+    </header>
+    {showingAlbums ? <section className="album-catalog min-h-0 flex-1 overflow-y-auto">
+      {visibleAlbums.length === 0 && <p className="py-12 text-center text-text-muted">没有符合条件的相册</p>}
+      <div className="album-cover-grid grid" style={albumGridStyle(albumCardSize)}>
+        {visibleAlbums.map((album) => <AlbumCoverCard
+          key={album.id}
+          title={album.name}
+          badge={typeLabels[album.album_type]}
+          description={`${album.photo_count} 张照片`}
+          cover={album.cover_photo_id ? <AlbumCoverThumbnail key={album.cover_photo_id} photoId={album.cover_photo_id} /> : <div className="grid h-full place-items-center text-3xl">▧</div>}
+          onOpen={() => setSelectedAlbum(album)}
+          actions={<>
+            <button onClick={() => void rename(album)} className="rounded-lg bg-black/65 px-2 py-1 text-xs text-white">编辑</button>
+            <button onClick={() => void removeAlbum(album)} className="rounded-lg bg-black/65 px-2 py-1 text-xs text-white">删除</button>
+          </>}
+        />)}
+      </div>
+    </section> : <PhotoMemoriesView
+      memories={visibleMemories}
+      size={albumCardSize}
+      loading={memoryState.loading}
+      error={memoryState.error}
+      onOpen={setSelectedMemoryId}
+    />}
+    {createOpen && <Dialog title="新建手工相册" onClose={() => setCreateOpen(false)}><form className="p-5" onSubmit={async (e) => { e.preventDefault(); if (!newAlbumName.trim()) return; const id = await api.createManualAlbum(newAlbumName); setCreateOpen(false); setNewAlbumName(""); const nextAlbums = await api.getSmartAlbums() as SmartAlbum[]; setAlbums(nextAlbums); const next = nextAlbums.find((album) => album.id === id); if (next) setSelectedAlbum(next); }}><label className="text-sm text-text-muted">相册名称</label><input autoFocus value={newAlbumName} onChange={(e) => setNewAlbumName(e.target.value)} className="ui-input mt-2 w-full" placeholder="例如：家庭精选" /><div className="mt-5 flex justify-end gap-2"><button type="button" onClick={() => setCreateOpen(false)} className="ui-button">取消</button><button className="ui-button-primary">创建并添加照片</button></div></form></Dialog>}
   </div>;
 });

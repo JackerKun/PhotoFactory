@@ -97,19 +97,19 @@ export default function OfflineMapPanel({ maps, layer, onView }: {
           <p className="font-medium">优先使用离线地图</p>
           <p className="my-2 text-xs leading-relaxed text-gray-500">先读取已导入和已缓存的瓦片，缺少时联网下载。</p>
           <button type="button" disabled={!!busy || !projectPath} onClick={() => void importPackage()}
-            className="rounded-md bg-accent-primary px-3 py-1.5 text-white disabled:opacity-50">
+            className="ui-button-primary">
             {busy === "import" ? "正在导入…" : "导入离线地图包"}
           </button>
-          <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-gray-100 pt-2">
+          <div className="mt-2 grid grid-cols-2 gap-2 border-t border-surface-secondary pt-2">
             <select aria-label="导出图层" value={exportLayer} disabled={!!busy}
               onChange={(event) => setExportLayer(event.target.value as MapLayerStyle | "both")}
-              className="rounded-md border border-gray-200 bg-bg-secondary px-2 py-1.5 text-sm">
+              className="ui-select w-full">
               <option value="standard">标准地图</option>
               <option value="satellite">卫星实景地图</option>
               <option value="both">两种地图</option>
             </select>
             <button type="button" disabled={!!busy || !projectPath} onClick={() => void exportPackage()}
-              className="rounded-md border border-gray-200 px-3 py-1.5 hover:bg-gray-50 disabled:opacity-50">
+              className="ui-button min-w-0">
               {busy === "export" ? "正在导出…" : "导出离线地图"}
             </button>
           </div>

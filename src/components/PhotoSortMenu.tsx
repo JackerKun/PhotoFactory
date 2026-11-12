@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useStore } from "../hooks/usePhotos";
 import type { PhotoSortBy, SortDirection } from "../types";
+import Icon from "./Icon";
 
 const labels: Record<PhotoSortBy, string> = {
   capture_date: "拍摄日期",
@@ -30,12 +31,12 @@ export default React.memo(function PhotoSortMenu() {
   };
 
   return (
-    <div ref={ref} className="relative">
-      <button type="button" onClick={() => setOpen((value) => !value)} className="rounded-lg bg-surface-primary/80 px-2.5 py-2 text-xs text-text-secondary hover:text-text-primary" title="排序">
-        ⇅ {labels[sortBy]} · {direction === "asc" ? "升序" : "降序"}
+    <div ref={ref} className="photo-toolbar-anchor relative">
+      <button type="button" onClick={() => setOpen((value) => !value)} className="ui-button" title="排序" aria-expanded={open}>
+        <Icon name="sort" size={14} />{labels[sortBy]} · {direction === "asc" ? "升序" : "降序"}
       </button>
       {open && (
-        <div className="absolute right-0 top-full z-50 mt-2 w-48 rounded-xl border border-surface-secondary bg-bg-secondary p-1.5 shadow-2xl">
+        <div className="photo-toolbar-popover absolute right-0 top-full z-50 mt-2 w-48 rounded-xl border border-surface-secondary bg-bg-secondary p-1.5 shadow-2xl">
           {(Object.keys(labels) as PhotoSortBy[]).map((key) => (
             <div key={key} className="flex items-center rounded-lg hover:bg-surface-primary">
               <span className="flex-1 px-2 py-2 text-xs">{labels[key]}</span>

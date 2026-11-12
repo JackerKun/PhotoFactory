@@ -107,6 +107,9 @@ const SuspectedFaceThumb: React.FC<{ faceId: number }> = React.memo(function Sus
 
 type TabKey = "named" | "unnamed" | "review";
 
+const faceActionClass = "w-full rounded-lg px-3 py-2 text-left hover:bg-surface-primary focus-visible:outline focus-visible:outline-accent-primary disabled:opacity-50";
+const faceActionHeadingClass = "px-3 py-1 text-xs font-medium text-text-muted";
+
 export default React.memo(function FaceView(_props: Props) {
   const [searchParams] = useSearchParams();
   const initialTab = (searchParams.get("tab") as TabKey) || "named";
@@ -115,6 +118,7 @@ export default React.memo(function FaceView(_props: Props) {
   const activeTabRef = useRef<TabKey>(initialTab);
   const pageRequest = useRef(0);
   const faceDataRevision = useStore((state) => state.faceDataRevision);
+  const projectRoot = useStore((state) => state.project?.root_path);
   const [pageTotal, setPageTotal] = useState(0);
   const [pageLoading, setPageLoading] = useState(false);
   const [tabCounts, setTabCounts] = useState({ named: 0, unnamed: 0, review: 0 });
@@ -136,6 +140,10 @@ export default React.memo(function FaceView(_props: Props) {
   const [clustering, setClustering] = useState(false);
   const [workerHealthy, setWorkerHealthy] = useState(false);
   const [operationMessage, setOperationMessage] = useState<string | null>(null);
+  const faceActions = useRef<HTMLDetailsElement>(null);
+  const faceActionsTrigger = useRef<HTMLElement>(null);
+  const aiStatus = useStore((state) => state.aiProcessingStatus?.status);
+  const aiBusy = aiRunning || aiStatus === "running" || aiStatus === "paused";
 
   // Face detection stats
   const [faceCount, setFaceCount] = useState(0);
@@ -158,9 +166,10 @@ export default React.memo(function FaceView(_props: Props) {
   const [suspectedFaceCount, setSuspectedFaceCount] = useState(0);
   const [suspectedFaces, setSuspectedFaces] = useState<api.SuspectedFace[]>([]);
   const [suspectedOpen, setSuspectedOpen] = useState(false);
-  const [faceAiUpgradeAvailable, setFaceAiUpgradeAvailable] = useState(false);
+  const [canReanalyzeFaces, setCanReanalyzeFaces] = useState(false);
   const [ignoredFaceCount, setIgnoredFaceCount] = useState(0);
   const navigate = useNavigate();
+  const maintenanceDisabled = aiBusy || clustering || autoMergeRunning;
 
   const refreshData = useCallback(async () => {
     const requestedTab = activeTab;
@@ -189,7 +198,7 @@ export default React.memo(function FaceView(_props: Props) {
     }
     api.hasAutomaticFaceMergeToUndo().then(setHasMergeUndo).catch(() => setHasMergeUndo(false));
     api.getSuspectedFaceCount().then(setSuspectedFaceCount).catch(() => setSuspectedFaceCount(0));
-    api.getFaceAiVersionStatus().then((status) => setFaceAiUpgradeAvailable(status.upgrade_available)).catch(() => {});
+    api.getFaceAiVersionStatus().then((status) => setCanReanalyzeFaces(status.upgrade_available)).catch(() => {});
     api.getIgnoredFaceCount().then(setIgnoredFaceCount).catch(() => setIgnoredFaceCount(0));
   }, [activeTab]);
 
@@ -236,6 +245,25 @@ export default React.memo(function FaceView(_props: Props) {
     return () => { clearInterval(interval); unsub?.(); };
   }, [refreshData]);
 
+  useEffect(() => {
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      const menu = faceActions.current;
+      if (menu?.open && event.target instanceof Node && !menu.contains(event.target)) menu.open = false;
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    return () => document.removeEventListener("pointerdown", closeOnOutsideClick);
+  }, []);
+
+  const closeFaceActions = () => {
+    if (faceActions.current) faceActions.current.open = false;
+    faceActionsTrigger.current?.focus();
+  };
+
+  const runFaceAction = (action: () => void) => {
+    closeFaceActions();
+    action();
+  };
+
   const handleRunFaceDetection = async () => {
     setAiRunning(true);
     setOperationMessage("正在检查新增或发生变化的照片；已经分析过的照片不会重复处理。");
@@ -248,8 +276,8 @@ export default React.memo(function FaceView(_props: Props) {
       }
       const result = await api.triggerAutoAi();
       setOperationMessage(result === "No pending AI work"
-        ? "没有新增照片需要分析。"
-        : "已开始在后台分析新增照片；完成后人物页面会自动更新。");
+        ? "没有待分析的照片。"
+        : "正在后台分析待处理的照片，完成后人物页面会自动更新。");
     } catch (err) {
       console.error("Face detection failed:", err);
       const msg = err instanceof Error ? err.message : String(err);
@@ -281,9 +309,9 @@ export default React.memo(function FaceView(_props: Props) {
   };
 
   const handleFullRecluster = async () => {
-    if (!window.confirm("将重新生成所有未命名人物分组；已命名及人工确认的人物会保留。继续吗？")) return;
+    if (!window.confirm("将用已有的人脸特征重建自动分组。已命名和人工确认的人物会保留。继续吗？")) return;
     setClustering(true);
-    setOperationMessage("正在用更严格的规则完整重建未命名人物分组…");
+    setOperationMessage("正在用已有的人脸特征重建人物分组…");
     try {
       const healthy = await api.workerHealth();
       if (!healthy) {
@@ -404,16 +432,18 @@ export default React.memo(function FaceView(_props: Props) {
     setOperationMessage(`已清理 ${deleted} 个疑似误检，原始照片未改动。`);
   };
 
-  const handleFaceAiUpgrade = async () => {
-    if (!window.confirm("将使用新版人脸算法重新分析照片。已命名及人工确认的人物会保留，自动分组会重建。继续吗？")) return;
+  const handleFaceReanalysis = async () => {
+    const undoNotice = hasMergeUndo ? "重新分析后，上次自动合并的撤销记录会清除。" : "";
+    if (!window.confirm(`将用当前算法重新读取照片、检测人脸并重建自动分组。已命名和人工确认的人物会保留。${undoNotice}操作可能耗时，继续吗？`)) return;
     setAiRunning(true);
     try {
       const prepared = await api.prepareFaceAiReanalysis();
+      setHasMergeUndo(false);
       await api.triggerAutoAi();
-      setFaceAiUpgradeAvailable(false);
+      setCanReanalyzeFaces(false);
       setOperationMessage(`${prepared} 已在后台开始重新分析。`);
     } catch (error) {
-      setOperationMessage(`启动人脸算法升级失败：${String(error)}`);
+      setOperationMessage(`启动人脸重新分析失败：${String(error)}`);
     } finally {
       setAiRunning(false);
     }
@@ -536,41 +566,63 @@ export default React.memo(function FaceView(_props: Props) {
   };
 
   const visibleClusters = clusters;
-  const [groupPhotosOpen, setGroupPhotosOpen] = useState(false);
-
-  if (groupPhotosOpen) return <GroupPhotosView onBack={() => setGroupPhotosOpen(false)} />;
+  const [groupTab, setGroupTab] = useState<"unopened" | "active" | "inactive">("unopened");
+  const groupPhotosOpen = groupTab === "active";
 
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
-      <div className="px-8 pt-7 pb-2">
-        <div className="flex items-start justify-between mb-5">
+      <div className="people-header">
+        <div className="mb-3 flex items-start justify-between gap-2">
           <div>
-            <h2 className="text-3xl font-semibold tracking-tight">人物</h2>
+            <h2 className="text-xl font-semibold tracking-tight">人物</h2>
             <p className="text-sm text-text-muted mt-1">
               {faceCount > 0
                 ? `${faceCount} 张人脸${tabCounts.named + tabCounts.unnamed > 0 ? ` · ${tabCounts.named + tabCounts.unnamed} 个人物` : ""}${unassignedCount > 0 ? ` · ${unassignedCount} 张待整理` : ""}`
                 : "PhotoFactory 会在后台自动发现并整理人物"}
             </p>
           </div>
-          <div className="flex items-center gap-3">
-            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-bg-secondary/70 border border-text-primary/5 text-xs text-text-secondary shadow-sm">
-              <span className={`w-2 h-2 rounded-full ${workerHealthy ? "bg-emerald-500" : "bg-slate-300"}`} />
+          <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5 whitespace-nowrap text-xs text-text-secondary">
+              <span className={`h-1.5 w-1.5 rounded-full ${workerHealthy ? "bg-emerald-500" : "bg-text-muted"}`} />
               {workerHealthy ? "智能分析服务已就绪" : "智能分析准备中"}
             </div>
-            <details className="relative">
-              <summary className="list-none cursor-pointer w-9 h-9 rounded-full bg-bg-secondary/70 border border-text-primary/5 shadow-sm flex items-center justify-center text-lg text-text-secondary hover:bg-bg-secondary">•••</summary>
-              <div className="absolute right-0 mt-2 z-20 w-44 rounded-xl border border-text-primary/10 bg-bg-secondary/95 p-1.5 shadow-xl backdrop-blur-xl text-sm">
-                <button onClick={handleRunFaceDetection} disabled={aiRunning} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5 disabled:opacity-50">分析新增照片人脸</button>
-                <button onClick={handleRunClustering} disabled={clustering} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5 disabled:opacity-50">整理待分组人脸</button>
-                <button onClick={handleFullRecluster} disabled={clustering} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5 disabled:opacity-50">完整重建人物分组…</button>
-                <button onClick={openAutoMerge} disabled={clustering || autoMergeRunning} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5 disabled:opacity-50">自动合并相似人物…</button>
-                {hasMergeUndo && <button onClick={handleUndoAutomaticMerge} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5 text-orange-700 dark:text-orange-300">撤销上次自动合并</button>}
-                {suspectedFaceCount > 0 && <button onClick={openSuspectedFaces} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5">审核疑似误检 ({suspectedFaceCount})…</button>}
-                {faceAiUpgradeAvailable && <button onClick={handleFaceAiUpgrade} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5 text-blue-700 dark:text-blue-300">使用新版算法重新分析…</button>}
-                {ignoredFaceCount > 0 && <button onClick={handleRestoreIgnoredFaces} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5 text-text-secondary">恢复已忽略人脸 ({ignoredFaceCount})…</button>}
-                <button onClick={() => mergeMode ? (setMergeMode(false), setMergeSelected(new Set())) : startMergeMode("named")} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5">合并已命名人物…</button>
-                <button onClick={() => mergeMode ? (setMergeMode(false), setMergeSelected(new Set())) : startMergeMode("unnamed")} className="w-full text-left rounded-lg px-3 py-2 hover:bg-text-primary/5">{mergeMode ? "退出合并模式" : "合并未命名人物…"}</button>
+            <details ref={faceActions} className="relative" onKeyDown={(event) => {
+              if (event.key === "Escape" && event.currentTarget.open) {
+                event.stopPropagation();
+                closeFaceActions();
+              }
+            }}>
+              <summary ref={faceActionsTrigger} aria-label="人物操作" title="人物操作"
+                className="flex h-8 w-8 cursor-pointer list-none items-center justify-center rounded-md border border-surface-secondary bg-bg-secondary text-base text-text-secondary hover:bg-surface-primary">•••</summary>
+              <div className="absolute right-0 z-20 mt-2 max-h-[70vh] w-72 max-w-[calc(100vw-2rem)] divide-y divide-surface-secondary overflow-y-auto rounded-xl border border-surface-secondary bg-bg-secondary px-1.5 text-sm shadow-xl">
+                <div role="group" aria-label="分析与分组" className="py-1.5">
+                  <p className={faceActionHeadingClass}>分析与分组</p>
+                  <button type="button" onClick={() => runFaceAction(handleRunFaceDetection)} disabled={aiBusy} className={faceActionClass}>分析待处理照片</button>
+                  <button type="button" onClick={() => runFaceAction(handleRunClustering)} disabled={clustering} className={faceActionClass}>整理待分组人脸</button>
+                </div>
+                <div role="group" aria-label="合并人物" className="py-1.5">
+                  <p className={faceActionHeadingClass}>合并人物</p>
+                  <button type="button" onClick={() => runFaceAction(openAutoMerge)} disabled={clustering || autoMergeRunning} className={faceActionClass}>查找相似人物…</button>
+                  {hasMergeUndo && <button type="button" onClick={() => runFaceAction(handleUndoAutomaticMerge)} className={faceActionClass}>撤销上次自动合并</button>}
+                </div>
+                {(suspectedFaceCount > 0 || ignoredFaceCount > 0) && <div role="group" aria-label="审核与恢复" className="py-1.5">
+                  <p className={faceActionHeadingClass}>审核与恢复</p>
+                  {suspectedFaceCount > 0 && <button type="button" onClick={() => runFaceAction(openSuspectedFaces)} className={faceActionClass}>审核疑似误检（{suspectedFaceCount}）…</button>}
+                  {ignoredFaceCount > 0 && <button type="button" onClick={() => runFaceAction(handleRestoreIgnoredFaces)} className={faceActionClass}>恢复已忽略人脸（{ignoredFaceCount}）…</button>}
+                </div>}
+                <div role="group" aria-label="高级维护" className="py-1.5">
+                  <p className={faceActionHeadingClass}>高级维护</p>
+                  <button type="button" onClick={() => runFaceAction(handleFullRecluster)} disabled={maintenanceDisabled} className={faceActionClass}>
+                    <span className="block">重建自动分组…</span>
+                    <span className="mt-0.5 block text-xs text-text-secondary">用已有的人脸特征重新分组</span>
+                  </button>
+                  {canReanalyzeFaces && <button type="button" onClick={() => runFaceAction(handleFaceReanalysis)} disabled={maintenanceDisabled} className={faceActionClass}>
+                    <span className="block">重新分析人脸…</span>
+                    <span className="mt-0.5 block text-xs text-text-secondary">重新读取照片并检测人脸</span>
+                  </button>}
+                  {maintenanceDisabled && <p className="px-3 py-1 text-xs text-text-muted">请在当前分析或分组任务结束后操作。</p>}
+                </div>
               </div>
             </details>
           </div>
@@ -584,11 +636,18 @@ export default React.memo(function FaceView(_props: Props) {
         )}
 
         {/* Tabs */}
-        <div className="inline-flex gap-1 p-1 rounded-xl bg-black/[0.045]">
+        <nav aria-label="人物视图" className="ui-segments max-w-full overflow-x-auto">
           {(["named", "unnamed", "review"] as TabKey[]).map((tab) => (
             <button
               key={tab}
+              type="button"
+              aria-pressed={!groupPhotosOpen && activeTab === tab}
               onClick={() => {
+                if (groupPhotosOpen) {
+                  setGroupTab("inactive");
+                  useStore.getState().setSelectedPhotoId(null);
+                }
+                if (activeTab === tab) return;
                 activeTabRef.current = tab;
                 setActiveTab(tab);
                 setClusters([]);
@@ -596,25 +655,25 @@ export default React.memo(function FaceView(_props: Props) {
                 setMergeMode(false);
                 setMergeSelected(new Set());
               }}
-              className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-all ${
-                activeTab === tab
-                  ? "bg-bg-secondary text-text-primary shadow-sm"
-                  : "text-text-muted hover:text-text-primary"
-              }`}
+              className="ui-segment"
             >
               {tab === "named" ? "\u5df2\u547d\u540d" : tab === "unnamed" ? "\u672a\u547d\u540d" : "\u5f85\u5ba1\u6838"}
               {" "}<span className="text-xs opacity-60">({tabCounts[tab]})</span>
             </button>
           ))}
-          <button type="button" onClick={() => setGroupPhotosOpen(true)} className="px-4 py-1.5 rounded-lg text-sm font-medium text-text-muted hover:text-text-primary">合影</button>
-        </div>
+          <button type="button" aria-pressed={groupPhotosOpen} onClick={() => setGroupTab("active")} className="ui-segment">合影</button>
+        </nav>
+      </div>
+
+      {groupTab !== "unopened" && <div className={groupPhotosOpen ? "flex min-h-0 flex-1 flex-col" : "hidden"}><GroupPhotosView key={projectRoot} /></div>}
+      <div className={groupPhotosOpen ? "hidden" : "flex min-h-0 flex-1 flex-col"}>
 
         {/* Toolbar */}
-        <div className="flex items-center gap-2 mt-3 min-h-8">
+        <div className="people-toolbar flex flex-wrap items-center gap-2">
           {activeTab === "named" && !mergeMode && (
             <button
               onClick={() => startMergeMode("named")}
-              className="bg-accent-primary text-white px-4 py-1.5 rounded-lg text-sm shadow-sm"
+              className="ui-button-primary"
             >
               选择已命名人物合并
             </button>
@@ -623,13 +682,13 @@ export default React.memo(function FaceView(_props: Props) {
             <>
               <button
                 onClick={openAutoMerge}
-                className="bg-accent-primary text-white px-4 py-1.5 rounded-lg text-sm shadow-sm"
+                className="ui-button-primary"
               >
                 自动合并相似人物…
               </button>
               <button
                 onClick={() => startMergeMode("unnamed")}
-                className="px-4 py-1.5 rounded-lg text-sm text-text-secondary bg-bg-secondary/70 border border-text-primary/5 shadow-sm"
+                className="ui-button"
               >
                 手动选择合并
               </button>
@@ -657,8 +716,8 @@ export default React.memo(function FaceView(_props: Props) {
           )}
           {activeTab === "review" && !mergeMode && (
             <>
-              <span className="text-xs text-text-muted">单张人脸或身份不明确的照片会留在这里。请确认、命名或手动合并。</span>
-              <button onClick={() => startMergeMode("review")} className="bg-orange-500 text-white px-3 py-1.5 rounded-lg text-sm shadow-sm">选择并合并</button>
+              <button onClick={() => startMergeMode("review")} className="ui-button">选择并合并</button>
+              <span className="text-xs text-text-muted">确认、命名或合并身份不明确的人脸。</span>
             </>
           )}
           {mergeMode && mergeSelected.size > 0 && (
@@ -672,22 +731,15 @@ export default React.memo(function FaceView(_props: Props) {
             </button>
           )}
         </div>
-      </div>
-
-      {/* Content */}
-      <div className="flex-1 overflow-y-auto px-8 pb-8 pt-3">
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-8 gap-x-5 gap-y-7">
+      <div className="people-results">
+        <div className="people-grid">
           {visibleClusters.map((cluster) => (
             <div
               key={cluster.id}
-              className={`group rounded-2xl p-2 transition-all ${
-                mergeMode
-                  ? mergeSelected.has(cluster.id!)
-                    ? "bg-accent-primary/20 border-2 border-accent-primary cursor-pointer"
-                    : "bg-bg-secondary/50 border-2 border-transparent cursor-pointer hover:border-accent-primary/40"
-                  : activeTab === "review"
-                    ? "bg-bg-secondary border-2 border-orange-300 cursor-pointer shadow-sm"
-                    : "cursor-pointer hover:bg-bg-secondary/70 hover:shadow-sm"
+              className={`people-card group cursor-pointer rounded-xl border transition-colors ${
+                mergeMode && mergeSelected.has(cluster.id!)
+                  ? "border-accent-primary bg-accent-primary/15"
+                  : "border-surface-secondary/70 bg-bg-secondary hover:border-accent-primary/40"
               }`}
               onClick={() => {
                 if (mergeMode) {
@@ -704,7 +756,7 @@ export default React.memo(function FaceView(_props: Props) {
                 }
               }}
             >
-              <div className="w-full aspect-square overflow-hidden rounded-xl bg-surface-secondary relative">
+              <div className="w-full aspect-square overflow-hidden rounded-lg bg-surface-secondary relative">
                 <FaceThumb clusterId={cluster.id!} />
                 {mergeMode && (
                   <span className={`absolute top-2 right-2 w-6 h-6 rounded-full border-2 flex items-center justify-center text-xs font-bold shadow-sm ${
@@ -714,24 +766,27 @@ export default React.memo(function FaceView(_props: Props) {
                   </span>
                 )}
               </div>
-              <div className="flex items-center justify-between mt-2 px-1">
-                  <span className="text-sm font-medium text-text-primary truncate">
-                    {cluster.name || `人物 ${cluster.id}`}
-                  </span>
-                  {!mergeMode && (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setEditingId(cluster.id!);
-                        setEditName(cluster.name || "");
-                      }}
-                      className="text-text-muted hover:text-text-primary text-xs ml-1 opacity-0 group-hover:opacity-100"
-                    >
-                      编辑
-                    </button>
-                  )}
+              <div className="mt-1.5 flex items-center justify-between gap-1 px-1">
+                <span className="min-w-0 truncate text-sm font-medium text-text-primary" title={cluster.name || undefined}>
+                  {cluster.name || `人物 ${cluster.id}`}
+                </span>
+                {!mergeMode && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setEditingId(cluster.id!);
+                      setEditName(cluster.name || "");
+                    }}
+                    className="shrink-0 whitespace-nowrap text-xs text-text-muted opacity-0 hover:text-text-primary focus-visible:opacity-100 group-hover:opacity-100"
+                  >
+                    编辑
+                  </button>
+                )}
               </div>
-              <p className="text-xs text-text-muted px-1">{cluster.photo_count} 张照片 · {cluster.face_count} 张人脸</p>
+              <p className="truncate px-1 text-xs text-text-muted" title={`${cluster.photo_count} 张照片 · ${cluster.face_count} 张人脸`}>
+                照片 {cluster.photo_count} · 人脸 {cluster.face_count}
+              </p>
               {activeTab === "review" && !mergeMode && (
                 <div className="mt-2 grid grid-cols-3 gap-1 px-1 pb-1">
                   <button
@@ -769,11 +824,12 @@ export default React.memo(function FaceView(_props: Props) {
           </div>
         )}
 
+        {visibleClusters.length === 0 && pageLoading && <p className="people-empty" role="status">正在读取人物…</p>}
         {visibleClusters.length === 0 && !aiRunning && !pageLoading && (
-          <div className="text-center py-24 text-text-muted">
+          <div className="people-empty">
             {unassignedCount > 0 ? (
               <div>
-                <p className="text-base mb-1">{`${unassignedCount} 张人脸正在等待整理`}</p>
+                <p className="mb-1 font-medium">{`${unassignedCount} 张人脸正在等待整理`}</p>
                 <p className="text-sm">后台分析会自动完成，你无需停留在此页面。</p>
               </div>
             ) : activeTab === "named"
@@ -783,6 +839,8 @@ export default React.memo(function FaceView(_props: Props) {
                 : "暂无低置信度的族群。"}
           </div>
         )}
+      </div>
+
       </div>
 
       {editingId !== null && (

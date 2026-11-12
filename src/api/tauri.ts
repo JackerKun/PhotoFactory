@@ -7,8 +7,24 @@ import type {
   ManualTag, PhotoTimelineBucket, PhotoFilterOptions, ScanResult,
   LibraryJob, LibraryPhoto, DuplicateGroup, StoryEvent, ModelPlugin,
   StorageSource, IgnoredFace, PhotoEdit,
-  Paged,
+  Paged, PhotoMemory,
 } from "../types";
+
+const GITHUB_PROJECT_URL = "https://github.com/JackerKun/PhotoFactory";
+
+export interface UpdateCheck {
+  current_version: string;
+  latest_release: { tag: string; version: string; is_newer: boolean } | null;
+}
+
+export function checkForUpdate(): Promise<UpdateCheck> {
+  return invoke("cmd_check_for_update");
+}
+
+export function openGitHub(releaseTag?: string): Promise<void> {
+  const path = releaseTag ? `${GITHUB_PROJECT_URL}/releases/tag/${encodeURIComponent(releaseTag)}` : GITHUB_PROJECT_URL;
+  return invoke("plugin:shell|open", { path });
+}
 
 export async function createProject(rootPath: string, name: string): Promise<Project> {
   return invoke<Project>("cmd_create_project", { rootPath, name });
@@ -476,28 +492,69 @@ export async function getAiPipelineStatus(): Promise<import("../types").AiProces
   return invoke<import("../types").AiProcessingStatus>("cmd_get_ai_pipeline_status");
 }
 
-export interface TaskErrorRecord {
-  id: number;
+export interface TaskErrorGroupKey {
   stage: string;
-  kind: "batch" | "photo" | "task";
+  reason: string;
+  through: number;
+}
+
+export interface TaskErrorGroup {
+  key: TaskErrorGroupKey;
   message: string;
   occurred_at: number;
-  photos: { filename: string; path: string; attempts: number | null }[];
+  occurrences: number;
 }
 
 export interface TaskErrorPage {
-  entries: TaskErrorRecord[];
+  groups: TaskErrorGroup[];
+  stages: string[];
   next_before: number | null;
   retryable: number;
   failed_faces: number;
   failed_classifications: number;
+  ignored_count: number;
   platform: string;
   architecture: string;
   version: string;
 }
 
-export function getTaskErrors(before: number | null = null): Promise<TaskErrorPage> {
-  return invoke("cmd_get_task_errors", { before });
+export interface TaskErrorGroupPhotos {
+  photos: {
+    photo_id: number | null;
+    filename: string;
+    path: string;
+    attempts: number | null;
+    ignored: boolean;
+    can_ignore: boolean;
+  }[];
+  next_after: string | null;
+  total: number;
+  can_ignore: number;
+}
+
+export interface IgnoredTaskPhotos {
+  photos: { photo_id: number; stage: string; filename: string; path: string }[];
+  next_offset: number | null;
+}
+
+export function getTaskErrors(stage: string | null, before: number | null): Promise<TaskErrorPage> {
+  return invoke("cmd_get_task_errors", { stage, before });
+}
+
+export function getTaskErrorPhotos(key: TaskErrorGroupKey, after: string | null): Promise<TaskErrorGroupPhotos> {
+  return invoke("cmd_get_task_error_photos", { key, after });
+}
+
+export function getIgnoredTaskPhotos(offset: number): Promise<IgnoredTaskPhotos> {
+  return invoke("cmd_get_ignored_task_photos", { offset });
+}
+
+export function ignoreTaskErrorPhotos(projectPath: string, key: TaskErrorGroupKey, photoId: number | null): Promise<number> {
+  return invoke("cmd_ignore_task_error_photos", { projectPath, key, photoId });
+}
+
+export function restoreTaskPhoto(projectPath: string, stage: string, photoId: number): Promise<number> {
+  return invoke("cmd_restore_task_photo", { projectPath, stage, photoId });
 }
 
 export async function controlAiPipeline(action: "pause" | "resume" | "cancel" | "retry"): Promise<string> {
@@ -554,6 +611,26 @@ export async function runEventTagging(): Promise<number> {
 
 export async function getSmartAlbums(): Promise<any[]> {
   return await invoke("cmd_get_smart_albums");
+}
+
+export async function getPhotoMemories(): Promise<PhotoMemory[]> {
+  return invoke<PhotoMemory[]>("cmd_get_photo_memories");
+}
+
+export async function setPhotoMemoryPreferences(projectRoot: string, memoryId: number, favorite: boolean, tags: string[]) {
+  return invoke<void>("cmd_set_photo_memory_preferences", { projectRoot, memoryId, favorite, tags });
+}
+
+export async function beginMemoryVideo(destination: string) {
+  return invoke<string>("cmd_begin_memory_video", { destination });
+}
+
+export async function appendMemoryVideo(id: string, bytes: ArrayBuffer) {
+  return invoke<void>("cmd_append_memory_video", bytes, { headers: { "x-photo-video-id": id } });
+}
+
+export async function finishMemoryVideo(id: string, save: boolean) {
+  return invoke<void>("cmd_finish_memory_video", { id, save });
 }
 
 export async function getSmartAlbumPhotos(albumId: number, cursor?: number, limit?: number): Promise<any[]> {
@@ -615,6 +692,7 @@ export async function removeRecentProject(rootPath: string): Promise<void> {
 export const getLibraryJobs = () => invoke<LibraryJob[]>("cmd_get_library_jobs");
 export const controlLibraryJob = (jobId:number, action:"pause"|"resume"|"cancel") => invoke<void>("cmd_control_library_job", { jobId, action });
 export const startLibraryAnalysis = (withOcr:boolean) => invoke<number>("cmd_start_library_analysis", { withOcr });
+export const retryLibraryAnalysis = (jobId: number) => invoke<number>("cmd_retry_library_analysis", { jobId });
 export const smartSearch = (query:string, includePrivate=false, offset=0, limit=60) => invoke<Paged<LibraryPhoto>>("cmd_smart_search", { query, includePrivate, offset, limit });
 export const getDuplicateGroups = (offset=0, limit=20) => invoke<Paged<DuplicateGroup>>("cmd_get_duplicate_groups", { offset, limit });
 export const getRawJpegStacks = (offset=0, limit=20) => invoke<Paged<DuplicateGroup>>("cmd_get_raw_jpeg_stacks", { offset, limit });
@@ -648,8 +726,19 @@ export interface GroupPhotoItem {
   unconfirmed_count: number;
 }
 
-export function getGroupPhotos(size: number, personIds: number[], exact: boolean, cursor?: number): Promise<GroupPhotoItem[]> {
-  return invoke("cmd_get_group_photos", { size, personIds, exact, cursor });
+export interface NamedPhotoGroup {
+  person_ids: number[];
+  names: string[];
+  cover_photo_id: number;
+  photo_count: number;
+}
+
+export function getNamedPhotoGroups(size: number, personIds: number[], exact: boolean, offset = 0): Promise<NamedPhotoGroup[]> {
+  return invoke("cmd_get_named_photo_groups", { size, personIds, exact, offset });
+}
+
+export function getGroupPhotos(size: number, personIds: number[], exact: boolean, cursor?: number, namedOnly?: boolean): Promise<GroupPhotoItem[]> {
+  return invoke("cmd_get_group_photos", { size, personIds, exact, cursor, namedOnly });
 }
 
 export function createPersonCombination(name: string, personIds: number[], exact: boolean): Promise<number> {

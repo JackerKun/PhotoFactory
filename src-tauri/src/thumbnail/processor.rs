@@ -65,6 +65,8 @@ pub struct ProcessingStatus {
     pub failed: usize,
     pub current_file: Option<String>,
     pub last_error: Option<String>,
+    #[serde(skip)]
+    pub last_error_photo_id: Option<i64>,
 }
 
 /// Shared state for background thumbnail processing.
@@ -76,7 +78,7 @@ pub struct ThumbnailProcessor {
     pub failed: AtomicUsize,
     pub batch_size: usize,
     pub current_file: Arc<std::sync::Mutex<Option<String>>>,
-    pub last_error: Arc<std::sync::Mutex<Option<String>>>,
+    last_error: Mutex<Option<(Option<i64>, String)>>,
     performance: Mutex<ThumbnailPerformance>,
     pools: [OnceLock<rayon::ThreadPool>; 3],
 }
@@ -91,7 +93,7 @@ impl ThumbnailProcessor {
             failed: AtomicUsize::new(0),
             batch_size,
             current_file: Arc::new(std::sync::Mutex::new(None)),
-            last_error: Arc::new(std::sync::Mutex::new(None)),
+            last_error: Mutex::new(None),
             performance: Mutex::new(ThumbnailPerformance::default()),
             pools: std::array::from_fn(|_| OnceLock::new()),
         }
@@ -140,6 +142,7 @@ impl ThumbnailProcessor {
 
     /// Get a snapshot of the current processing status.
     pub fn get_status(&self) -> ProcessingStatus {
+        let last_error = self.last_error.lock().unwrap();
         ProcessingStatus {
             running: self.running.load(Ordering::SeqCst),
             batch_size: self.batch_size,
@@ -149,7 +152,8 @@ impl ThumbnailProcessor {
             succeeded: self.succeeded.load(Ordering::SeqCst),
             failed: self.failed.load(Ordering::SeqCst),
             current_file: self.current_file.lock().unwrap().clone(),
-            last_error: self.last_error.lock().unwrap().clone(),
+            last_error: last_error.as_ref().map(|(_, error)| error.clone()),
+            last_error_photo_id: last_error.as_ref().and_then(|(photo_id, _)| *photo_id),
         }
     }
 
@@ -173,11 +177,7 @@ impl ThumbnailProcessor {
         let result = (|| -> AppResult<()> {
             let mut conn = init_db(&project.db_path())?;
             loop {
-                let pending: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM photos WHERE thumbnail_status=0 AND deleted=0",
-                    [],
-                    |row| row.get(0),
-                )?;
+                let pending = photo_dao::count_pending_thumbnails(&conn)?;
                 self.total_pending.store(pending, Ordering::SeqCst);
                 if pending == 0 || self.process_batch(project, &mut conn)? == 0 {
                     break;
@@ -187,9 +187,13 @@ impl ThumbnailProcessor {
         })();
         if let Err(error) = result {
             if let Ok(conn) = init_db(&project.db_path()) {
-                let _ = crate::db::task_error_dao::record_task_error(&conn, "thumbnail", &error.to_string());
+                let _ = crate::db::task_error_dao::record_task_error(
+                    &conn,
+                    "thumbnail",
+                    &error.to_string(),
+                );
             }
-            *self.last_error.lock().unwrap() = Some(error.to_string());
+            *self.last_error.lock().unwrap() = Some((None, error.to_string()));
             self.failed.fetch_add(1, Ordering::SeqCst);
         }
         *self.current_file.lock().unwrap() = None;
@@ -243,12 +247,19 @@ impl ThumbnailProcessor {
                 }
                 Err(error) => {
                     failed += 1;
-                    *self.last_error.lock().unwrap() = Some(format!("{}: {error}", photo.filename));
-                    let _ = crate::db::task_error_dao::record(&tx, "thumbnail", "photo", &error.to_string(), &[
-                        crate::db::task_error_dao::ErrorPhoto {
-                            filename: photo.filename.clone(), path: photo.path.clone(), attempts: None,
-                        },
-                    ]);
+                    *self.last_error.lock().unwrap() =
+                        Some((photo.id, format!("{}: {error}", photo.filename)));
+                    let _ = crate::db::task_error_dao::record(
+                        &tx,
+                        "thumbnail",
+                        "photo",
+                        &error.to_string(),
+                        &[crate::db::task_error_dao::ErrorPhoto {
+                            filename: photo.filename.clone(),
+                            path: photo.path.clone(),
+                            attempts: None,
+                        }],
+                    );
                     -1
                 }
             };
@@ -302,7 +313,7 @@ mod tests {
         proc.processed.store(13, Ordering::SeqCst);
         proc.total_pending.store(20, Ordering::SeqCst);
         *proc.current_file.lock().unwrap() = Some("test.jpg".to_string());
-        *proc.last_error.lock().unwrap() = Some("error".to_string());
+        *proc.last_error.lock().unwrap() = Some((None, "error".to_string()));
 
         proc.reset();
 
@@ -336,6 +347,7 @@ mod tests {
             failed: 2,
             current_file: Some("photo.jpg".to_string()),
             last_error: Some("timeout".to_string()),
+            last_error_photo_id: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         let parsed: ProcessingStatus = serde_json::from_str(&json).unwrap();

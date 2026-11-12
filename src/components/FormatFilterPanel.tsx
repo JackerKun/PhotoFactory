@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useId, useRef, useState } from "react";
 
 interface ExtensionGroup {
   label: string;
@@ -46,13 +46,22 @@ const GROUPS: ExtensionGroup[] = [
 ];
 
 interface Props {
+  mode?: "import" | "scan";
   currentExtensions: string[];
   onConfirm: (extensions: string[]) => void;
   onCancel: () => void;
 }
 
-export default React.memo(function FormatFilterPanel({ currentExtensions, onConfirm, onCancel }: Props) {
+export default React.memo(function FormatFilterPanel({ mode = "import", currentExtensions, onConfirm, onCancel }: Props) {
   const [selected, setSelected] = useState<Set<string>>(() => new Set(currentExtensions));
+  const dialog = useRef<HTMLDialogElement>(null);
+  const titleId = useId();
+
+  useEffect(() => {
+    const element = dialog.current;
+    if (element && !element.open) element.showModal();
+    return () => { element?.close(); };
+  }, []);
 
   const isGroupAllChecked = (group: ExtensionGroup) =>
     group.extensions.every((e) => selected.has(e.ext));
@@ -81,20 +90,19 @@ export default React.memo(function FormatFilterPanel({ currentExtensions, onConf
   };
 
   const handleConfirm = () => {
-    if (selected.size === 0) {
-      alert("请至少选择一种文件格式");
-      return;
-    }
-    onConfirm(Array.from(selected));
+    if (selected.size > 0) onConfirm(Array.from(selected));
   };
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-bg-secondary rounded-xl p-6 w-full max-w-lg shadow-2xl">
-        <h3 className="text-lg font-bold mb-4 text-text-primary">选择导入的文件格式</h3>
-
+    <dialog ref={dialog} aria-labelledby={titleId} onCancel={(event) => { event.preventDefault(); onCancel(); }}
+      className="m-auto max-h-[calc(100vh-2rem)] w-[min(32rem,calc(100%-2rem))] overflow-x-hidden overflow-y-auto overscroll-contain scroll-pb-16 rounded-2xl border border-surface-secondary bg-bg-secondary p-0 text-text-primary shadow-2xl backdrop:bg-black/45">
+      <header className="border-b border-surface-secondary px-5 py-4">
+        <h2 id={titleId} className="text-lg font-semibold">{mode === "scan" ? "增量扫描" : "选择导入的文件格式"}</h2>
+        {mode === "scan" && <p className="mt-1 text-sm text-text-secondary">选择要扫描的文件格式。</p>}
+      </header>
+      <div className="space-y-4 px-5 py-4">
         {GROUPS.map((group) => (
-          <div key={group.label} className="mb-4">
+          <div key={group.label}>
             <label className="flex items-center gap-2 mb-2 cursor-pointer">
               <input
                 type="checkbox"
@@ -105,14 +113,14 @@ export default React.memo(function FormatFilterPanel({ currentExtensions, onConf
               />
               <span className="text-sm font-medium text-text-primary">{group.label}</span>
             </label>
-            <div className="flex flex-wrap gap-2 ml-6">
+            <div className="ml-5 grid grid-cols-2 gap-x-3 gap-y-2 min-[420px]:grid-cols-4">
               {group.extensions.map(({ ext, label }) => (
                 <label key={ext} className="flex items-center gap-1 cursor-pointer">
                   <input
                     type="checkbox"
                     checked={selected.has(ext)}
                     onChange={() => toggleExt(ext)}
-                    className="accent-accent-primary w-3 h-3"
+                    className="h-4 w-4 shrink-0 accent-accent-primary"
                   />
                   <span className="text-xs text-text-secondary">{label}</span>
                 </label>
@@ -120,18 +128,13 @@ export default React.memo(function FormatFilterPanel({ currentExtensions, onConf
             </div>
           </div>
         ))}
-
-        <div className="flex gap-3 mt-6">
-          <button onClick={onCancel}
-            className="flex-1 bg-surface-primary border border-surface-secondary text-text-primary py-2 rounded-lg text-sm">
-            取消
-          </button>
-          <button onClick={handleConfirm}
-            className="flex-1 bg-accent-primary hover:bg-accent-primary/80 text-white py-2 rounded-lg text-sm font-medium">
-            确认
-          </button>
-        </div>
       </div>
-    </div>
+      <footer className="sticky bottom-0 flex justify-end gap-2 border-t border-surface-secondary bg-bg-secondary px-5 py-3">
+        <button type="button" onClick={onCancel} className="ui-button" autoFocus>取消</button>
+        <button type="button" onClick={handleConfirm} disabled={selected.size === 0} className="ui-button-primary">
+          {mode === "scan" ? "开始扫描" : "确认"}
+        </button>
+      </footer>
+    </dialog>
   );
 });

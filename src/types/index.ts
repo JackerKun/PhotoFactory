@@ -241,3 +241,21 @@ export interface SmartAlbum {
   created_at: string;
   updated_at: string;
 }
+
+export interface PhotoMemory {
+  id: number;
+  kind: "event" | "anniversary";
+  title: string;
+  start_at: number;
+  end_at: number;
+  source_count: number;
+  cover_photo_id: number;
+  photo_ids: number[];
+  location: string | null;
+  gps_count: number;
+  people: string[];
+  scene: string | null;
+  indexed_count: number;
+  favorite: boolean;
+  tags: string[];
+}

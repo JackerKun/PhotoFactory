@@ -3,6 +3,13 @@ import type { AiProcessingStatus, Photo, PhotoCursor, PhotoFilter, Project, Thum
 import * as api from "../api/tauri";
 import { readPhotoData } from "../utils/photoRequests";
 
+interface GpsBatchSession {
+  photoId: number;
+  mode: "single" | "batch";
+  selectedPhotoIds?: number[];
+  sourcePhoto?: Photo;
+}
+
 interface AppState {
   project: Project | null;
   setProject: (p: Project | null) => void;
@@ -26,10 +33,9 @@ interface AppState {
   setRatingSelectionMode: (enabled: boolean) => void;
   toggleRatingSelection: (photoId: number) => void;
   clearRatingSelection: () => void;
-  showGpsBatchEditor: boolean;
-  setShowGpsBatchEditor: (show: boolean) => void;
-  batchEditorPhotoId: number;
-  setBatchEditorPhotoId: (id: number) => void;
+  gpsBatchSession: GpsBatchSession | null;
+  openGpsBatchEditor: (session: GpsBatchSession) => void;
+  closeGpsBatchEditor: () => void;
   batchGpsPending: Map<number, { lat: number; lng: number }>;
   setBatchGpsPending: (pending: Map<number, { lat: number; lng: number }>) => void;
   mapFocusRequest: { lat: number; lng: number; photoId: number; requestId: number } | null;
@@ -65,6 +71,7 @@ export const useStore = create<AppState>((set, get) => ({
     return {
       project: p, photos: [], totalPhotos: 0, cursor: null, hasNext: false,
       loading: false, photoLoadError: null,
+      gpsBatchSession: null, batchGpsPending: new Map(),
       _photoRequestGeneration: state._photoRequestGeneration + 1,
     };
   }),
@@ -92,10 +99,9 @@ export const useStore = create<AppState>((set, get) => ({
       : [...state.ratingSelection, photoId],
   })),
   clearRatingSelection: () => set({ ratingSelection: [] }),
-  showGpsBatchEditor: false,
-  setShowGpsBatchEditor: (show) => set({ showGpsBatchEditor: show }),
-  batchEditorPhotoId: 0,
-  setBatchEditorPhotoId: (id) => set({ batchEditorPhotoId: id }),
+  gpsBatchSession: null,
+  openGpsBatchEditor: (gpsBatchSession) => set({ gpsBatchSession, selectedPhotoId: null }),
+  closeGpsBatchEditor: () => set({ gpsBatchSession: null, batchGpsPending: new Map() }),
   batchGpsPending: new Map(),
   setBatchGpsPending: (pending) => set({ batchGpsPending: pending }),
   mapFocusRequest: null,
@@ -237,7 +243,7 @@ export const useStore = create<AppState>((set, get) => ({
       photos: [], totalPhotos: 0, cursor: null, hasNext: false, filter: {},
       selectedPhotoId: null, lightboxPhotoId: null,
       ratingSelectionMode: false, ratingSelection: [],
-      showGpsBatchEditor: false, batchEditorPhotoId: 0, batchGpsPending: new Map(),
+      gpsBatchSession: null, batchGpsPending: new Map(),
       mapFocusRequest: null,
       photoRoute: "/", photoGridScrollOffsets: { square: 0, proportional: 0 },
       aiProcessingStatus: null,

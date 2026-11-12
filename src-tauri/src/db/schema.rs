@@ -195,6 +195,12 @@ CREATE TABLE IF NOT EXISTS story_event_photos (
     photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
     position INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(event_id, photo_id)
 );
+CREATE TABLE IF NOT EXISTS saved_photo_memories (
+    id INTEGER PRIMARY KEY,
+    memory_json TEXT NOT NULL,
+    favorite INTEGER NOT NULL,
+    tags_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS model_plugins (
     id TEXT PRIMARY KEY, name TEXT NOT NULL, capability TEXT NOT NULL,
     version TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
@@ -244,6 +250,27 @@ CREATE TABLE IF NOT EXISTS task_error_events (
     occurred_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS photo_task_ignores (
+    photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+    stage TEXT NOT NULL,
+    PRIMARY KEY(photo_id, stage)
+);
+
+CREATE VIEW IF NOT EXISTS active_ai_photo_tasks AS
+    SELECT t.* FROM ai_photo_tasks t JOIN photos p ON p.id=t.photo_id
+    WHERE p.deleted=0 AND NOT EXISTS (
+        SELECT 1 FROM photo_task_ignores i WHERE i.photo_id=t.photo_id AND i.stage=t.stage
+    );
+
+CREATE VIEW IF NOT EXISTS task_error_reasons AS
+    SELECT id, stage, message, photos_json, occurred_at,
+           substr(message, 1, instr(message || char(10), char(10)) - 1) AS reason
+    FROM task_error_events;
+
+CREATE INDEX IF NOT EXISTS idx_task_error_stage_reason ON task_error_events(
+    stage, substr(message, 1, instr(message || char(10), char(10)) - 1)
+);
+
 CREATE INDEX IF NOT EXISTS idx_photos_path ON photos(path);
 CREATE INDEX IF NOT EXISTS idx_photos_taken_at ON photos(taken_at);
 CREATE INDEX IF NOT EXISTS idx_photos_rating ON photos(rating, deleted);
@@ -251,6 +278,7 @@ CREATE INDEX IF NOT EXISTS idx_photos_gps ON photos(latitude, longitude) WHERE l
 CREATE INDEX IF NOT EXISTS idx_ai_classifications_photo ON ai_classifications(photo_id);
 CREATE INDEX IF NOT EXISTS idx_ai_classifications_label ON ai_classifications(label);
 CREATE INDEX IF NOT EXISTS idx_photos_pending_thumbnails ON photos(id) WHERE thumbnail_status = 0 AND deleted = 0;
+CREATE INDEX IF NOT EXISTS idx_photos_failed_thumbnails ON photos(id) WHERE thumbnail_status = -1 AND deleted = 0;
 CREATE INDEX IF NOT EXISTS idx_face_detections_photo ON face_detections(photo_id);
 CREATE INDEX IF NOT EXISTS idx_face_detections_person ON face_detections(person_id);
 CREATE INDEX IF NOT EXISTS idx_face_detections_person_photo ON face_detections(person_id, photo_id);

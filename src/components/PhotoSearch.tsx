@@ -45,11 +45,11 @@ export default React.memo(function PhotoSearch() {
   };
 
   return (
-    <div ref={rootRef} className="relative min-w-[220px] max-w-2xl flex-1">
-      <form onSubmit={submit} className="flex overflow-hidden rounded-xl border border-surface-secondary bg-bg-primary focus-within:border-accent-primary">
-        <input value={value} onChange={(event) => { setValue(event.target.value); setOpen(true); }} onFocus={() => setOpen(true)} placeholder="搜索文件名、日期、人物、标签、EXIF…" className="min-w-0 flex-1 bg-transparent px-3 py-2 text-sm outline-none" />
-        {(value || filter.keyword) && <button type="button" onClick={() => { setValue(""); setFilter({ keyword: undefined }); }} className="px-2 text-text-muted" title="清除搜索">×</button>}
-        <button type="submit" className="bg-accent-primary px-3 text-xs font-medium text-white">搜索</button>
+    <div ref={rootRef} className="relative min-w-[min(100%,13rem)] flex-1">
+      <form onSubmit={submit} className="ui-search">
+        <input value={value} onChange={(event) => { setValue(event.target.value); setOpen(true); }} onFocus={() => setOpen(true)} placeholder="搜索文件名、日期、人物、标签、EXIF…" aria-label="搜索照片" className="ui-input flex-1" />
+        {(value || filter.keyword) && <button type="button" onClick={() => { setValue(""); setFilter({ keyword: undefined }); }} className="ui-button ui-icon-button text-text-muted" aria-label="清除搜索" title="清除搜索">×</button>}
+        <button type="submit" className="ui-button-primary">搜索</button>
       </form>
       {open && (
         <div className="absolute left-0 right-0 top-full z-50 mt-2 max-h-[420px] overflow-y-auto rounded-2xl border border-surface-secondary bg-bg-secondary p-2 shadow-2xl">

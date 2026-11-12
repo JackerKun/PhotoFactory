@@ -30,6 +30,79 @@ pub struct GroupPhoto {
     pub unconfirmed_count: i64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct NamedPhotoGroup {
+    pub person_ids: Vec<i64>,
+    pub names: Vec<String>,
+    pub cover_photo_id: i64,
+    pub photo_count: i64,
+}
+
+pub fn get_named_photo_groups(
+    conn: &rusqlite::Connection,
+    people: &[i64],
+    size: i64,
+    exact: bool,
+    offset: i64,
+    limit: i64,
+) -> AppResult<Vec<NamedPhotoGroup>> {
+    let mut stmt = conn.prepare(
+        "WITH selected AS (SELECT CAST(value AS INTEGER) AS id FROM json_each(?1)),
+         rosters AS (
+             SELECT fd.photo_id, json_group_array(DISTINCT fd.person_id ORDER BY fd.person_id) AS person_ids,
+                    COUNT(DISTINCT fd.person_id) AS people_count,
+                    COUNT(DISTINCT CASE WHEN fd.person_id IN (SELECT id FROM selected) THEN fd.person_id END) AS matched
+             FROM face_detections fd
+             JOIN photos p ON p.id=fd.photo_id AND p.deleted=0
+             LEFT JOIN face_clusters fc ON fc.id=fd.person_id
+             WHERE COALESCE(fd.review_status,'active') IN ('active','identity_review')
+             GROUP BY fd.photo_id
+             HAVING people_count >= 2
+                AND COUNT(*) FILTER (WHERE fd.review_status='identity_review' OR TRIM(COALESCE(fc.name,''))='')=0
+         ), groups AS (
+             SELECT person_ids, MAX(photo_id) AS cover_photo_id, COUNT(*) AS photo_count
+             FROM rosters
+             WHERE (?2=0 OR (?2<4 AND people_count=?2) OR (?2=4 AND people_count>=4))
+               AND matched=(SELECT COUNT(*) FROM selected)
+               AND (NOT ?3 OR people_count=matched)
+             GROUP BY person_ids
+             ORDER BY photo_count DESC, cover_photo_id DESC
+             LIMIT ?4 OFFSET ?5
+         )
+         SELECT groups.person_ids, cover_photo_id, photo_count,
+                (SELECT json_group_array(TRIM(fc.name) ORDER BY fc.id)
+                 FROM json_each(groups.person_ids) person JOIN face_clusters fc ON fc.id=person.value)
+         FROM groups ORDER BY photo_count DESC, cover_photo_id DESC",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            serde_json::json!(people).to_string(),
+            size,
+            exact,
+            limit.clamp(1, 100),
+            offset.max(0),
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        },
+    )?;
+    rows.map(|row| {
+        let (person_ids, cover_photo_id, photo_count, names) = row?;
+        Ok(NamedPhotoGroup {
+            person_ids: serde_json::from_str(&person_ids)?,
+            names: serde_json::from_str(&names)?,
+            cover_photo_id,
+            photo_count,
+        })
+    })
+    .collect()
+}
+
 // A confirmed identity is counted once (mirrors, collages, etc.). A real face
 // with no reliable identity contributes to the visible count, but never to a
 // saved person's membership. Ignored and suspected detections do not count.
@@ -59,15 +132,28 @@ pub fn get_group_photos(
     exact: bool,
     cursor: Option<i64>,
     limit: i64,
+    named_only: bool,
 ) -> AppResult<Vec<GroupPhoto>> {
     let people = serde_json::json!(people).to_string();
     let mut stmt = conn.prepare(&format!(
         "{GROUP_QUERY}
         SELECT photo_id,total,unconfirmed FROM matches
-        WHERE (?4 IS NULL OR photo_id < ?4) ORDER BY photo_id DESC LIMIT ?5"
+        WHERE (?4 IS NULL OR photo_id < ?4)
+          AND (NOT ?6 OR NOT EXISTS (
+              SELECT 1 FROM selected s LEFT JOIN face_clusters fc ON fc.id=s.id
+              WHERE TRIM(COALESCE(fc.name,''))=''
+          ))
+        ORDER BY photo_id DESC LIMIT ?5"
     ))?;
     let rows = stmt.query_map(
-        params![people, size, exact, cursor, limit.clamp(1, 200)],
+        params![
+            people,
+            size,
+            exact || named_only,
+            cursor,
+            limit.clamp(1, 200),
+            named_only,
+        ],
         |row| {
             Ok(GroupPhoto {
                 photo_id: row.get(0)?,
@@ -174,6 +260,21 @@ pub fn get_all_smart_albums(conn: &rusqlite::Connection) -> AppResult<Vec<SmartA
     })?;
     let mut albums = rows.collect::<Result<Vec<_>, _>>()?;
     for album in &mut albums {
+        if album.album_type == "themed" {
+            let rule = serde_json::from_str::<serde_json::Value>(&album.rule_json).ok();
+            if let Some(label) = rule.as_ref().and_then(|rule| rule["label"].as_str()) {
+                if let Some((prefix, count)) = album.name.split_once(" · ") {
+                    if prefix == label
+                        && count
+                            .strip_suffix('张')
+                            .is_some_and(|count| count.parse::<i64>().is_ok())
+                    {
+                        let translated = crate::tags::places365_cn::translate_label(label);
+                        album.name = format!("{translated} · {count}");
+                    }
+                }
+            }
+        }
         if album.album_type != "person_combination" {
             continue;
         }
@@ -221,6 +322,7 @@ pub fn get_album_photos(
             rule.exact,
             cursor.and_then(i64::checked_neg),
             limit,
+            false,
         )?
         .into_iter()
         .map(|row| (row.photo_id, -row.photo_id))
@@ -383,6 +485,7 @@ pub fn set_album_cover(conn: &rusqlite::Connection, album_id: i64, photo_id: i64
                 rule.exact,
                 photo_id.checked_add(1),
                 1,
+                false,
             )?
             .first()
             .is_some_and(|row| row.photo_id == photo_id)
@@ -408,6 +511,7 @@ pub fn set_album_cover(conn: &rusqlite::Connection, album_id: i64, photo_id: i64
 /// Delete generated albums and regenerate them. User-managed albums are preserved.
 /// Returns the number of albums created.
 pub fn regenerate_smart_albums(conn: &rusqlite::Connection) -> AppResult<i64> {
+    let conn = conn.unchecked_transaction()?;
     conn.execute(
         "DELETE FROM smart_album_photos WHERE album_id IN
          (SELECT id FROM smart_albums WHERE album_type NOT IN ('manual','person_combination'))",
@@ -420,11 +524,12 @@ pub fn regenerate_smart_albums(conn: &rusqlite::Connection) -> AppResult<i64> {
 
     let mut count = 0i64;
 
-    count += generate_travel_albums(conn)?;
-    count += generate_monthly_albums(conn)?;
-    count += generate_themed_albums(conn)?;
-    count += generate_person_albums(conn)?;
+    count += generate_travel_albums(&conn)?;
+    count += generate_monthly_albums(&conn)?;
+    count += generate_themed_albums(&conn)?;
+    count += generate_person_albums(&conn)?;
 
+    conn.commit()?;
     Ok(count)
 }
 
@@ -588,7 +693,8 @@ fn generate_themed_albums(conn: &rusqlite::Connection) -> AppResult<i64> {
     let mut count = 0i64;
 
     for (label, photo_count) in rows {
-        let name = format!("{} · {}张", label, photo_count);
+        let translated = crate::tags::places365_cn::translate_label(&label);
+        let name = format!("{translated} · {photo_count}张");
         let rule = serde_json::json!({
             "type": "themed",
             "label": label,
@@ -707,6 +813,52 @@ mod tests {
     }
 
     #[test]
+    fn named_groups_use_the_complete_roster_and_current_names() {
+        let conn = new_in_memory_db();
+        for (id, name) in [(1, "甲"), (2, "乙"), (3, "丙"), (4, " "), (5, "乙")] {
+            insert_person(&conn, id, name);
+        }
+        for id in 1..=8 {
+            insert_photo(&conn, id, &format!("/{id}.jpg"), id);
+        }
+        for (photo, person, status) in [
+            (1, Some(1), "active"), (1, Some(2), "active"),
+            (2, Some(2), "active"), (2, Some(1), "active"), (2, Some(1), "active"),
+            (2, None, "ignored"),
+            (3, Some(1), "active"), (3, Some(2), "active"), (3, Some(3), "active"),
+            (4, Some(1), "active"), (4, Some(2), "active"), (4, Some(4), "active"),
+            (5, Some(1), "active"), (5, Some(2), "active"), (5, Some(3), "identity_review"),
+            (6, Some(1), "active"), (6, Some(2), "active"), (6, None, "active"),
+            (7, Some(1), "active"), (7, Some(2), "active"),
+            (8, Some(1), "active"), (8, Some(5), "active"),
+        ] {
+            conn.execute(
+                "INSERT INTO face_detections(photo_id,person_id,review_status,created_at) VALUES (?1,?2,?3,0)",
+                params![photo, person, status],
+            ).unwrap();
+        }
+        conn.execute("UPDATE photos SET deleted=1 WHERE id=7", []).unwrap();
+
+        let groups = get_named_photo_groups(&conn, &[], 0, false, 0, 10).unwrap();
+        assert_eq!(groups.iter().map(|group| (group.person_ids.as_slice(), group.photo_count, group.cover_photo_id)).collect::<Vec<_>>(),
+            vec![(&[1, 2][..], 2, 2), (&[1, 5][..], 1, 8), (&[1, 2, 3][..], 1, 3)]);
+        assert_eq!(groups[0].names, ["甲", "乙"]);
+        let next = get_named_photo_groups(&conn, &[1], 2, false, 1, 1).unwrap();
+        assert_eq!(next[0].person_ids, [1, 5]);
+        let exact = get_named_photo_groups(&conn, &[1, 2], 0, true, 0, 10).unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].photo_count, 2);
+        let detail = get_group_photos(&conn, &[1, 2], 0, true, None, 20, true).unwrap();
+        assert_eq!(detail.iter().map(|photo| photo.photo_id).collect::<Vec<_>>(), [2, 1]);
+
+        super::super::face_dao::rename_cluster(&conn, 4, "丁").unwrap();
+        let updated = get_named_photo_groups(&conn, &[1, 2, 4], 0, true, 0, 10).unwrap();
+        assert_eq!(updated[0].names, ["甲", "乙", "丁"]);
+        super::super::face_dao::rename_cluster(&conn, 2, "").unwrap();
+        assert!(get_group_photos(&conn, &[1, 2], 0, true, None, 20, true).unwrap().is_empty());
+    }
+
+    #[test]
     fn group_filters_and_saved_combinations_track_current_people() {
         let conn = new_in_memory_db();
         for (id, name) in [(1, "甲"), (2, "乙"), (3, "丙"), (4, "丁")] {
@@ -741,17 +893,17 @@ mod tests {
         conn.execute("UPDATE photos SET deleted=1 WHERE id=5", [])
             .unwrap();
         assert_eq!(
-            get_group_photos(&conn, &[], 2, false, None, 20).unwrap()[0].photo_id,
+            get_group_photos(&conn, &[], 2, false, None, 20, false).unwrap()[0].photo_id,
             1
         );
-        let three = get_group_photos(&conn, &[], 3, false, None, 20).unwrap();
+        let three = get_group_photos(&conn, &[], 3, false, None, 20, false).unwrap();
         assert_eq!((three[0].photo_id, three[0].unconfirmed_count), (2, 1));
         assert_eq!(
-            get_group_photos(&conn, &[], 4, false, None, 20).unwrap()[0].photo_id,
+            get_group_photos(&conn, &[], 4, false, None, 20, false).unwrap()[0].photo_id,
             4
         );
         assert_eq!(
-            get_group_photos(&conn, &[1, 2], 0, false, None, 20)
+            get_group_photos(&conn, &[1, 2], 0, false, None, 20, false)
                 .unwrap()
                 .len(),
             3

@@ -573,11 +573,14 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
 
         {/* Info button — opens PhotoDetail drawer */}
         <button
+          type="button"
           data-lightbox-control
           onPointerDown={(event) => event.stopPropagation()}
           onClick={() => setSelectedPhotoId(selectedPhotoId === photoId ? null : photoId)}
           className="absolute bottom-4 right-4 z-10 w-8 h-8 rounded-full bg-black/40 hover:bg-text-primary/60 text-white/70 hover:text-white flex items-center justify-center transition-colors"
           title="照片详情"
+          aria-label="照片详情"
+          aria-pressed={detailsOpen}
         >
           <span className="text-sm font-semibold">i</span>
         </button>

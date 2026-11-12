@@ -1,14 +1,15 @@
-use crate::commands::project::{get_conn, AppState};
+use crate::commands::project::{current_project, get_conn, read_project_db, AppState};
 use crate::db::connection::init_db;
 use crate::error::{AppError, AppResult};
 use image::imageops::FilterType;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
-use tauri::State;
+use tauri::{Emitter, State};
 
 const MAX_PAGE_SIZE: i64 = 100;
 fn page_bounds(offset: i64, limit: i64) -> (i64, i64) {
@@ -156,17 +157,63 @@ fn map_library_photo(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryPhoto> 
 
 const PHOTO_SELECT: &str = "SELECT p.id,p.path,p.filename,p.rating,p.is_favorite,p.taken_at,i.ocr_text,i.quality_score,i.duplicate_group,i.stack_key,i.best_in_group,i.is_private,i.is_sensitive,t.trashed_at FROM photos p LEFT JOIN photo_intelligence i ON i.photo_id=p.id LEFT JOIN photo_trash t ON t.photo_id=p.id";
 
-#[tauri::command]
-pub async fn cmd_get_library_jobs(state: State<'_, AppState>) -> AppResult<Vec<LibraryJob>> {
-    use crate::commands::project::{current_project, read_project_db};
-    read_project_db(current_project(&state)?, read_library_jobs).await
+// Keep the lock for the lifetime of the worker, including while paused or
+// stopping. The OS releases it if the app exits, even after a crash.
+fn try_lock_analysis(db: &Path) -> AppResult<Option<File>> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0);
+    }
+    let file = match options.open(db.with_file_name("library-analysis.lock")) {
+        Ok(file) => file,
+        #[cfg(windows)]
+        Err(error) if error.raw_os_error() == Some(32) => return Ok(None), // ERROR_SHARING_VIOLATION
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // The descriptor belongs to file and stays open until the worker ends.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(error.into());
+        }
+    }
+    Ok(Some(file))
 }
 
-fn read_library_jobs(conn: &rusqlite::Connection) -> AppResult<Vec<LibraryJob>> {
-    let mut stmt = conn.prepare("SELECT id,job_type,status,progress,total,message,error,created_at,updated_at FROM library_jobs ORDER BY id DESC LIMIT 50")?;
+#[tauri::command]
+pub async fn cmd_get_library_jobs(state: State<'_, AppState>) -> AppResult<Vec<LibraryJob>> {
+    let project = current_project(&state)?;
+    let db = project.db_path();
+    read_project_db(project, move |conn| {
+        let available_lock = try_lock_analysis(&db)?;
+        read_library_jobs(conn, available_lock.is_none())
+    })
+    .await
+}
+
+fn read_library_jobs(conn: &Connection, worker_present: bool) -> AppResult<Vec<LibraryJob>> {
+    let mut stmt = conn.prepare(
+        "WITH ranked AS (
+           SELECT *,ROW_NUMBER() OVER (
+             PARTITION BY job_type
+             ORDER BY (?1 AND status IN ('queued','running','paused','stopping')) DESC,updated_at DESC,id DESC
+           ) AS position
+           FROM library_jobs
+         )
+         SELECT id,job_type,status,progress,total,message,error,created_at,updated_at
+         FROM ranked WHERE position=1 ORDER BY updated_at DESC,id DESC",
+    )?;
     let rows = stmt
-        .query_map([], |r| {
-            Ok(LibraryJob {
+        .query_map([worker_present], |r| {
+            let mut job = LibraryJob {
                 id: r.get(0)?,
                 job_type: r.get(1)?,
                 status: r.get(2)?,
@@ -176,7 +223,18 @@ fn read_library_jobs(conn: &rusqlite::Connection) -> AppResult<Vec<LibraryJob>> 
                 error: r.get(6)?,
                 created_at: r.get(7)?,
                 updated_at: r.get(8)?,
-            })
+            };
+            if !worker_present {
+                match job.status.as_str() {
+                    "queued" | "running" | "paused" => {
+                        job.status = "failed".into();
+                        job.error = Some("上次索引任务中断，可重试。".into());
+                    }
+                    "stopping" => job.status = "canceled".into(),
+                    _ => {}
+                }
+            }
+            Ok(job)
         })?
         .collect::<Result<_, _>>()?;
     Ok(rows)
@@ -188,16 +246,26 @@ pub fn cmd_control_library_job(
     action: String,
     state: State<'_, AppState>,
 ) -> AppResult<()> {
-    let status = match action.as_str() {
-        "pause" => "paused",
-        "resume" => "running",
-        "cancel" => "canceled",
+    let db = current_project(&state)?.db_path();
+    if try_lock_analysis(&db)?.is_some() {
+        return Err(AppError::Project(
+            "任务已结束或中断，请刷新任务状态。".into(),
+        ));
+    }
+    let (status, first_allowed, second_allowed) = match action.as_str() {
+        "pause" => ("paused", "running", "running"),
+        "resume" => ("running", "paused", "paused"),
+        "cancel" => ("stopping", "running", "paused"),
         _ => return Err(AppError::Project("不支持的任务操作".into())),
     };
-    get_conn(state)?.execute(
-        "UPDATE library_jobs SET status=?1,updated_at=?2 WHERE id=?3",
-        params![status, now(), job_id],
+    let changed = init_db(&db)?.execute(
+        "UPDATE library_jobs SET status=?1,updated_at=?2 WHERE id=?3
+         AND (status IN (?4,?5) OR (?1='stopping' AND status='queued'))",
+        params![status, now(), job_id, first_allowed, second_allowed],
     )?;
+    if changed == 0 {
+        return Err(AppError::Project("任务状态已变化，请刷新后再操作。".into()));
+    }
     Ok(())
 }
 
@@ -350,32 +418,45 @@ fn finish_groups(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
-fn run_analysis(db: PathBuf, job_id: i64, with_ocr: bool) {
+fn wait_for_analysis(conn: &Connection, job_id: i64) -> AppResult<bool> {
+    loop {
+        let status: String = conn.query_row(
+            "SELECT status FROM library_jobs WHERE id=?1",
+            [job_id],
+            |row| row.get(0),
+        )?;
+        match status.as_str() {
+            "paused" => thread::sleep(Duration::from_millis(300)),
+            "running" => return Ok(true),
+            _ => return Ok(false),
+        }
+    }
+}
+
+fn run_analysis(conn: Connection, job_id: i64, with_ocr: bool) {
     let result = (|| -> AppResult<()> {
-        let conn = init_db(&db)?;
         let photos: Vec<(i64, String, i64, i64)> = {
-            let mut s=conn.prepare("SELECT id,path,rating,is_favorite FROM photos WHERE deleted=0 AND id NOT IN(SELECT photo_id FROM photo_trash)")?;
-            let rows = s
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            let mut stmt = conn.prepare(
+                "SELECT id,path,rating,is_favorite FROM photos
+                 WHERE deleted=0 AND id NOT IN (SELECT photo_id FROM photo_trash)",
+            )?;
+            let photos = stmt
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
                 .collect::<Result<_, _>>()?;
-            rows
+            photos
         };
-        conn.execute("UPDATE library_jobs SET status='running',total=?1,message='建立照片智能索引',updated_at=?2 WHERE id=?3",params![photos.len() as i64,now(),job_id])?;
+        if conn.execute(
+            "UPDATE library_jobs SET status='running',total=?1,message='建立照片智能索引',updated_at=?2
+             WHERE id=?3 AND status='queued'",
+            params![photos.len() as i64, now(), job_id],
+        )? == 0 {
+            return Ok(());
+        }
         for (idx, (id, path, rating, favorite)) in photos.iter().enumerate() {
-            loop {
-                let status: String = conn.query_row(
-                    "SELECT status FROM library_jobs WHERE id=?1",
-                    [job_id],
-                    |r| r.get(0),
-                )?;
-                if status == "paused" {
-                    thread::sleep(Duration::from_millis(300));
-                    continue;
-                }
-                if status == "canceled" {
-                    return Ok(());
-                }
-                break;
+            if !wait_for_analysis(&conn, job_id)? {
+                return Ok(());
             }
             let (hash, sharp) = dhash_and_quality(path).unwrap_or_default();
             let quality = sharp + *rating as f64 * 10.0 + if *favorite != 0 { 15.0 } else { 0.0 };
@@ -404,35 +485,124 @@ fn run_analysis(db: PathBuf, job_id: i64, with_ocr: bool) {
                 ],
             )?;
         }
+        if !wait_for_analysis(&conn, job_id)? {
+            return Ok(());
+        }
         finish_groups(&conn)?;
-        conn.execute("UPDATE library_jobs SET status='completed',message='智能索引已完成',updated_at=?1 WHERE id=?2",params![now(),job_id])?;
+        conn.execute(
+            "UPDATE library_jobs SET status='completed',message='智能索引已完成',updated_at=?1
+             WHERE id=?2 AND status IN ('running','paused')",
+            params![now(), job_id],
+        )?;
         Ok(())
     })();
-    if let Err(e) = result {
-        if let Ok(conn) = init_db(&db) {
-            let _ = conn.execute(
-                "UPDATE library_jobs SET status='failed',error=?1,updated_at=?2 WHERE id=?3",
-                params![e.to_string(), now(), job_id],
-            );
-        }
+    if let Err(error) = result {
+        let _ = conn.execute(
+            "UPDATE library_jobs SET status='failed',error=?1,updated_at=?2
+             WHERE id=?3 AND status IN ('queued','running','paused')",
+            params![error.to_string(), now(), job_id],
+        );
     }
+    let _ = conn.execute(
+        "UPDATE library_jobs SET status='canceled',updated_at=?1 WHERE id=?2 AND status='stopping'",
+        params![now(), job_id],
+    );
+}
+
+fn queue_library_analysis(
+    conn: &mut Connection,
+    job_type: &str,
+    retry_id: Option<i64>,
+) -> AppResult<i64> {
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE library_jobs SET
+           status=CASE WHEN status='stopping' THEN 'canceled' ELSE 'failed' END,
+           error=CASE WHEN status='stopping' THEN NULL ELSE '上次索引任务中断，可重试。' END
+         WHERE status IN ('queued','running','paused','stopping')",
+        [],
+    )?;
+    let id = if let Some(id) = retry_id {
+        if tx.execute(
+            "UPDATE library_jobs SET status='queued',progress=0,total=0,message='等待开始',error=NULL,updated_at=?1
+             WHERE id=?2 AND status IN ('failed','canceled')",
+            params![now(), id],
+        )? == 0 {
+            return Err(AppError::Project("此任务已完成或无法重试。".into()));
+        }
+        id
+    } else {
+        tx.execute(
+            "INSERT INTO library_jobs(job_type,status,message,created_at,updated_at)
+             VALUES(?1,'queued','等待开始',?2,?2)",
+            params![job_type, now()],
+        )?;
+        tx.last_insert_rowid()
+    };
+    tx.commit()?;
+    Ok(id)
+}
+
+fn schedule_library_analysis(db: &Path, with_ocr: bool, retry_id: Option<i64>) -> AppResult<i64> {
+    let mut conn = init_db(db)?;
+    let job_type = match retry_id {
+        Some(id) => conn
+            .query_row(
+                "SELECT job_type FROM library_jobs WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| AppError::NotFound("找不到要重试的任务。".into()))?,
+        None if with_ocr => "intelligence+ocr".to_owned(),
+        None => "intelligence".to_owned(),
+    };
+    let mut lock = try_lock_analysis(db)?;
+    if lock.is_none() {
+        // A status poll may be holding the lock while it reads the latest job.
+        thread::sleep(Duration::from_millis(15));
+        lock = try_lock_analysis(db)?;
+    }
+    let Some(lock) = lock else {
+        let active = conn
+            .query_row(
+                "SELECT id,job_type,status FROM library_jobs
+             WHERE status IN ('queued','running','paused','stopping') ORDER BY id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((id, active_type, status)) = active {
+            if active_type == job_type && status != "stopping" {
+                return Ok(id);
+            }
+        }
+        return Err(AppError::Project(
+            "此照片库已有索引任务，请在任务结束后再试。".into(),
+        ));
+    };
+    let id = queue_library_analysis(&mut conn, &job_type, retry_id)?;
+    thread::Builder::new().spawn(move || {
+        let _lock = lock;
+        run_analysis(conn, id, job_type == "intelligence+ocr");
+    })?;
+    Ok(id)
 }
 
 #[tauri::command]
 pub fn cmd_start_library_analysis(with_ocr: bool, state: State<'_, AppState>) -> AppResult<i64> {
-    let project = state
-        .project
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| AppError::Project("No project open".into()))?;
-    let conn = init_db(&project.db_path())?;
-    let ts = now();
-    conn.execute("INSERT INTO library_jobs(job_type,status,message,created_at,updated_at) VALUES(?1,'queued','等待开始',?2,?2)",params![if with_ocr{"intelligence+ocr"}else{"intelligence"},ts])?;
-    let id = conn.last_insert_rowid();
-    let db = project.db_path();
-    thread::spawn(move || run_analysis(db, id, with_ocr));
-    Ok(id)
+    schedule_library_analysis(&current_project(&state)?.db_path(), with_ocr, None)
+}
+
+#[tauri::command]
+pub fn cmd_retry_library_analysis(job_id: i64, state: State<'_, AppState>) -> AppResult<i64> {
+    schedule_library_analysis(&current_project(&state)?.db_path(), false, Some(job_id))
 }
 
 #[tauri::command]
@@ -580,10 +750,17 @@ pub fn cmd_get_duplicate_group_photos(
 }
 
 #[tauri::command]
-pub fn cmd_trash_duplicate_group(group_id: String, state: State<'_, AppState>) -> AppResult<usize> {
+pub fn cmd_trash_duplicate_group(
+    group_id: String,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> AppResult<usize> {
     let conn = get_conn(state)?;
     let ts = now();
     let changed=conn.execute("INSERT INTO photo_trash(photo_id,reason,trashed_at) SELECT photo_id,'相似照片清理',?1 FROM photo_intelligence WHERE duplicate_group=?2 AND best_in_group=0 ON CONFLICT(photo_id) DO UPDATE SET reason=excluded.reason,trashed_at=excluded.trashed_at",params![ts,group_id])?;
+    if changed > 0 {
+        let _ = app.emit("photo_memory_visibility_changed", ());
+    }
     Ok(changed)
 }
 
@@ -592,6 +769,7 @@ pub fn cmd_move_photos_to_trash(
     photo_ids: Vec<i64>,
     reason: String,
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> AppResult<usize> {
     let conn = get_conn(state)?;
     let tx = conn.unchecked_transaction()?;
@@ -599,6 +777,9 @@ pub fn cmd_move_photos_to_trash(
         tx.execute("INSERT INTO photo_trash(photo_id,reason,trashed_at) VALUES(?1,?2,?3) ON CONFLICT(photo_id) DO UPDATE SET reason=excluded.reason,trashed_at=excluded.trashed_at",params![id,reason,now()])?;
     }
     tx.commit()?;
+    if !photo_ids.is_empty() {
+        let _ = app.emit("photo_memory_visibility_changed", ());
+    }
     Ok(photo_ids.len())
 }
 
@@ -624,11 +805,15 @@ pub fn cmd_get_trashed_photos(
 pub fn cmd_restore_trashed_photos(
     photo_ids: Vec<i64>,
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> AppResult<usize> {
     let conn = get_conn(state)?;
     let mut n = 0;
     for id in photo_ids {
         n += conn.execute("DELETE FROM photo_trash WHERE photo_id=?1", [id])?;
+    }
+    if n > 0 {
+        let _ = app.emit("photo_memory_visibility_changed", ());
     }
     Ok(n)
 }
@@ -639,10 +824,16 @@ pub fn cmd_set_photo_privacy(
     is_private: bool,
     is_sensitive: bool,
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> AppResult<usize> {
     let conn = get_conn(state)?;
+    let tx = conn.unchecked_transaction()?;
     for id in &photo_ids {
-        conn.execute("INSERT INTO photo_intelligence(photo_id,is_private,is_sensitive) VALUES(?1,?2,?3) ON CONFLICT(photo_id) DO UPDATE SET is_private=excluded.is_private,is_sensitive=excluded.is_sensitive",params![id,is_private as i64,is_sensitive as i64])?;
+        tx.execute("INSERT INTO photo_intelligence(photo_id,is_private,is_sensitive) VALUES(?1,?2,?3) ON CONFLICT(photo_id) DO UPDATE SET is_private=excluded.is_private,is_sensitive=excluded.is_sensitive",params![id,is_private as i64,is_sensitive as i64])?;
+    }
+    tx.commit()?;
+    if !photo_ids.is_empty() {
+        let _ = app.emit("photo_memory_visibility_changed", ());
     }
     Ok(photo_ids.len())
 }
@@ -1078,6 +1269,60 @@ mod tests {
     fn page_bounds_reject_unbounded_requests() {
         assert_eq!(page_bounds(-20, 50_000), (0, MAX_PAGE_SIZE));
         assert_eq!(page_bounds(40, 0), (40, 1));
+    }
+
+    #[test]
+    fn repeated_index_retries_share_the_running_job_and_keep_its_id() {
+        let project = tempfile::tempdir().unwrap();
+        let db = project.path().join("photos.db");
+        let mut conn = init_db(&db).unwrap();
+        conn.execute_batch(
+            "INSERT INTO library_jobs(id,job_type,status,progress,created_at,updated_at)
+             VALUES(1,'intelligence+ocr','canceled',4,1,1),
+                   (2,'intelligence+ocr','running',0,2,2);",
+        )
+        .unwrap();
+
+        let lock = try_lock_analysis(&db).unwrap().unwrap();
+        assert!(try_lock_analysis(&db).unwrap().is_none());
+        let before = read_library_jobs(&conn, false).unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].status, "failed");
+        assert_eq!(
+            queue_library_analysis(&mut conn, "intelligence+ocr", Some(1)).unwrap(),
+            1
+        );
+        assert_eq!(schedule_library_analysis(&db, false, Some(1)).unwrap(), 1);
+        assert_eq!(schedule_library_analysis(&db, true, None).unwrap(), 1);
+        assert!(schedule_library_analysis(&db, false, None).is_err());
+
+        let after = read_library_jobs(&conn, true).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!((after[0].id, after[0].progress), (1, 0));
+        assert_eq!(after[0].status, "queued");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM library_jobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        drop(lock);
+        assert!(try_lock_analysis(&db).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_stopping_index_job_is_not_restarted_by_its_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("photos.db");
+        let conn = init_db(&path).unwrap();
+        conn.execute(
+            "INSERT INTO library_jobs(id,job_type,status,created_at,updated_at)
+             VALUES(1,'intelligence','stopping',1,1)",
+            [],
+        )
+        .unwrap();
+        run_analysis(conn, 1, false);
+        let jobs = read_library_jobs(&init_db(&path).unwrap(), false).unwrap();
+        assert_eq!(jobs[0].status, "canceled");
+        assert_eq!(jobs[0].progress, 0);
     }
 
     #[test]

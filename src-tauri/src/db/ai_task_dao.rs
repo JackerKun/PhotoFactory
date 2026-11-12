@@ -75,8 +75,8 @@ pub fn claim_tasks(conn: &Connection, stage: &str, limit: i64) -> AppResult<Vec<
     )?;
     let ids = {
         let mut statement = tx.prepare(
-            "SELECT t.photo_id FROM ai_photo_tasks t JOIN photos p ON p.id=t.photo_id
-             WHERE t.stage=?1 AND t.status='pending' AND p.deleted=0
+            "SELECT t.photo_id FROM active_ai_photo_tasks t
+             WHERE t.stage=?1 AND t.status='pending'
              ORDER BY t.photo_id LIMIT ?2",
         )?;
         let mapped = statement.query_map(params![stage, limit.max(1)], |row| row.get(0))?;
@@ -155,7 +155,8 @@ fn update_failed_task(
 pub fn retry_failed(conn: &Connection) -> AppResult<usize> {
     Ok(conn.execute(
         "UPDATE ai_photo_tasks SET status='pending',lease_until=NULL,updated_at=?1
-         WHERE status='failed' AND EXISTS (SELECT 1 FROM photos p WHERE p.id=photo_id AND p.deleted=0)",
+         WHERE status='failed' AND EXISTS (SELECT 1 FROM active_ai_photo_tasks t
+             WHERE t.photo_id=ai_photo_tasks.photo_id AND t.stage=ai_photo_tasks.stage)",
         [now()],
     )?)
 }
@@ -166,6 +167,8 @@ pub fn requeue_oversized_jpeg_failures(conn: &Connection) -> AppResult<usize> {
         "UPDATE ai_photo_tasks SET status='pending',attempts=0,lease_until=NULL,error=NULL,updated_at=?1
          WHERE status IN ('pending','failed') AND stage IN (?2,?3)
            AND error LIKE 'Image size (% pixels) exceeds limit of % pixels, could be decompression bomb DOS attack.'
+           AND NOT EXISTS (SELECT 1 FROM photo_task_ignores i
+               WHERE i.photo_id=ai_photo_tasks.photo_id AND i.stage=ai_photo_tasks.stage)
            AND EXISTS (SELECT 1 FROM photos p WHERE p.id=photo_id AND p.deleted=0
              AND (LOWER(p.path) LIKE '%.jpg' OR LOWER(p.path) LIKE '%.jpeg'))",
         params![now(), FACE_STAGE, CLASSIFICATION_STAGE],
@@ -174,8 +177,8 @@ pub fn requeue_oversized_jpeg_failures(conn: &Connection) -> AppResult<usize> {
 
 pub fn has_pending_tasks(conn: &Connection, stage: &str) -> AppResult<bool> {
     Ok(conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM ai_photo_tasks t JOIN photos p ON p.id=t.photo_id
-         WHERE t.stage=?1 AND t.status='pending' AND p.deleted=0)",
+        "SELECT EXISTS (SELECT 1 FROM active_ai_photo_tasks t
+         WHERE t.stage=?1 AND t.status='pending')",
         [stage],
         |row| row.get(0),
     )?)
@@ -184,7 +187,7 @@ pub fn has_pending_tasks(conn: &Connection, stage: &str) -> AppResult<bool> {
 pub fn stage_counts(conn: &Connection, stage: &str) -> AppResult<(i64, i64, i64)> {
     conn.query_row(
         "SELECT COUNT(*),SUM(CASE WHEN status='done' THEN 1 ELSE 0 END),SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END)
-         FROM ai_photo_tasks t JOIN photos p ON p.id=t.photo_id WHERE t.stage=?1 AND p.deleted=0",
+         FROM active_ai_photo_tasks WHERE stage=?1",
         [stage],
         |row| Ok((row.get(0)?, row.get::<_, Option<i64>>(1)?.unwrap_or(0), row.get::<_, Option<i64>>(2)?.unwrap_or(0))),
     ).map_err(Into::into)

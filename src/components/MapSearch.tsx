@@ -59,7 +59,7 @@ export default function MapSearch({
 
   return (
     <div ref={rootRef} className={`relative ${className}`}>
-      <div className="flex gap-1.5">
+      <div className="ui-search">
         <input
           value={query}
           onChange={(event) => {
@@ -77,13 +77,13 @@ export default function MapSearch({
           }}
           placeholder={placeholder}
           aria-label="搜索地图地址"
-          className={`min-w-0 flex-1 border border-surface-secondary bg-surface-primary text-text-primary outline-none focus:border-accent-primary ${compact ? "rounded-md px-2 py-1 text-xs" : "rounded-lg px-3 py-2 text-sm"}`}
+          className={`ui-input flex-1 ${compact ? "text-xs" : ""}`}
         />
         <button
           type="button"
           onClick={() => void search()}
           disabled={searching || !query.trim()}
-          className={`rounded-md bg-accent-primary text-white disabled:opacity-40 ${compact ? "px-2.5 py-1 text-xs" : "px-4 py-2 text-sm"}`}
+          className={`ui-button-primary ${compact ? "text-xs" : ""}`}
         >
           {searching ? "搜索中…" : "搜索"}
         </button>
@@ -105,7 +105,7 @@ export default function MapSearch({
                   role="option"
                   key={`${result.lat}-${result.lng}-${index}`}
                   onClick={() => choose(result)}
-                  className="flex w-full items-start gap-2 rounded-lg px-3 py-2.5 text-left hover:bg-blue-50 focus:bg-blue-50"
+                  className="flex w-full items-start gap-2 rounded-lg px-3 py-2.5 text-left hover:bg-surface-primary focus:bg-surface-primary"
                 >
                   <svg className="mt-0.5 shrink-0 text-accent-link" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><path d="M20 10c0 5-8 12-8 12S4 15 4 10a8 8 0 1 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/></svg>
                   <span className="min-w-0">

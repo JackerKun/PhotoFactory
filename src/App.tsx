@@ -2,6 +2,7 @@ import { Component, useState, useEffect, useCallback, useMemo, useRef, type Reac
 import { HashRouter, Routes, Route, Navigate, useNavigate, useSearchParams, useLocation } from "react-router-dom";
 import { listen } from "@tauri-apps/api/event";
 import Sidebar from "./components/Sidebar";
+import AppUpdates from "./components/AppUpdates";
 import PhotoGrid from "./components/PhotoGrid";
 import PhotoDetail, { GpsBatchEditor } from "./components/PhotoDetail";
 import MapView from "./components/MapView";
@@ -12,6 +13,7 @@ import LibraryToolsView from "./components/LibraryToolsView";
 import ImportModal from "./components/ImportModal";
 import Lightbox from "./components/Lightbox";
 import { useStore } from "./hooks/usePhotos";
+import { usePreparePhotoMemories } from "./hooks/usePhotoMemories";
 import { useKeyboardNavigation } from "./hooks/useKeyboardNavigation";
 import type { AiProcessingStatus, ViewMode } from "./types";
 import * as api from "./api/tauri";
@@ -100,9 +102,10 @@ function FilterSync() {
 
 /** Shared layout: Sidebar + main content + detail panel + lightbox + import modal */
 function AppLayout({ children, viewMode }: { children: React.ReactNode; viewMode: ViewMode }) {
-  const { project, setProject, lightboxPhotoId, setLightboxPhotoId, selectedPhotoId, setSelectedPhotoId, photos, showGpsBatchEditor, setShowGpsBatchEditor, batchGpsPending, setBatchGpsPending, batchEditorPhotoId, setBatchEditorPhotoId } = useStore();
+  const { project, setProject, lightboxPhotoId, setLightboxPhotoId, selectedPhotoId, setSelectedPhotoId, photos, gpsBatchSession, closeGpsBatchEditor, batchGpsPending, setBatchGpsPending } = useStore();
   const updatePhotoInList = useStore((s) => s.updatePhotoInList);
   const navigate = useNavigate();
+  const hasStandalonePhotoDetail = viewMode === "grid" || viewMode === "albums" || viewMode === "map";
   const [showImport, setShowImport] = useState(!project);
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     const stored = Number(localStorage.getItem("photofactory.sidebarWidth"));
@@ -190,12 +193,12 @@ function AppLayout({ children, viewMode }: { children: React.ReactNode; viewMode
     return () => { disposed = true; if (timer) clearInterval(timer); };
   }, [project]);
 
-  // Close PhotoDetail when navigating away from grid/albums views
+  // The lightbox also uses the selection for its embedded detail panel.
   useEffect(() => {
-    if (viewMode !== "grid" && viewMode !== "albums" && viewMode !== "map" && selectedPhotoId) {
+    if (!hasStandalonePhotoDetail && !lightboxPhotoId && selectedPhotoId) {
       setSelectedPhotoId(null);
     }
-  }, [viewMode, selectedPhotoId, setSelectedPhotoId]);
+  }, [hasStandalonePhotoDetail, lightboxPhotoId, selectedPhotoId, setSelectedPhotoId]);
 
   // Listen for AI status events
   useEffect(() => {
@@ -250,6 +253,10 @@ function AppLayout({ children, viewMode }: { children: React.ReactNode; viewMode
     }
   }, [navigate]);
 
+  const sourcePhoto = gpsBatchSession?.sourcePhoto;
+  const gpsPhotos = sourcePhoto && !photos.some((photo) => photo.id === sourcePhoto.id)
+    ? [sourcePhoto, ...photos]
+    : photos;
   return (
     <div className="app-shell flex h-screen w-screen bg-bg-primary text-text-primary">
       <FilterSync />
@@ -262,7 +269,7 @@ function AppLayout({ children, viewMode }: { children: React.ReactNode; viewMode
         onPointerDown={(event) => beginResize("sidebar", event)}
       ><span className="absolute inset-y-0 -left-1 -right-1" /></div>
       <main className="flex-1 overflow-hidden">{children}</main>
-      {selectedPhotoId && !lightboxPhotoId && (
+      {hasStandalonePhotoDetail && selectedPhotoId && !lightboxPhotoId && (
         <>
           <div
             role="separator"
@@ -275,16 +282,18 @@ function AppLayout({ children, viewMode }: { children: React.ReactNode; viewMode
           <PhotoDetail width={detailWidth} photoId={selectedPhotoId} onClose={() => setSelectedPhotoId(null)} />
         </>
       )}
-      {lightboxPhotoId && <Lightbox photoId={lightboxPhotoId} onClose={() => setLightboxPhotoId(null)} />}
+      {lightboxPhotoId && !gpsBatchSession && <Lightbox photoId={lightboxPhotoId} onClose={() => setLightboxPhotoId(null)} />}
       {showImport && <ImportModal onImported={handleImported} onClose={() => setShowImport(false)} />}
-      {showGpsBatchEditor && (
-        <GpsEditorErrorBoundary onClose={() => setShowGpsBatchEditor(false)}>
+      {gpsBatchSession && (
+        <GpsEditorErrorBoundary onClose={closeGpsBatchEditor}>
         <GpsBatchEditor
-          photos={photos}
-          currentPhotoId={batchEditorPhotoId}
+          photos={gpsPhotos}
+          currentPhotoId={gpsBatchSession.photoId}
+          initialMode={gpsBatchSession.mode}
+          initialSelectedIds={gpsBatchSession.selectedPhotoIds}
           photoLocations={(() => {
             const map = new Map<number, { lat: number; lng: number }>(
-              photos
+              gpsPhotos
                 .filter((p) => p.latitude != null && p.longitude != null)
                 .map((p) => [p.id!, { lat: p.latitude!, lng: p.longitude! }])
             );
@@ -309,11 +318,7 @@ function AppLayout({ children, viewMode }: { children: React.ReactNode; viewMode
             updates.forEach(({ photoId }) => newPending.delete(photoId));
             setBatchGpsPending(newPending);
           }}
-          onClose={() => {
-            setShowGpsBatchEditor(false);
-            setBatchGpsPending(new Map());
-            setBatchEditorPhotoId(0);
-          }}
+          onClose={closeGpsBatchEditor}
         />
         </GpsEditorErrorBoundary>
       )}
@@ -324,6 +329,7 @@ function AppLayout({ children, viewMode }: { children: React.ReactNode; viewMode
 function GridPage() {
   const { photos, thumbnailSize, lightboxPhotoId, selectedPhotoId, setSelectedPhotoId } = useStore();
   const project = useStore((s) => s.project);
+  const gpsEditorOpen = useStore((s) => s.gpsBatchSession !== null);
   const setLightboxPhotoId = useStore((s) => s.setLightboxPhotoId);
   const updatePhotoInList = useStore((s) => s.updatePhotoInList);
 
@@ -357,7 +363,7 @@ function GridPage() {
     onSelectPhoto: handleSelectPhoto,
     photoIds,
     columnCount,
-    enabled: !!project,
+    enabled: !!project && !gpsEditorOpen,
     isLightboxOpen: !!lightboxPhotoId,
     onOpenPhoto: handleOpenPhoto,
     onRatePhoto: handleRatePhoto,
@@ -424,18 +430,21 @@ function LibraryPage() {
 }
 
 export default function App() {
+  usePreparePhotoMemories();
   return (
-    <HashRouter>
-      <Routes>
-        <Route path="/" element={<GridPage />} />
-        <Route path="/grid" element={<GridPage />} />
-        <Route path="/map" element={<MapPage />} />
-        <Route path="/faces" element={<FacesPage />} />
-        <Route path="/tags" element={<TagsPage />} />
-        <Route path="/albums" element={<AlbumsPage />} />
-        <Route path="/library" element={<LibraryPage />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
-    </HashRouter>
+    <AppUpdates>
+      <HashRouter>
+        <Routes>
+          <Route path="/" element={<GridPage />} />
+          <Route path="/grid" element={<GridPage />} />
+          <Route path="/map" element={<MapPage />} />
+          <Route path="/faces" element={<FacesPage />} />
+          <Route path="/tags" element={<TagsPage />} />
+          <Route path="/albums" element={<AlbumsPage />} />
+          <Route path="/library" element={<LibraryPage />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </HashRouter>
+    </AppUpdates>
   );
 }

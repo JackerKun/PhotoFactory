@@ -482,7 +482,9 @@ pub fn get_photos_in_same_directory(
 
 pub fn get_pending_thumbnails(conn: &rusqlite::Connection, limit: i64) -> AppResult<Vec<Photo>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {} FROM photos WHERE thumbnail_status = 0 AND deleted = 0 LIMIT ?",
+        "SELECT {} FROM photos WHERE thumbnail_status=0 AND deleted=0
+         AND NOT EXISTS (SELECT 1 FROM photo_task_ignores i WHERE i.photo_id=photos.id AND i.stage='thumbnail')
+         LIMIT ?",
         PHOTO_COLS
     ))?;
     let photos: Vec<Photo> = stmt
@@ -490,6 +492,15 @@ pub fn get_pending_thumbnails(conn: &rusqlite::Connection, limit: i64) -> AppRes
         .filter_map(|r| r.ok())
         .collect();
     Ok(photos)
+}
+
+pub fn count_pending_thumbnails(conn: &rusqlite::Connection) -> AppResult<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM photos WHERE thumbnail_status=0 AND deleted=0
+         AND NOT EXISTS (SELECT 1 FROM photo_task_ignores i WHERE i.photo_id=photos.id AND i.stage='thumbnail')",
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 pub fn get_pending_ai_photos(conn: &rusqlite::Connection, limit: i64) -> AppResult<Vec<Photo>> {
@@ -530,7 +541,10 @@ pub fn get_pending_classification_photos(
 
 pub fn get_pending_ai_count(conn: &rusqlite::Connection) -> AppResult<i64> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM photos WHERE (face_status = 0 OR classification_status = 0) AND deleted = 0",
+        "SELECT COUNT(*) FROM photos WHERE deleted=0 AND (
+            (face_status=0 AND NOT EXISTS (SELECT 1 FROM photo_task_ignores i WHERE i.photo_id=photos.id AND i.stage='face_detection'))
+            OR (classification_status=0 AND NOT EXISTS (SELECT 1 FROM photo_task_ignores i WHERE i.photo_id=photos.id AND i.stage='classification'))
+         )",
         [],
         |row| row.get(0),
     )?;
@@ -549,11 +563,16 @@ pub fn update_thumbnail_status(
     Ok(())
 }
 
-/// Get all active photo IDs, paths, and file sizes for thumbnail rebuild check.
-pub fn get_all_photo_paths(conn: &rusqlite::Connection) -> AppResult<Vec<(i64, String, i64)>> {
-    let mut stmt = conn.prepare("SELECT id, path, file_size FROM photos WHERE deleted = 0")?;
+/// Get photo IDs, paths, and file sizes for thumbnail rebuild.
+pub fn get_thumbnail_rebuild_candidates(
+    conn: &rusqlite::Connection,
+) -> AppResult<Vec<(i64, String, i64, bool)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id,path,file_size,COALESCE(thumbnail_status=-1,0) FROM photos WHERE deleted=0
+         AND NOT EXISTS (SELECT 1 FROM photo_task_ignores i WHERE i.photo_id=photos.id AND i.stage='thumbnail')",
+    )?;
     let rows: Vec<_> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .filter_map(|r| r.ok())
         .collect();
     Ok(rows)

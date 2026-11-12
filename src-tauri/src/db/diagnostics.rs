@@ -383,7 +383,7 @@ mod tests {
         let (db_path, _conn) = test_db();
         let indexes = list_indexes(&db_path).unwrap();
         // Includes explicit application indexes plus migration-added indexes.
-        assert_eq!(indexes.len(), 29);
+        assert_eq!(indexes.len(), 31);
         let _ = fs::remove_dir_all(db_path.parent().unwrap());
     }
 
@@ -393,7 +393,7 @@ mod tests {
         let report = run_diagnostics(&db_path).unwrap();
         assert!(report.integrity.ok);
         assert_eq!(report.integrity.photo_count, 0);
-        assert_eq!(report.index_info.len(), 29);
+        assert_eq!(report.index_info.len(), 31);
         let _ = fs::remove_dir_all(db_path.parent().unwrap());
     }
 }

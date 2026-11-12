@@ -11,16 +11,17 @@ interface Props {
   photo: Photo;
   onClick: () => void;
   onDoubleClick?: () => void;
-  size: number;
+  size?: number;
   height?: number;
   shape?: "square" | "proportional";
+  showFilename?: boolean;
   isSelected?: boolean;
   ratingSelectionMode?: boolean;
   ratingSelected?: boolean;
   onToggleRatingSelection?: () => void;
 }
 
-export default React.memo(function PhotoCard({ photo, onClick, onDoubleClick, size, height, shape = "square", isSelected = false, ratingSelectionMode = false, ratingSelected = false, onToggleRatingSelection }: Props) {
+export default React.memo(function PhotoCard({ photo, onClick, onDoubleClick, size, height, shape = "square", showFilename = true, isSelected = false, ratingSelectionMode = false, ratingSelected = false, onToggleRatingSelection }: Props) {
   const thumbnailProgress = useStore((state) => state.thumbnailProcessingStatus?.processed ?? 0);
   const [thumbnailRetry, setThumbnailRetry] = useState(0);
   const [imageError, setImageError] = useState("图片加载失败");
@@ -182,7 +183,7 @@ export default React.memo(function PhotoCard({ photo, onClick, onDoubleClick, si
           ? "ring-2 ring-accent-primary"
           : "hover:ring-2 hover:ring-accent-primary"
       }`}
-      style={{ width: "100%", height: cardHeight }}
+      style={{ width: "100%", height: cardHeight, aspectRatio: cardHeight == null ? "1 / 1" : undefined }}
       onClick={handleCardClick}
       onDoubleClick={handleCardDoubleClick}
       onContextMenu={handleContextMenu}
@@ -235,9 +236,9 @@ export default React.memo(function PhotoCard({ photo, onClick, onDoubleClick, si
           ★ {photo.rating}
         </div>
       )}
-      <div className="absolute bottom-0 left-0 right-0 bg-black/60 px-1 py-0.5">
+      {showFilename && <div className="absolute bottom-0 left-0 right-0 bg-black/60 px-1 py-0.5">
         <p className="text-white text-xs truncate">{photo.filename}</p>
-      </div>
+      </div>}
 
       {menuPos && (
         <ContextMenu

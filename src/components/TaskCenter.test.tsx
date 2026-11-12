@@ -13,10 +13,15 @@ vi.mock("../api/tauri", () => ({
   setThumbnailPerformance: vi.fn(async () => {}),
   getLibraryJobs: vi.fn(async () => []),
   controlAiPipeline: vi.fn(async () => {}),
+  retryLibraryAnalysis: vi.fn(),
   getTaskErrors: vi.fn(async () => ({
-    entries: [], next_before: null, retryable: 0, failed_faces: 1, failed_classifications: 0,
+    groups: [], stages: [], next_before: null, retryable: 0, failed_faces: 1, failed_classifications: 0, ignored_count: 0,
     platform: "windows", architecture: "x86_64", version: "0.1.4",
   })),
+  getTaskErrorPhotos: vi.fn(),
+  getIgnoredTaskPhotos: vi.fn(),
+  ignoreTaskErrorPhotos: vi.fn(),
+  restoreTaskPhoto: vi.fn(),
 }));
 afterEach(() => { cleanup(); useStore.setState({ project: null, aiProcessingStatus: null, thumbnailProcessingStatus: null }); vi.restoreAllMocks(); });
 it("keeps failed thumbnail and AI jobs visible in one task dialog and retries AI", async () => {
@@ -31,6 +36,7 @@ it("keeps failed thumbnail and AI jobs visible in one task dialog and retries AI
   await waitFor(() => expect(performance).toHaveValue("balanced"));
   fireEvent.change(performance, { target: { value: "full" } });
   await waitFor(() => expect(api.setThumbnailPerformance).toHaveBeenCalledWith("full"));
+  fireEvent.click(screen.getByText(/^当前提示/));
   expect(screen.getByText("无法读取原文件")).toBeInTheDocument();
   expect(screen.getByText("模型无法加载")).toBeInTheDocument();
   expect(await screen.findByText("人脸检测：DirectML (GPU)")).toBeInTheDocument();
@@ -38,31 +44,69 @@ it("keeps failed thumbnail and AI jobs visible in one task dialog and retries AI
   await waitFor(() => expect(api.controlAiPipeline).toHaveBeenCalledWith("retry"));
 });
 
-it("shows a previous batch interruption after the pipeline resumes and copies its files and cause", async () => {
+it("retries an index job by ID and replaces the stopped card with the active one", async () => {
+  const stopped = { id: 12, job_type: "intelligence+ocr", status: "canceled", progress: 4,
+    total: 20, message: "", error: null, created_at: 1, updated_at: 1 };
+  vi.mocked(api.getLibraryJobs).mockResolvedValueOnce([stopped])
+    .mockResolvedValueOnce([{ ...stopped, status: "running", progress: 0 }]);
+  vi.mocked(api.retryLibraryAnalysis).mockResolvedValueOnce(stopped.id);
+  useStore.setState({ project: { root_path: "/test" } as Project });
+  render(<TaskCenter />);
+  fireEvent.click(screen.getByRole("button", { name: "后台任务" }));
+  const retry = await screen.findByRole("button", { name: "重试", exact: true });
+  fireEvent.click(retry);
+  fireEvent.click(retry);
+  await waitFor(() => expect(api.retryLibraryAnalysis).toHaveBeenCalledExactlyOnceWith(stopped.id));
+  expect(screen.getAllByRole("heading", { name: "智能索引与文字识别" })).toHaveLength(1);
+  await waitFor(() => expect(screen.queryByRole("button", { name: "重试", exact: true })).not.toBeInTheDocument());
+});
+
+it("groups repeated failures and lets the user inspect, ignore and restore photos", async () => {
   const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
   const writeText = vi.fn(async () => {});
   Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
   try {
     vi.mocked(api.getAiPipelineStatus).mockResolvedValueOnce({ status: "running", stage: "face_detection", processed: 655, total: 3560, failed: 1 });
-    vi.mocked(api.getTaskErrors).mockResolvedValueOnce({
-      entries: [{
-        id: 1, stage: "face_detection", kind: "batch", occurred_at: 1760000000,
+    const key = { stage: "face_detection", reason: "HTTP error", through: 5 };
+    const photo = { photo_id: 42, filename: "DSC001.jpg", path: "D:\\Photos\\DSC001.jpg", attempts: 2 };
+    const details = { photos: [{ ...photo, ignored: false, can_ignore: true }], total: 1, can_ignore: 1, next_after: null };
+    const page: api.TaskErrorPage = {
+      groups: [{
+        key, occurrences: 5, occurred_at: 1760000000,
         message: "原因：Connection reset by peer (os error 10054)",
-        photos: [{ filename: "DSC001.jpg", path: "D:\\Photos\\DSC001.jpg", attempts: 2 }],
       }],
-      next_before: null, retryable: 1, failed_faces: 0, failed_classifications: 0,
+      stages: ["face_detection"], next_before: null, retryable: 0, failed_faces: 1, failed_classifications: 0, ignored_count: 0,
       platform: "windows", architecture: "x86_64", version: "0.1.4",
-    });
+    };
+    vi.mocked(api.getTaskErrors).mockResolvedValueOnce(page)
+      .mockResolvedValueOnce({ ...page, failed_faces: 0, ignored_count: 1 });
+    vi.mocked(api.getTaskErrorPhotos).mockResolvedValueOnce(details)
+      .mockResolvedValueOnce({ ...details, photos: [{ ...photo, ignored: true, can_ignore: false }], can_ignore: 0 });
+    vi.mocked(api.ignoreTaskErrorPhotos).mockResolvedValueOnce(1);
+    vi.mocked(api.getIgnoredTaskPhotos)
+      .mockResolvedValueOnce({ photos: [{ ...photo, stage: key.stage }], next_offset: null })
+      .mockResolvedValueOnce({ photos: [], next_offset: null });
+    vi.mocked(api.restoreTaskPhoto).mockResolvedValueOnce(1);
     useStore.setState({ project: { root_path: "/test" } as Project });
     render(<TaskCenter />);
     fireEvent.click(screen.getByRole("button", { name: "后台任务" }));
-    expect(await screen.findByText("识别人脸 · 批次中断 · 1 张")).toBeInTheDocument();
+    const group = await screen.findByRole("button", { name: /识别人脸 · 5 条记录/ });
+    expect(group).toHaveAttribute("aria-expanded", "false");
+    expect(api.getTaskErrorPhotos).not.toHaveBeenCalled();
     expect(screen.getByText(/已跳过失败的照片/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重试失败" })).toBeDisabled();
-    expect(screen.getByText("D:\\Photos\\DSC001.jpg")).toBeInTheDocument();
+    fireEvent.click(group);
+    expect(await screen.findByText(photo.path)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "复制本页诊断" }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith(expect.stringContaining("Connection reset by peer")));
-    expect(writeText).toHaveBeenCalledWith(expect.stringContaining("D:\\Photos\\DSC001.jpg"));
+    expect(writeText).toHaveBeenCalledWith(expect.stringContaining(photo.path));
+    fireEvent.click(screen.getByRole("button", { name: "忽略 DSC001.jpg" }));
+    await waitFor(() => expect(api.ignoreTaskErrorPhotos).toHaveBeenCalledWith("/test", key, 42));
+    expect(await screen.findByText("已忽略", { exact: true })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "已忽略照片" }));
+    fireEvent.click(await screen.findByRole("button", { name: "取消忽略 DSC001.jpg的识别人脸" }));
+    await waitFor(() => expect(api.restoreTaskPhoto).toHaveBeenCalledWith("/test", "face_detection", 42));
+    expect(await screen.findByText("暂无已忽略的照片")).toBeInTheDocument();
   } finally {
     if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
     else Reflect.deleteProperty(navigator, "clipboard");

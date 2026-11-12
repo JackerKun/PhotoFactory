@@ -6,8 +6,8 @@ use std::time::Duration;
 use photofactory::commands::ai::AiWorkerState;
 use photofactory::commands::project::{self, try_load_last_project, AppState};
 use photofactory::commands::{
-    ai, diagnostics, faces, geo_tags, library, map, photos, shell, smart_albums, tag_rules, tags,
-    time_tags,
+    ai, diagnostics, faces, geo_tags, library, map, memory_video, photos, shell, smart_albums, tag_rules, tags,
+    time_tags, updates,
 };
 use photofactory::thumbnail::processor::ThumbnailProcessor;
 use tauri::{Listener, Manager};
@@ -27,6 +27,7 @@ fn main() {
             process: Mutex::new(None),
             pipeline_running: AtomicBool::new(false),
         })
+        .manage(memory_video::MemoryVideoState::default())
         .setup(|app| {
             if let Some(project) = app.state::<AppState>().project.lock().unwrap().as_ref() {
                 if let Err(error) = project::allow_project_assets(app.handle(), project) {
@@ -42,6 +43,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            updates::cmd_check_for_update,
             project::cmd_create_project,
             project::cmd_open_project,
             project::cmd_scan_project,
@@ -138,6 +140,10 @@ fn main() {
             ai::cmd_get_ai_runtime,
             ai::cmd_get_ai_pipeline_status,
             ai::cmd_get_task_errors,
+            ai::cmd_get_task_error_photos,
+            ai::cmd_get_ignored_task_photos,
+            ai::cmd_ignore_task_error_photos,
+            ai::cmd_restore_task_photo,
             ai::cmd_auto_ai_pipeline,
             diagnostics::cmd_run_diagnostics,
             diagnostics::cmd_check_integrity,
@@ -159,7 +165,13 @@ fn main() {
             time_tags::cmd_run_device_tagging,
             time_tags::cmd_run_event_tagging,
             smart_albums::cmd_get_smart_albums,
+            smart_albums::cmd_get_photo_memories,
+            smart_albums::cmd_set_photo_memory_preferences,
+            memory_video::cmd_begin_memory_video,
+            memory_video::cmd_append_memory_video,
+            memory_video::cmd_finish_memory_video,
             smart_albums::cmd_get_group_photos,
+            smart_albums::cmd_get_named_photo_groups,
             smart_albums::cmd_create_person_combination,
             smart_albums::cmd_get_smart_album_photos,
             smart_albums::cmd_regenerate_smart_albums,
@@ -173,6 +185,7 @@ fn main() {
             library::cmd_get_library_jobs,
             library::cmd_control_library_job,
             library::cmd_start_library_analysis,
+            library::cmd_retry_library_analysis,
             library::cmd_smart_search,
             library::cmd_get_duplicate_groups,
             library::cmd_get_raw_jpeg_stacks,

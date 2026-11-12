@@ -38,6 +38,22 @@ function photo(id: number, latitude: number | null, longitude: number | null): P
 }
 
 describe("GpsBatchEditor", () => {
+  it("starts in shared-location mode with the checked photos in the current list", () => {
+    render(<GpsBatchEditor
+      photos={[photo(1, null, null), photo(2, 31.2, 121.5), photo(3, null, null)]}
+      currentPhotoId={2}
+      initialMode="batch"
+      initialSelectedIds={[2, 3, 999]}
+      photoLocations={new Map([[2, { lat: 31.2, lng: 121.5 }]])}
+      onApply={vi.fn()}
+      onApplyIndividual={vi.fn()}
+      onClose={vi.fn()}
+    />);
+
+    expect(screen.getByRole("button", { name: "统一位置", pressed: true })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "应用到 2 张" })).toBeEnabled();
+  });
+
   it("opens in per-photo mode and switches to shared batch mode", () => {
     const photos = [photo(1, 31.2, 121.5), photo(2, null, null)];
     render(<GpsBatchEditor

@@ -34,7 +34,7 @@ export default function CachedTileLayer({ layer: requestedLayer }: { layer?: Map
     retry.type = "button";
     retry.title = "重试加载地图";
     retry.setAttribute("aria-label", retry.title);
-    retry.className = "ui-button h-8 w-8 shrink-0 p-0";
+    retry.className = "ui-button ui-icon-button";
     retry.innerHTML = `<svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="${iconPaths.retry}"/></svg>`;
     retry.hidden = true;
     status.append(statusText, retry);

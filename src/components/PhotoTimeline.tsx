@@ -117,18 +117,14 @@ export default React.memo(function PhotoTimeline() {
   };
 
   return (
-    <div ref={rootRef} className="relative">
+    <div ref={rootRef} className="photo-toolbar-anchor relative">
       <div className="flex items-center gap-1">
         <button
           type="button"
           onClick={() => setOpen((value) => !value)}
           aria-expanded={open}
           aria-haspopup="dialog"
-          className={`flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-xs font-medium transition-colors ${
-            filter.year
-              ? "bg-accent-primary text-white"
-              : "bg-surface-primary/80 text-text-secondary hover:text-text-primary"
-          }`}
+          className={filter.year ? "ui-button-primary" : "ui-button"}
           title="按拍摄年月查找照片"
         >
           <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
@@ -141,7 +137,7 @@ export default React.memo(function PhotoTimeline() {
           <button
             type="button"
             onClick={() => selectTime(undefined, undefined)}
-            className="rounded-md p-1.5 text-text-muted hover:bg-surface-primary hover:text-text-primary"
+            className="ui-button ui-icon-button"
             aria-label="清除时间筛选"
             title="清除时间筛选"
           >
@@ -154,7 +150,7 @@ export default React.memo(function PhotoTimeline() {
         <div
           role="dialog"
           aria-label="照片时间轴"
-          className="absolute left-0 top-full z-40 mt-2 w-[320px] overflow-hidden rounded-2xl border border-surface-secondary bg-bg-secondary shadow-2xl"
+          className="photo-toolbar-popover absolute left-0 top-full z-40 mt-2 w-[320px] overflow-hidden rounded-2xl border border-surface-secondary bg-bg-secondary shadow-2xl"
         >
           <div className="border-b border-surface-secondary p-3">
             <div className="text-sm font-semibold text-text-primary">按时间查找</div>
@@ -164,7 +160,7 @@ export default React.memo(function PhotoTimeline() {
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               placeholder="搜索年份或月份，如 2026-08"
-              className="mt-3 w-full rounded-lg border border-surface-secondary bg-bg-primary px-3 py-2 text-sm text-text-primary outline-none focus:border-accent-primary"
+              className="ui-input mt-3 w-full"
             />
           </div>
 

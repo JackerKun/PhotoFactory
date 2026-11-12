@@ -111,14 +111,82 @@ pub async fn cmd_get_ai_pipeline_status(state: State<'_, AppState>) -> AppResult
 
 #[tauri::command]
 pub async fn cmd_get_task_errors(
+    stage: Option<String>,
     before: Option<i64>,
     state: State<'_, AppState>,
 ) -> AppResult<task_error_dao::TaskErrorPage> {
     use crate::commands::project::{current_project, read_project_db};
     read_project_db(current_project(&state)?, move |conn| {
-        task_error_dao::page(conn, before)
+        task_error_dao::page(conn, stage.as_deref(), before)
     })
     .await
+}
+
+#[tauri::command]
+pub async fn cmd_get_task_error_photos(
+    key: task_error_dao::TaskErrorGroupKey,
+    after: Option<String>,
+    state: State<'_, AppState>,
+) -> AppResult<task_error_dao::TaskErrorGroupPhotos> {
+    use crate::commands::project::{current_project, read_project_db};
+    read_project_db(current_project(&state)?, move |conn| {
+        task_error_dao::group_photos(conn, &key, after.as_deref())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn cmd_get_ignored_task_photos(
+    offset: i64,
+    state: State<'_, AppState>,
+) -> AppResult<task_error_dao::IgnoredTaskPhotos> {
+    use crate::commands::project::{current_project, read_project_db};
+    read_project_db(current_project(&state)?, move |conn| {
+        task_error_dao::ignored_photos(conn, offset)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn cmd_ignore_task_error_photos(
+    project_path: String,
+    key: task_error_dao::TaskErrorGroupKey,
+    photo_id: Option<i64>,
+    state: State<'_, AppState>,
+) -> AppResult<usize> {
+    let project = crate::commands::project::current_project(&state)?;
+    if project.root_path != project_path {
+        return Err(AppError::Project(
+            "照片库已切换，请重新打开后台任务。".into(),
+        ));
+    }
+    tokio::task::spawn_blocking(move || {
+        let conn = crate::db::connection::init_db(&project.db_path())?;
+        task_error_dao::ignore_group_photos(&conn, &key, photo_id)
+    })
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))?
+}
+
+#[tauri::command]
+pub async fn cmd_restore_task_photo(
+    project_path: String,
+    stage: String,
+    photo_id: i64,
+    state: State<'_, AppState>,
+) -> AppResult<usize> {
+    let project = crate::commands::project::current_project(&state)?;
+    if project.root_path != project_path {
+        return Err(AppError::Project(
+            "照片库已切换，请重新打开后台任务。".into(),
+        ));
+    }
+    tokio::task::spawn_blocking(move || {
+        let conn = crate::db::connection::init_db(&project.db_path())?;
+        task_error_dao::restore_photo(&conn, &stage, photo_id)
+    })
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))?
 }
 
 async fn record_ai_batch_failure(
@@ -197,6 +265,19 @@ fn read_pipeline_status(conn: &rusqlite::Connection) -> AppResult<AiPipelineStat
         [],
         |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
     )?;
+    let (total, processed, failed) = match stage.as_str() {
+        ai_task_dao::FACE_STAGE | ai_task_dao::CLASSIFICATION_STAGE => {
+            let (total, done, failed) = ai_task_dao::stage_counts(conn, &stage)?;
+            (total, done + failed, failed)
+        }
+        "done" => (
+            total,
+            processed,
+            ai_task_dao::stage_counts(conn, ai_task_dao::FACE_STAGE)?.2
+                + ai_task_dao::stage_counts(conn, ai_task_dao::CLASSIFICATION_STAGE)?.2,
+        ),
+        _ => (total, processed, failed),
+    };
     let elapsed = stage_started_at
         .map(|started| (chrono::Utc::now().timestamp() - started).max(1))
         .unwrap_or(1);

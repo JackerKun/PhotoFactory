@@ -3,6 +3,7 @@ import DirectoryTree from "./DirectoryTree";
 import Icon, { type IconName } from "./Icon";
 import TaskCenter from "./TaskCenter";
 import ThemeSwitcher from "./ThemeSwitcher";
+import { AppUpdateActions } from "./AppUpdates";
 import FormatFilterPanel from "./FormatFilterPanel";
 import type { ViewMode, Project } from "../types";
 import { useStore } from "../hooks/usePhotos";
@@ -93,18 +94,16 @@ export default React.memo(function Sidebar({ viewMode, onViewModeChange, project
 
   return (
     <aside className="mac-sidebar flex-none bg-bg-secondary border-r border-surface-secondary flex flex-col overflow-hidden" style={{ width }}>
-      <div className="p-4 border-b border-surface-secondary">
-        <div className="flex items-center justify-between mb-1">
-          <h1 className="text-lg font-semibold tracking-tight text-text-primary">PhotoFactory</h1>
-        </div>
-        {project && (
+      {project && (
+        <div className="border-b border-surface-secondary px-4 py-3">
           <div className="flex items-center justify-between">
-            <p className="text-xs text-text-secondary truncate flex-1 mr-2" title={project.name}>
+            <p className="mr-2 flex-1 truncate text-sm font-medium text-text-primary" title={project.name}>
               {project.name}
             </p>
             <div className="relative">
-              <button onClick={() => setShowDropdown(!showDropdown)}
-                className="text-xs text-text-muted hover:text-text-primary p-1" title="照片库操作">
+              <button type="button" onClick={() => setShowDropdown(!showDropdown)}
+                className="flex h-8 w-8 items-center justify-center rounded-lg text-text-muted hover:bg-surface-primary hover:text-text-primary"
+                title="照片库操作" aria-label="照片库操作" aria-expanded={showDropdown}>
                 ⋮
               </button>
               {showDropdown && (
@@ -132,13 +131,13 @@ export default React.memo(function Sidebar({ viewMode, onViewModeChange, project
               )}
             </div>
           </div>
-        )}
-      </div>
+        </div>
+      )}
       <nav className="p-2">
         {navItems.map((item) => (
           <button key={item.mode} onClick={() => onViewModeChange(item.mode)}
-            className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors ${
-              viewMode === item.mode ? "bg-accent-primary text-white shadow-sm" : "text-text-secondary hover:bg-bg-secondary/70"
+            className={`sidebar-nav-button w-full flex items-center gap-2 px-3 rounded-lg text-sm transition-colors ${
+              viewMode === item.mode ? "bg-accent-primary text-white" : "text-text-secondary hover:bg-surface-primary"
             }`}>
             <Icon name={item.icon as IconName} /><span>{item.label}</span>
           </button>
@@ -153,10 +152,14 @@ export default React.memo(function Sidebar({ viewMode, onViewModeChange, project
         </div>
       )}
 
-      <div className="mt-auto"><ThemeSwitcher /></div>
+      <div className="mt-auto">
+        <AppUpdateActions />
+        <ThemeSwitcher />
+      </div>
 
       {showFormatPanel && project && (
         <FormatFilterPanel
+          mode="scan"
           currentExtensions={project.enabled_extensions?.length > 0 ? project.enabled_extensions : DEFAULT_EXTENSIONS}
           onConfirm={handleFormatConfirm}
           onCancel={() => setShowFormatPanel(false)}
