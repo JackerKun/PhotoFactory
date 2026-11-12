@@ -137,6 +137,7 @@ fn main() {
             ai::cmd_worker_health,
             ai::cmd_get_ai_runtime,
             ai::cmd_get_ai_pipeline_status,
+            ai::cmd_get_task_errors,
             ai::cmd_auto_ai_pipeline,
             diagnostics::cmd_run_diagnostics,
             diagnostics::cmd_check_integrity,

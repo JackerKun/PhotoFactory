@@ -9,7 +9,7 @@ use tauri::{Emitter, State};
 use crate::ai_worker::client::AiWorkerClient;
 use crate::commands::project::{get_conn, AppState};
 use crate::commands::tag_rules;
-use crate::db::{ai_task_dao, classification_dao, face_dao, photo_dao};
+use crate::db::{ai_task_dao, classification_dao, face_dao, photo_dao, task_error_dao};
 use crate::error::{AppError, AppResult};
 use crate::models::AiClassification;
 
@@ -107,6 +107,70 @@ pub struct AiPipelineStatus {
 pub async fn cmd_get_ai_pipeline_status(state: State<'_, AppState>) -> AppResult<AiPipelineStatus> {
     use crate::commands::project::{current_project, read_project_db};
     read_project_db(current_project(&state)?, read_pipeline_status).await
+}
+
+#[tauri::command]
+pub async fn cmd_get_task_errors(
+    before: Option<i64>,
+    state: State<'_, AppState>,
+) -> AppResult<task_error_dao::TaskErrorPage> {
+    use crate::commands::project::{current_project, read_project_db};
+    read_project_db(current_project(&state)?, move |conn| {
+        task_error_dao::page(conn, before)
+    })
+    .await
+}
+
+async fn record_ai_batch_failure(
+    conn: &mut rusqlite::Connection,
+    stage: &str,
+    photos: &[crate::models::Photo],
+    error: AppError,
+    worker: State<'_, AiWorkerState>,
+    elapsed: Duration,
+) -> AppResult<()> {
+    use std::error::Error;
+    let message = error.to_string();
+    let mut detail = message.clone();
+    if let AppError::Http(http) = &error {
+        if http.is_timeout() {
+            detail.push_str("\n错误类型：本地 AI 请求超时");
+        } else if http.is_connect() {
+            detail.push_str("\n错误类型：无法连接本地 AI 服务");
+        } else if http.is_body() {
+            detail.push_str("\n错误类型：读取本地 AI 响应失败");
+        }
+        let mut source = http.source();
+        while let Some(cause) = source {
+            detail.push_str(&format!("\n原因：{cause}"));
+            source = cause.source();
+        }
+    }
+    let (process, exited) = match worker.process.lock().unwrap().as_mut() {
+        Some(child) => {
+            let pid = child.id();
+            match child.try_wait() {
+                Ok(Some(status)) => (format!("PID {pid}，已退出（{status}）"), true),
+                Ok(None) => (format!("PID {pid}，进程仍在运行"), false),
+                Err(error) => (format!("PID {pid}，无法读取进程状态：{error}"), false),
+            }
+        }
+        None => ("未记录本地 AI 进程".into(), false),
+    };
+    detail.push_str(&format!(
+        "\n请求用时：{:.2} 秒\nAI 服务：127.0.0.1:{} · {process}",
+        elapsed.as_secs_f64(),
+        worker.port
+    ));
+    let ids: Vec<_> = photos.iter().filter_map(|photo| photo.id).collect();
+    ai_task_dao::mark_batch_failed(conn, &ids, stage, &message, &detail)?;
+    if exited {
+        let port = worker.port;
+        cmd_start_ai_worker(port, worker)
+            .await
+            .map_err(|error| AppError::AiWorker(format!("本地 AI 服务重启失败：{error}")))?;
+    }
+    Ok(())
 }
 
 fn read_pipeline_status(conn: &rusqlite::Connection) -> AppResult<AiPipelineStatus> {
@@ -249,7 +313,9 @@ pub async fn cmd_start_ai_worker(port: u16, state: State<'_, AiWorkerState>) -> 
     }
 
     // First launch may include macOS verification of bundled native libraries.
-    let ready = wait_for_health(port, 120).await;
+    let ready = tokio::time::timeout(Duration::from_secs(60), wait_for_health(port))
+        .await
+        .unwrap_or(false);
     if ready {
         *state.client.lock().unwrap() = Some(AiWorkerClient::new(port));
         Ok(format!(
@@ -383,18 +449,25 @@ pub(crate) fn find_ai_worker_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Poll /health endpoint until ready or timeout
-async fn wait_for_health(port: u16, max_retries: usize) -> bool {
+async fn wait_for_health(port: u16) -> bool {
+    let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{}/health", port);
-    for i in 0..max_retries {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
         tokio::time::sleep(Duration::from_millis(500)).await;
-        if let Ok(resp) = reqwest::get(&url).await {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        {
             if resp.status().is_success() {
-                println!("AI worker ready after {} retries", i + 1);
+                println!("AI worker ready after {attempts} attempts");
                 return true;
             }
         }
     }
-    false
 }
 
 #[tauri::command]
@@ -403,7 +476,7 @@ pub async fn cmd_run_ai_classification(
     state: State<'_, AppState>,
     worker_state: State<'_, AiWorkerState>,
 ) -> AppResult<usize> {
-    let conn = get_conn(state.clone())?;
+    let mut conn = get_conn(state.clone())?;
     let project = {
         let guard = state.project.lock().unwrap();
         guard
@@ -415,7 +488,10 @@ pub async fn cmd_run_ai_classification(
     let claimed = ai_task_dao::claim_tasks(&conn, ai_task_dao::CLASSIFICATION_STAGE, limit)?;
     let pending = claimed
         .iter()
-        .filter_map(|id| photo_dao::get_photo_by_id(&conn, *id).ok().flatten())
+        .map(|id| photo_dao::get_photo_by_id(&conn, *id))
+        .collect::<AppResult<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .collect::<Vec<_>>();
 
     if pending.is_empty() {
@@ -448,33 +524,48 @@ pub async fn cmd_run_ai_classification(
     for chunk in pending.chunks(batch_limit) {
         let paths: Vec<String> = chunk.iter().map(|p| p.path.clone()).collect();
         println!("Classifying batch of {} photos...", paths.len());
+        let started = std::time::Instant::now();
         let response = match client.classify(paths, model.clone()).await {
             Ok(response) => response,
             Err(error) => {
-                for photo in chunk {
-                    ai_task_dao::mark_task_failed(
-                        &conn,
-                        photo.id.unwrap_or(0),
-                        ai_task_dao::CLASSIFICATION_STAGE,
-                        &error.to_string(),
-                    )?;
-                }
-                return Err(error);
+                record_ai_batch_failure(
+                    &mut conn,
+                    ai_task_dao::CLASSIFICATION_STAGE,
+                    chunk,
+                    error,
+                    worker_state.clone(),
+                    started.elapsed(),
+                )
+                .await?;
+                continue;
             }
         };
 
-        for result in &response.results {
-            if let Some(photo) = chunk.iter().find(|p| p.path == result.path) {
-                let photo_id = photo.id.unwrap_or(0);
-                if let Some(error) = &result.error {
-                    ai_task_dao::mark_task_failed(
-                        &conn,
-                        photo_id,
-                        ai_task_dao::CLASSIFICATION_STAGE,
-                        error,
-                    )?;
-                    continue;
-                }
+        for photo in chunk {
+            let photo_id = photo.id.unwrap_or(0);
+            let Some(result) = response
+                .results
+                .iter()
+                .find(|result| result.path == photo.path)
+            else {
+                ai_task_dao::mark_task_failed(
+                    &conn,
+                    photo_id,
+                    ai_task_dao::CLASSIFICATION_STAGE,
+                    "本地 AI 服务未返回该照片的场景分类结果",
+                )?;
+                continue;
+            };
+            if let Some(error) = &result.error {
+                ai_task_dao::mark_task_failed(
+                    &conn,
+                    photo_id,
+                    ai_task_dao::CLASSIFICATION_STAGE,
+                    error,
+                )?;
+                continue;
+            }
+            let outcome = (|| -> AppResult<()> {
                 let tx = conn.unchecked_transaction()?;
                 tx.execute(
                     "DELETE FROM ai_classifications WHERE photo_id=?1 AND COALESCE(tag_type,label_type,'ai_scene') IN ('ai_scene','ai_semantic')",
@@ -516,7 +607,16 @@ pub async fn cmd_run_ai_classification(
                     rusqlite::params![chrono::Utc::now().timestamp(), photo_id, ai_task_dao::CLASSIFICATION_STAGE],
                 )?;
                 tx.commit()?;
-                total_count += 1;
+                Ok(())
+            })();
+            match outcome {
+                Ok(()) => total_count += 1,
+                Err(error) => ai_task_dao::mark_task_failed(
+                    &conn,
+                    photo_id,
+                    ai_task_dao::CLASSIFICATION_STAGE,
+                    &error.to_string(),
+                )?,
             }
         }
         println!("  Classified {} photos so far...", total_count);
@@ -531,7 +631,7 @@ pub async fn cmd_run_face_detection(
     state: State<'_, AppState>,
     worker_state: State<'_, AiWorkerState>,
 ) -> AppResult<usize> {
-    let conn = get_conn(state.clone())?;
+    let mut conn = get_conn(state.clone())?;
     let project = {
         let guard = state.project.lock().unwrap();
         guard
@@ -543,7 +643,10 @@ pub async fn cmd_run_face_detection(
     let claimed = ai_task_dao::claim_tasks(&conn, ai_task_dao::FACE_STAGE, limit)?;
     let pending = claimed
         .iter()
-        .filter_map(|id| photo_dao::get_photo_by_id(&conn, *id).ok().flatten())
+        .map(|id| photo_dao::get_photo_by_id(&conn, *id))
+        .collect::<AppResult<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .collect::<Vec<_>>();
 
     if pending.is_empty() {
@@ -574,17 +677,16 @@ pub async fn cmd_run_face_detection(
     fs::create_dir_all(&faces_cache)?;
     println!("Faces cache path: {}", faces_cache.display());
 
-    // Keep each batch private and on the photo library's volume. Renaming
-    // from the system temp disk fails for libraries on external Windows disks.
-    let temp_dir = tempfile::Builder::new()
-        .prefix(".detect-")
-        .tempdir_in(&faces_cache)?;
-    let temp_path = temp_dir
-        .path()
-        .to_str()
-        .ok_or_else(|| AppError::InvalidPath(temp_dir.path().display().to_string()))?;
-
     for chunk in pending.chunks(batch_limit) {
+        // A timed-out request may still be writing files. Give each request its
+        // own directory on the library's volume so a later batch cannot read them.
+        let temp_dir = tempfile::Builder::new()
+            .prefix(".detect-")
+            .tempdir_in(&faces_cache)?;
+        let temp_path = temp_dir
+            .path()
+            .to_str()
+            .ok_or_else(|| AppError::InvalidPath(temp_dir.path().display().to_string()))?;
         let paths: Vec<String> = chunk.iter().map(|p| p.path.clone()).collect();
         println!("Detecting faces in {} photos...", paths.len());
         let large_cache = project.large_thumbnails_path();
@@ -595,28 +697,44 @@ pub async fn cmd_run_face_detection(
                     .map(|preview| (path.clone(), preview.to_string_lossy().into_owned()))
             })
             .collect();
+        let started = std::time::Instant::now();
         let response = match client.detect_faces(paths, temp_path, previews).await {
             Ok(response) => response,
             Err(error) => {
-                for photo in chunk {
-                    ai_task_dao::mark_task_failed(
-                        &conn,
-                        photo.id.unwrap_or(0),
-                        ai_task_dao::FACE_STAGE,
-                        &error.to_string(),
-                    )?;
-                }
-                return Err(error);
+                record_ai_batch_failure(
+                    &mut conn,
+                    ai_task_dao::FACE_STAGE,
+                    chunk,
+                    error,
+                    worker_state.clone(),
+                    started.elapsed(),
+                )
+                .await?;
+                continue;
             }
         };
 
-        for (result_idx, result) in response.results.iter().enumerate() {
-            if let Some(photo) = chunk.iter().find(|p| p.path == result.path) {
-                let photo_id = photo.id.unwrap_or(0);
-                if let Some(error) = &result.error {
-                    ai_task_dao::mark_task_failed(&conn, photo_id, ai_task_dao::FACE_STAGE, error)?;
-                    continue;
-                }
+        for photo in chunk {
+            let photo_id = photo.id.unwrap_or(0);
+            let Some((result_idx, result)) = response
+                .results
+                .iter()
+                .enumerate()
+                .find(|(_, result)| result.path == photo.path)
+            else {
+                ai_task_dao::mark_task_failed(
+                    &conn,
+                    photo_id,
+                    ai_task_dao::FACE_STAGE,
+                    "本地 AI 服务未返回该照片的人脸检测结果",
+                )?;
+                continue;
+            };
+            if let Some(error) = &result.error {
+                ai_task_dao::mark_task_failed(&conn, photo_id, ai_task_dao::FACE_STAGE, error)?;
+                continue;
+            }
+            let outcome = (|| -> AppResult<()> {
                 let old_faces = face_dao::get_faces_for_photo(&conn, photo_id)?;
                 let named_faces = face_dao::get_named_faces_for_photo(&conn, photo_id)?;
                 let reserved =
@@ -734,7 +852,16 @@ pub async fn cmd_run_face_detection(
                     rusqlite::params![chrono::Utc::now().timestamp(), photo_id, ai_task_dao::FACE_STAGE],
                 )?;
                 tx.commit()?;
-                total_count += 1;
+                Ok(())
+            })();
+            match outcome {
+                Ok(()) => total_count += 1,
+                Err(error) => ai_task_dao::mark_task_failed(
+                    &conn,
+                    photo_id,
+                    ai_task_dao::FACE_STAGE,
+                    &error.to_string(),
+                )?,
             }
         }
         println!("  Processed {} photos so far...", total_count);
@@ -982,6 +1109,22 @@ fn publish_ai_progress(
 ) -> Result<(), String> {
     ai_task_dao::set_pipeline_state(conn, status, stage, total, processed, failed, error)
         .map_err(|value| value.to_string())?;
+    if let Some(message) = error {
+        if status == "error" {
+            // A failed HTTP batch already has a record with its photos and full cause.
+            let logged_batch = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_error_events WHERE id=(SELECT MAX(id) FROM task_error_events WHERE stage=?1)
+                 AND kind='batch' AND occurred_at>=?2 AND substr(message,1,length(?3))=?3)",
+                rusqlite::params![stage, chrono::Utc::now().timestamp() - 5, message],
+                |row| row.get::<_, bool>(0),
+            ).unwrap_or(false);
+            if !logged_batch {
+                let _ = task_error_dao::record_task_error(conn, stage, message);
+            }
+        } else if stage == "finishing_tags" {
+            let _ = task_error_dao::record_task_error(conn, "geo_tagging", message);
+        }
+    }
     let status = ai_task_dao::pipeline_control_status(conn).map_err(|value| value.to_string())?;
     app_handle
         .emit(
@@ -1299,7 +1442,7 @@ pub async fn run_auto_ai_pipeline_inner(
         "running",
         "face_detection",
         face_total,
-        face_done,
+        face_done + face_failed,
         face_failed,
         None,
     )?;
@@ -1329,7 +1472,7 @@ pub async fn run_auto_ai_pipeline_inner(
                         "error",
                         "face_detection",
                         total,
-                        done,
+                        done + failed,
                         failed,
                         Some(&e.to_string()),
                     );
@@ -1348,7 +1491,7 @@ pub async fn run_auto_ai_pipeline_inner(
             "running",
             "face_detection",
             total,
-            done,
+            done + failed,
             failed,
             None,
         )?;
@@ -1380,7 +1523,7 @@ pub async fn run_auto_ai_pipeline_inner(
         "running",
         "classification",
         classification_total,
-        classification_done,
+        classification_done + classification_failed,
         classification_failed,
         None,
     )?;
@@ -1408,7 +1551,7 @@ pub async fn run_auto_ai_pipeline_inner(
                         "error",
                         "classification",
                         total,
-                        done,
+                        done + failed,
                         failed,
                         Some(&error.to_string()),
                     );
@@ -1427,7 +1570,7 @@ pub async fn run_auto_ai_pipeline_inner(
             "running",
             "classification",
             total,
-            done,
+            done + failed,
             failed,
             None,
         )?;

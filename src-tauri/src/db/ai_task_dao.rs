@@ -1,5 +1,6 @@
 use rusqlite::{params, Connection};
 
+use crate::db::task_error_dao::{self, ErrorPhoto};
 use crate::error::AppResult;
 
 pub const FACE_STAGE: &str = "face_detection";
@@ -75,7 +76,7 @@ pub fn claim_tasks(conn: &Connection, stage: &str, limit: i64) -> AppResult<Vec<
     let ids = {
         let mut statement = tx.prepare(
             "SELECT t.photo_id FROM ai_photo_tasks t JOIN photos p ON p.id=t.photo_id
-             WHERE t.stage=?1 AND t.status='pending' AND t.attempts<3 AND p.deleted=0
+             WHERE t.stage=?1 AND t.status='pending' AND p.deleted=0
              ORDER BY t.photo_id LIMIT ?2",
         )?;
         let mapped = statement.query_map(params![stage, limit.max(1)], |row| row.get(0))?;
@@ -98,28 +99,63 @@ pub fn mark_task_failed(
     stage: &str,
     error: &str,
 ) -> AppResult<()> {
-    let attempts: i64 = conn.query_row(
-        "SELECT attempts FROM ai_photo_tasks WHERE photo_id=?1 AND stage=?2",
+    let tx = conn.unchecked_transaction()?;
+    let photo = update_failed_task(&tx, photo_id, stage, error)?;
+    task_error_dao::record(&tx, stage, "photo", error, &[photo])?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn mark_batch_failed(
+    conn: &Connection,
+    photo_ids: &[i64],
+    stage: &str,
+    error: &str,
+    detail: &str,
+) -> AppResult<()> {
+    let tx = conn.unchecked_transaction()?;
+    let photos = photo_ids
+        .iter()
+        .map(|&id| update_failed_task(&tx, id, stage, error))
+        .collect::<AppResult<Vec<_>>>()?;
+    task_error_dao::record(&tx, stage, "batch", detail, &photos)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn update_failed_task(
+    conn: &Connection,
+    photo_id: i64,
+    stage: &str,
+    error: &str,
+) -> AppResult<ErrorPhoto> {
+    let (filename, path, attempts): (String, String, i64) = conn.query_row(
+        "SELECT p.filename,p.path,t.attempts FROM ai_photo_tasks t JOIN photos p ON p.id=t.photo_id
+         WHERE t.photo_id=?1 AND t.stage=?2",
         params![photo_id, stage],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     conn.execute(
-        "UPDATE ai_photo_tasks SET status=?1,lease_until=NULL,error=?2,updated_at=?3
-         WHERE photo_id=?4 AND stage=?5",
+        "UPDATE ai_photo_tasks SET status='failed',lease_until=NULL,error=?1,updated_at=?2
+         WHERE photo_id=?3 AND stage=?4",
         params![
-            if attempts >= 3 { "failed" } else { "pending" },
             error.chars().take(1000).collect::<String>(),
             now(),
             photo_id,
             stage
         ],
     )?;
-    Ok(())
+    Ok(ErrorPhoto {
+        filename,
+        path,
+        attempts: Some(attempts),
+    })
 }
 
 pub fn retry_failed(conn: &Connection) -> AppResult<usize> {
     Ok(conn.execute(
-        "UPDATE ai_photo_tasks SET status='pending',attempts=0,lease_until=NULL,error=NULL,updated_at=?1 WHERE status='failed'",
+        "UPDATE ai_photo_tasks SET status='pending',lease_until=NULL,updated_at=?1
+         WHERE status='failed' AND EXISTS (SELECT 1 FROM photos p WHERE p.id=photo_id AND p.deleted=0)",
         [now()],
     )?)
 }
@@ -139,7 +175,7 @@ pub fn requeue_oversized_jpeg_failures(conn: &Connection) -> AppResult<usize> {
 pub fn has_pending_tasks(conn: &Connection, stage: &str) -> AppResult<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM ai_photo_tasks t JOIN photos p ON p.id=t.photo_id
-         WHERE t.stage=?1 AND t.status='pending' AND t.attempts<3 AND p.deleted=0)",
+         WHERE t.stage=?1 AND t.status='pending' AND p.deleted=0)",
         [stage],
         |row| row.get(0),
     )?)
@@ -275,21 +311,23 @@ mod tests {
     }
 
     #[test]
-    fn repeatedly_failed_task_can_be_explicitly_retried() {
+    fn failed_task_does_not_block_later_photos_and_can_be_retried() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(CREATE_TABLES).unwrap();
         conn.execute(
-            "INSERT INTO photos(id,path,filename,file_size,file_mtime,face_status,imported_at) VALUES(1,'/1.jpg','1.jpg',10,20,0,1)",
+            "INSERT INTO photos(id,path,filename,file_size,file_mtime,face_status,imported_at)
+             VALUES (1,'/1.jpg','1.jpg',10,20,0,1),(2,'/2.jpg','2.jpg',10,20,0,1)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         sync_stage_tasks(&conn, FACE_STAGE, "v1", "face_status").unwrap();
-        for attempt in 1..=3 {
-            assert_eq!(claim_tasks(&conn, FACE_STAGE, 1).unwrap(), vec![1]);
-            mark_task_failed(&conn, 1, FACE_STAGE, "bad image").unwrap();
-            assert_eq!(has_pending_tasks(&conn, FACE_STAGE).unwrap(), attempt < 3);
-        }
+        assert_eq!(claim_tasks(&conn, FACE_STAGE, 1).unwrap(), vec![1]);
+        mark_task_failed(&conn, 1, FACE_STAGE, "bad image").unwrap();
+        assert!(has_pending_tasks(&conn, FACE_STAGE).unwrap());
+        assert_eq!(claim_tasks(&conn, FACE_STAGE, 1).unwrap(), vec![2]);
+        assert!(!has_pending_tasks(&conn, FACE_STAGE).unwrap());
         assert!(claim_tasks(&conn, FACE_STAGE, 1).unwrap().is_empty());
-        assert_eq!(stage_counts(&conn, FACE_STAGE).unwrap(), (1, 0, 1));
+        assert_eq!(stage_counts(&conn, FACE_STAGE).unwrap(), (2, 0, 1));
         assert_eq!(retry_failed(&conn).unwrap(), 1);
         assert_eq!(claim_tasks(&conn, FACE_STAGE, 1).unwrap(), vec![1]);
     }
@@ -311,6 +349,9 @@ mod tests {
         assert_eq!(requeue_oversized_jpeg_failures(&conn).unwrap(), 2);
         assert_eq!(requeue_oversized_jpeg_failures(&conn).unwrap(), 0);
         assert_eq!(claim_tasks(&conn, FACE_STAGE, 10).unwrap(), vec![1]);
-        assert_eq!(claim_tasks(&conn, CLASSIFICATION_STAGE, 10).unwrap(), vec![1]);
+        assert_eq!(
+            claim_tasks(&conn, CLASSIFICATION_STAGE, 10).unwrap(),
+            vec![1]
+        );
     }
 }

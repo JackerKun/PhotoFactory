@@ -86,6 +86,25 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
     overscan: 10,
   });
 
+  useEffect(() => {
+    const filmstrip = filmstripRef.current;
+    if (!filmstrip) return;
+
+    const scrollFilmstrip = (event: WheelEvent) => {
+      // Leave horizontal trackpad gestures and pinch gestures to the browser.
+      if (event.ctrlKey || event.metaKey || Math.abs(event.deltaX) >= Math.abs(event.deltaY)) return;
+      if (filmstrip.scrollWidth <= filmstrip.clientWidth) return;
+      const unit = event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+        ? filmstrip.clientWidth
+        : event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : 1;
+      event.preventDefault();
+      filmstrip.scrollLeft += event.deltaY * unit;
+    };
+
+    filmstrip.addEventListener("wheel", scrollFilmstrip, { passive: false });
+    return () => filmstrip.removeEventListener("wheel", scrollFilmstrip);
+  }, []);
+
   // Auto-scroll filmstrip to current
   useEffect(() => {
     if (currentIndex >= 0) {
@@ -579,7 +598,9 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
       {/* Filmstrip */}
       <div
         ref={filmstripRef}
-        className="bg-black/90 border-t border-white/10 overflow-x-auto"
+        role="region"
+        aria-label="照片缩略图带"
+        className="shrink-0 overflow-x-auto overflow-y-hidden bg-black/90 border-t border-white/10"
         style={{ height: FILMSTRIP_HEIGHT }}
       >
         <div

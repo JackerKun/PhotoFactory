@@ -9,3 +9,4 @@ pub mod manual_tag_dao;
 pub mod photo_dao;
 pub mod schema;
 pub mod smart_album_dao;
+pub mod task_error_dao;

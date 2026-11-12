@@ -59,6 +59,26 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+it("scrolls the lightbox filmstrip in both directions with a vertical mouse wheel", async () => {
+  useStore.setState({ lightboxPhotoId: 1 });
+  render(<MemoryRouter><Lightbox photoId={1} onClose={vi.fn()} /></MemoryRouter>);
+  await screen.findByRole("img", { name: "1.jpg" });
+  const filmstrip = screen.getByRole("region", { name: "照片缩略图带" });
+  Object.defineProperties(filmstrip, {
+    scrollWidth: { value: 1200 },
+    clientWidth: { value: 400 },
+  });
+
+  expect(fireEvent.wheel(filmstrip, { deltaY: 160 })).toBe(false);
+  expect(filmstrip.scrollLeft).toBe(160);
+  expect(fireEvent.wheel(filmstrip, { deltaY: -3, deltaMode: WheelEvent.DOM_DELTA_LINE })).toBe(false);
+  expect(filmstrip.scrollLeft).toBe(112);
+  expect(fireEvent.wheel(filmstrip, { deltaX: 80, deltaY: 4 })).toBe(true);
+  expect(fireEvent.wheel(filmstrip, { ctrlKey: true, deltaY: 50 })).toBe(true);
+  expect(filmstrip.scrollLeft).toBe(112);
+  expect(useStore.getState().lightboxPhotoId).toBe(1);
+});
+
 it("names the original group from the photo detail and refreshes both photos and the active filter", async () => {
   useStore.setState({ selectedPhotoId: 1, filter: { person_id: 41 } });
   const page = (id: number) => <MemoryRouter><ActiveFilters /><Lightbox photoId={id} onClose={vi.fn()} /></MemoryRouter>;

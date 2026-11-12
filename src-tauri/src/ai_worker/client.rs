@@ -7,6 +7,16 @@ use crate::models::{
     DetectFacesRequest, DetectFacesResponse, HealthResponse,
 };
 
+async fn worker_response_text(response: reqwest::Response) -> AppResult<String> {
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        let detail: String = text.chars().take(2000).collect();
+        return Err(AppError::AiWorker(format!("HTTP {status}: {detail}")));
+    }
+    Ok(text)
+}
+
 pub struct AiWorkerClient {
     client: Client,
     long_client: Client,
@@ -74,7 +84,8 @@ impl AiWorkerClient {
             .send()
             .await
             .map_err(|e| AppError::Http(e))?;
-        let result: ClassifyResponse = resp.json().await.map_err(|e| AppError::Http(e))?;
+        let text = worker_response_text(resp).await?;
+        let result: ClassifyResponse = serde_json::from_str(&text)?;
         Ok(result)
     }
 
@@ -97,20 +108,12 @@ impl AiWorkerClient {
             .await
             .map_err(|e| AppError::Http(e))?;
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| AppError::Http(e))?;
+        let text = worker_response_text(resp).await?;
         println!(
             "detect_faces response status: {}, body length: {}",
             status,
             text.len()
         );
-        if !status.is_success() {
-            let detail = if text.len() < 500 {
-                text.clone()
-            } else {
-                text[..500].to_string()
-            };
-            return Err(AppError::AiWorker(format!("HTTP {}: {}", status, detail)));
-        }
         if text.len() < 2000 {
             println!("detect_faces body: {}", text);
         }
@@ -118,11 +121,7 @@ impl AiWorkerClient {
             AppError::AiWorker(format!(
                 "JSON parse error: {}\nResponse: {}",
                 e,
-                if text.len() < 500 {
-                    text
-                } else {
-                    text[..500].to_string()
-                }
+                text.chars().take(500).collect::<String>()
             ))
         })?;
         Ok(result)

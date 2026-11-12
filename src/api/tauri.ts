@@ -476,6 +476,30 @@ export async function getAiPipelineStatus(): Promise<import("../types").AiProces
   return invoke<import("../types").AiProcessingStatus>("cmd_get_ai_pipeline_status");
 }
 
+export interface TaskErrorRecord {
+  id: number;
+  stage: string;
+  kind: "batch" | "photo" | "task";
+  message: string;
+  occurred_at: number;
+  photos: { filename: string; path: string; attempts: number | null }[];
+}
+
+export interface TaskErrorPage {
+  entries: TaskErrorRecord[];
+  next_before: number | null;
+  retryable: number;
+  failed_faces: number;
+  failed_classifications: number;
+  platform: string;
+  architecture: string;
+  version: string;
+}
+
+export function getTaskErrors(before: number | null = null): Promise<TaskErrorPage> {
+  return invoke("cmd_get_task_errors", { before });
+}
+
 export async function controlAiPipeline(action: "pause" | "resume" | "cancel" | "retry"): Promise<string> {
   return invoke<string>("cmd_control_ai_pipeline", { action });
 }

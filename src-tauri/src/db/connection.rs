@@ -26,6 +26,7 @@ pub fn init_db(db_path: &Path) -> AppResult<Connection> {
     conn.pragma_update(None, "cache_size", "-50000")?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.execute_batch(CREATE_TABLES)?;
+    crate::db::task_error_dao::import_legacy_errors(&conn)?;
     // Migration: add is_favorite column to existing databases
     conn.execute(
         "ALTER TABLE photos ADD COLUMN is_favorite INTEGER DEFAULT 0",

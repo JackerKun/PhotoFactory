@@ -13,6 +13,10 @@ vi.mock("../api/tauri", () => ({
   setThumbnailPerformance: vi.fn(async () => {}),
   getLibraryJobs: vi.fn(async () => []),
   controlAiPipeline: vi.fn(async () => {}),
+  getTaskErrors: vi.fn(async () => ({
+    entries: [], next_before: null, retryable: 0, failed_faces: 1, failed_classifications: 0,
+    platform: "windows", architecture: "x86_64", version: "0.1.4",
+  })),
 }));
 afterEach(() => { cleanup(); useStore.setState({ project: null, aiProcessingStatus: null, thumbnailProcessingStatus: null }); vi.restoreAllMocks(); });
 it("keeps failed thumbnail and AI jobs visible in one task dialog and retries AI", async () => {
@@ -32,4 +36,35 @@ it("keeps failed thumbnail and AI jobs visible in one task dialog and retries AI
   expect(await screen.findByText("人脸检测：DirectML (GPU)")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "重试失败" }));
   await waitFor(() => expect(api.controlAiPipeline).toHaveBeenCalledWith("retry"));
+});
+
+it("shows a previous batch interruption after the pipeline resumes and copies its files and cause", async () => {
+  const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  const writeText = vi.fn(async () => {});
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+  try {
+    vi.mocked(api.getAiPipelineStatus).mockResolvedValueOnce({ status: "running", stage: "face_detection", processed: 655, total: 3560, failed: 1 });
+    vi.mocked(api.getTaskErrors).mockResolvedValueOnce({
+      entries: [{
+        id: 1, stage: "face_detection", kind: "batch", occurred_at: 1760000000,
+        message: "原因：Connection reset by peer (os error 10054)",
+        photos: [{ filename: "DSC001.jpg", path: "D:\\Photos\\DSC001.jpg", attempts: 2 }],
+      }],
+      next_before: null, retryable: 1, failed_faces: 0, failed_classifications: 0,
+      platform: "windows", architecture: "x86_64", version: "0.1.4",
+    });
+    useStore.setState({ project: { root_path: "/test" } as Project });
+    render(<TaskCenter />);
+    fireEvent.click(screen.getByRole("button", { name: "后台任务" }));
+    expect(await screen.findByText("识别人脸 · 批次中断 · 1 张")).toBeInTheDocument();
+    expect(screen.getByText(/已跳过失败的照片/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试失败" })).toBeDisabled();
+    expect(screen.getByText("D:\\Photos\\DSC001.jpg")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "复制本页诊断" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(expect.stringContaining("Connection reset by peer")));
+    expect(writeText).toHaveBeenCalledWith(expect.stringContaining("D:\\Photos\\DSC001.jpg"));
+  } finally {
+    if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
+    else Reflect.deleteProperty(navigator, "clipboard");
+  }
 });

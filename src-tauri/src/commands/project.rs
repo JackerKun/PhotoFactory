@@ -488,6 +488,14 @@ pub async fn cmd_trigger_auto_ai(
         if let Some(error) = error {
             eprintln!("AI pipeline: {error}");
             if let Ok(conn) = init_db(&db_path) {
+                if let Ok((stage, recorded)) = conn.query_row(
+                    "SELECT stage, status='error' AND COALESCE(last_error,'')=?1 FROM ai_pipeline_state WHERE id=1",
+                    [&error], |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+                ) {
+                    if !recorded {
+                        let _ = crate::db::task_error_dao::record_task_error(&conn, &stage, &error);
+                    }
+                }
                 let _ = conn.execute(
                     "UPDATE ai_pipeline_state SET status='error',last_error=?1,updated_at=?2
                      WHERE id=1 AND status NOT IN ('canceled','paused')",

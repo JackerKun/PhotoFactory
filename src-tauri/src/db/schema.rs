@@ -235,6 +235,15 @@ CREATE TABLE IF NOT EXISTS ai_pipeline_state (
 );
 INSERT OR IGNORE INTO ai_pipeline_state(id,status,stage,updated_at) VALUES(1,'idle','idle',0);
 
+CREATE TABLE IF NOT EXISTS task_error_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stage TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    message TEXT NOT NULL,
+    photos_json TEXT NOT NULL,
+    occurred_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_photos_path ON photos(path);
 CREATE INDEX IF NOT EXISTS idx_photos_taken_at ON photos(taken_at);
 CREATE INDEX IF NOT EXISTS idx_photos_rating ON photos(rating, deleted);

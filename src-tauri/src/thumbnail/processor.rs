@@ -186,6 +186,9 @@ impl ThumbnailProcessor {
             Ok(())
         })();
         if let Err(error) = result {
+            if let Ok(conn) = init_db(&project.db_path()) {
+                let _ = crate::db::task_error_dao::record_task_error(&conn, "thumbnail", &error.to_string());
+            }
             *self.last_error.lock().unwrap() = Some(error.to_string());
             self.failed.fetch_add(1, Ordering::SeqCst);
         }
@@ -224,7 +227,7 @@ impl ThumbnailProcessor {
                     if mode == ThumbnailPerformance::Low {
                         std::thread::sleep(Duration::from_millis(25));
                     }
-                    (photo.id.unwrap_or(0), &photo.filename, result)
+                    (photo, result)
                 })
                 .collect()
         });
@@ -232,7 +235,7 @@ impl ThumbnailProcessor {
         let tx = conn.transaction()?;
         let mut succeeded = 0;
         let mut failed = 0;
-        for (photo_id, filename, result) in &results {
+        for (photo, result) in &results {
             let status = match result {
                 Ok(_) => {
                     succeeded += 1;
@@ -240,13 +243,18 @@ impl ThumbnailProcessor {
                 }
                 Err(error) => {
                     failed += 1;
-                    *self.last_error.lock().unwrap() = Some(format!("{filename}: {error}"));
+                    *self.last_error.lock().unwrap() = Some(format!("{}: {error}", photo.filename));
+                    let _ = crate::db::task_error_dao::record(&tx, "thumbnail", "photo", &error.to_string(), &[
+                        crate::db::task_error_dao::ErrorPhoto {
+                            filename: photo.filename.clone(), path: photo.path.clone(), attempts: None,
+                        },
+                    ]);
                     -1
                 }
             };
             tx.execute(
                 "UPDATE photos SET thumbnail_status = ?1 WHERE id = ?2 AND thumbnail_status = 0",
-                rusqlite::params![status, photo_id],
+                rusqlite::params![status, photo.id.unwrap_or(0)],
             )?;
         }
         tx.commit()?;
