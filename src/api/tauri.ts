@@ -488,6 +488,37 @@ export function getAiRuntime(): Promise<AiRuntimeInfo | null> {
   return invoke("cmd_get_ai_runtime");
 }
 
+export interface AiWorkerDiagnostics {
+  version: string;
+  platform: string;
+  architecture: string;
+  status: "idle" | "starting" | "ready" | "exited" | "failed";
+  port: number;
+  pid: number | null;
+  entries: {
+    id: number;
+    occurred_at: number;
+    source: "service" | "error" | "stdout" | "stderr" | "warning";
+    pid: number | null;
+    message: string;
+  }[];
+  log_error: string | null;
+}
+
+export function getAiWorkerDiagnostics(): Promise<AiWorkerDiagnostics> {
+  return invoke("cmd_get_ai_worker_diagnostics");
+}
+
+export function clearAiWorkerDiagnostics(through: number): Promise<void> {
+  return invoke("cmd_clear_ai_worker_diagnostics", { through });
+}
+
+type AiCheckResult = { Ok: number } | { Err: string };
+
+export function checkAiPhoto(path: string): Promise<{ faces: AiCheckResult; tags: AiCheckResult }> {
+  return invoke("cmd_check_ai_photo", { path });
+}
+
 export async function getAiPipelineStatus(): Promise<import("../types").AiProcessingStatus> {
   return invoke<import("../types").AiProcessingStatus>("cmd_get_ai_pipeline_status");
 }

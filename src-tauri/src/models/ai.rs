@@ -54,6 +54,8 @@ pub struct CustomAttribute {
 pub struct ClassifyRequest {
     pub paths: Vec<String>,
     pub model: String,
+    #[serde(default)]
+    pub previews: std::collections::HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +137,8 @@ pub struct DetectFacesResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
+    #[serde(default)]
+    pub instance_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

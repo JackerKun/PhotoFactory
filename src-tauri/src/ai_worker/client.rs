@@ -17,34 +17,27 @@ async fn worker_response_text(response: reqwest::Response) -> AppResult<String> 
     Ok(text)
 }
 
+#[derive(Clone)]
 pub struct AiWorkerClient {
     client: Client,
     long_client: Client,
     base_url: String,
-}
-
-impl Clone for AiWorkerClient {
-    fn clone(&self) -> Self {
-        Self {
-            client: Client::builder().build().unwrap(),
-            long_client: Client::builder()
-                .timeout(std::time::Duration::from_secs(300))
-                .build()
-                .unwrap(),
-            base_url: self.base_url.clone(),
-        }
-    }
+    pub port: u16,
+    instance_id: String,
 }
 
 impl AiWorkerClient {
-    pub fn new(port: u16) -> Self {
+    pub fn new(port: u16, instance_id: String) -> Self {
         Self {
-            client: Client::builder().build().unwrap(),
+            client: Client::builder().no_proxy().build().unwrap(),
             long_client: Client::builder()
+                .no_proxy()
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap(),
             base_url: format!("http://127.0.0.1:{}", port),
+            port,
+            instance_id,
         }
     }
 
@@ -52,14 +45,15 @@ impl AiWorkerClient {
         match self
             .client
             .get(format!("{}/health", self.base_url))
+            .timeout(std::time::Duration::from_secs(2))
             .send()
             .await
         {
-            Ok(resp) => {
+            Ok(resp) if resp.status().is_success() => {
                 let health: HealthResponse = resp.json().await.map_err(|e| AppError::Http(e))?;
-                Ok(health.status == "ok")
+                Ok(health.status == "ok" && health.instance_id.as_deref() == Some(&self.instance_id))
             }
-            Err(_) => Ok(false),
+            Ok(_) | Err(_) => Ok(false),
         }
     }
 
@@ -75,12 +69,11 @@ impl AiWorkerClient {
             .await?)
     }
 
-    pub async fn classify(&self, paths: Vec<String>, model: String) -> AppResult<ClassifyResponse> {
-        let req = ClassifyRequest { paths, model };
+    pub async fn classify(&self, req: &ClassifyRequest) -> AppResult<ClassifyResponse> {
         let resp = self
             .long_client
             .post(format!("{}/classify", self.base_url))
-            .json(&req)
+            .json(req)
             .send()
             .await
             .map_err(|e| AppError::Http(e))?;

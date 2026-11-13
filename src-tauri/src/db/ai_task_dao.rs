@@ -106,6 +106,20 @@ pub fn mark_task_failed(
     Ok(())
 }
 
+pub fn release_claimed_tasks(conn: &Connection, stage: &str, photo_ids: &[i64]) -> AppResult<()> {
+    let ts = now();
+    let tx = conn.unchecked_transaction()?;
+    for id in photo_ids {
+        tx.execute(
+            "UPDATE ai_photo_tasks SET status='pending',lease_until=NULL,updated_at=?1
+             WHERE photo_id=?2 AND stage=?3 AND status='running'",
+            params![ts, id, stage],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn mark_batch_failed(
     conn: &Connection,
     photo_ids: &[i64],
@@ -333,6 +347,23 @@ mod tests {
         assert_eq!(stage_counts(&conn, FACE_STAGE).unwrap(), (2, 0, 1));
         assert_eq!(retry_failed(&conn).unwrap(), 1);
         assert_eq!(claim_tasks(&conn, FACE_STAGE, 1).unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn releasing_an_interrupted_batch_preserves_completed_and_other_claimed_tasks() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(CREATE_TABLES).unwrap();
+        conn.execute_batch(
+            "INSERT INTO photos(id,path,filename,file_size,file_mtime,imported_at)
+             VALUES (1,'/1.jpg','1.jpg',10,20,1),(2,'/2.jpg','2.jpg',10,20,1),(3,'/3.jpg','3.jpg',10,20,1);",
+        ).unwrap();
+        sync_stage_tasks(&conn, FACE_STAGE, "v1", "face_status").unwrap();
+        let batch = claim_tasks(&conn, FACE_STAGE, 2).unwrap();
+        assert_eq!(claim_tasks(&conn, FACE_STAGE, 1).unwrap(), vec![3]);
+        conn.execute("UPDATE ai_photo_tasks SET status='done' WHERE photo_id=1", []).unwrap();
+        release_claimed_tasks(&conn, FACE_STAGE, &batch).unwrap();
+        assert_eq!(stage_counts(&conn, FACE_STAGE).unwrap(), (3, 1, 0));
+        assert_eq!(claim_tasks(&conn, FACE_STAGE, 3).unwrap(), vec![2]);
     }
 
     #[test]

@@ -25,10 +25,18 @@ fn main() {
             client: Mutex::new(None),
             port: 9876,
             process: Mutex::new(None),
+            start_lock: tokio::sync::Mutex::new(()),
             pipeline_running: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            diagnostics: dirs::data_local_dir()
+                .map(|directory| photofactory::ai_worker::diagnostics::WorkerDiagnostics::open(
+                    directory.join("PhotoFactory").join("ai-worker.jsonl"),
+                ))
+                .unwrap_or_default(),
         })
         .manage(memory_video::MemoryVideoState::default())
         .setup(|app| {
+            tauri::async_runtime::spawn(ai::monitor_ai_worker(app.handle().clone()));
             if let Some(project) = app.state::<AppState>().project.lock().unwrap().as_ref() {
                 if let Err(error) = project::allow_project_assets(app.handle(), project) {
                     eprintln!("Could not restore photo directory access: {error}");
@@ -138,6 +146,9 @@ fn main() {
             ai::cmd_run_face_detection,
             ai::cmd_worker_health,
             ai::cmd_get_ai_runtime,
+            ai::cmd_get_ai_worker_diagnostics,
+            ai::cmd_clear_ai_worker_diagnostics,
+            ai::cmd_check_ai_photo,
             ai::cmd_get_ai_pipeline_status,
             ai::cmd_get_task_errors,
             ai::cmd_clear_task_error_history,
@@ -220,6 +231,7 @@ fn main() {
 /// Gracefully shut down the AI worker Python process.
 /// Called by commands that need to stop the worker, or on app teardown.
 pub fn shutdown_ai_worker(state: &AiWorkerState) {
+    state.shutting_down.store(true, std::sync::atomic::Ordering::Release);
     let mut guard = state.process.lock().unwrap();
     if let Some(mut child) = guard.take() {
         let pid = child.id();

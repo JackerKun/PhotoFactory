@@ -3,16 +3,23 @@
 import os
 import time
 import sys
+import faulthandler
+import logging
 import subprocess
 import tempfile
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor
+
+if __name__ == "__main__" and sys.stderr is not None:
+    faulthandler.enable(file=sys.stderr)
 from typing import List, Dict, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import numpy as np
 import uvicorn
+
+logger = logging.getLogger("uvicorn.error")
 
 RAW_EXTENSIONS = {".arw", ".cr2", ".nef", ".dng", ".raw", ".orf", ".rw2", ".pef"}
 HEIF_EXTENSIONS = {".heic", ".heif"}
@@ -83,6 +90,7 @@ app = FastAPI(title="PhotoFactory AI Worker")
 class ClassifyRequest(BaseModel):
     paths: List[str]
     model: str = "scene_v2"
+    previews: Dict[str, List[str]] = Field(default_factory=dict)
 
 class AiTag(BaseModel):
     label: str
@@ -158,6 +166,7 @@ class FaceQualityRequest(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+    instance_id: Optional[str] = None
 
 _last_face_batch = {}
 _last_cluster_ms = None
@@ -230,9 +239,9 @@ def load_semantic_classifier():
                 from semantic_classifier import SemanticClassifier
                 _semantic_classifier = SemanticClassifier()
                 print("Semantic classifier loaded", flush=True)
-            except Exception as error:
+            except Exception:
                 _semantic_unavailable = True
-                print(f"Semantic classifier unavailable; continuing with scene labels: {error}", flush=True)
+                logger.exception("Semantic classifier unavailable; continuing with scene labels")
         return _semantic_classifier
 
 
@@ -240,13 +249,30 @@ def load_semantic_classifier():
 
 @app.get("/health")
 async def health() -> HealthResponse:
-    return HealthResponse(status="ok")
+    return HealthResponse(status="ok", instance_id=os.environ.get("PHOTOFACTORY_AI_INSTANCE"))
+
+
+def _load_classification_image(path, decoded_path, preview_paths):
+    from image_input import open_ai_image
+
+    try:
+        with open_ai_image(decoded_path) as (image, _):
+            return image.convert("RGB")
+    except OSError as error:
+        for preview_path in preview_paths:
+            try:
+                if os.path.getmtime(preview_path) >= os.path.getmtime(path):
+                    with open_ai_image(preview_path) as (preview, _):
+                        rgb = preview.convert("RGB")
+                    print(f"  classifying cached preview for {path}: {error}", flush=True)
+                    return rgb
+            except (OSError, ValueError) as preview_error:
+                print(f"  could not read cached preview for {path}: {preview_error}", flush=True)
+        raise ValueError(f"无法解码原图，且没有可用的缓存预览。原始错误：{error}") from error
 
 
 @app.post("/classify")
 def classify(req: ClassifyRequest) -> ClassifyResponse:
-    from image_input import open_ai_image
-
     try:
         classifier = load_scene_classifier()
         semantic_classifier = load_semantic_classifier()
@@ -260,9 +286,7 @@ def classify(req: ClassifyRequest) -> ClassifyResponse:
             jpeg_path = None
             try:
                 jpeg_path = _convert_for_ai(path)
-                process_path = jpeg_path or path
-                with open_ai_image(process_path) as (image, _):
-                    rgb = image.convert("RGB")
+                with _load_classification_image(path, jpeg_path or path, req.previews.get(path, ())) as rgb:
                     tags = classifier.classify_image(rgb)
                     if semantic_classifier is not None:
                         tags.extend(semantic_classifier.classify_image(rgb))
@@ -270,7 +294,7 @@ def classify(req: ClassifyRequest) -> ClassifyResponse:
             except Exception as e:
                 # A single damaged/unsupported photo must not permanently block
                 # the background queue. Keep an empty result and continue.
-                print(f"  skip classification for {path}: {e}", flush=True)
+                logger.warning("Scene classification skipped %s: %s: %s", path, type(e).__name__, e)
                 results.append(ClassifyResult(path=path, tags=[], error=str(e)))
             finally:
                 if jpeg_path:
@@ -280,8 +304,10 @@ def classify(req: ClassifyRequest) -> ClassifyResponse:
         print(f"Classification done: {len(results)} results", flush=True)
         return ClassifyResponse(results=results)
     except RuntimeError as e:
+        logger.exception("Scene classification request failed")
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
+        logger.exception("Scene classification request failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -336,7 +362,7 @@ def detect_faces(req: DetectFacesRequest) -> DetectFacesResponse:
             except Exception as e:
                 # Preserve result ordering (embedding filenames depend on it)
                 # and allow later photos in the batch to keep processing.
-                print(f"  skip face detection for {path}: {e}", flush=True)
+                logger.warning("Face detection skipped %s: %s: %s", path, type(e).__name__, e)
                 return FaceResult(path=path, faces=[], error=str(e))
             finally:
                 if jpeg_path:
@@ -353,8 +379,10 @@ def detect_faces(req: DetectFacesRequest) -> DetectFacesResponse:
         _last_face_batch.update(photos=len(req.paths), elapsed_ms=1000 * (time.perf_counter() - start))
         return DetectFacesResponse(results=results)
     except RuntimeError as e:
+        logger.exception("Face detection request failed")
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
+        logger.exception("Face detection request failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 

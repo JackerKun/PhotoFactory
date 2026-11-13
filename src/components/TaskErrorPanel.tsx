@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   clearTaskErrorHistory, getIgnoredTaskPhotos, getTaskErrorPhotos, getTaskErrors, ignoreTaskErrorPhotos, restoreTaskPhoto,
-  type IgnoredTaskPhotos, type TaskErrorGroup, type TaskErrorGroupPhotos, type TaskErrorPage,
+  checkAiPhoto, clearAiWorkerDiagnostics, getAiWorkerDiagnostics, startAiWorker,
+  type AiWorkerDiagnostics, type IgnoredTaskPhotos, type TaskErrorGroup, type TaskErrorGroupPhotos, type TaskErrorPage,
 } from "../api/tauri";
 import Icon from "./Icon";
 
@@ -47,6 +49,14 @@ function groupId(group: TaskErrorGroup) {
   return JSON.stringify([group.key.stage, group.key.reason]);
 }
 
+const workerStatuses: Record<AiWorkerDiagnostics["status"], string> = {
+  idle: "尚未启动", starting: "正在启动", ready: "已就绪", exited: "进程已退出", failed: "启动失败",
+};
+
+const logSources: Record<AiWorkerDiagnostics["entries"][number]["source"], string> = {
+  service: "服务", error: "错误", stdout: "标准输出", stderr: "标准错误", warning: "警告",
+};
+
 export default function TaskErrorPanel({ projectPath, current, stages, runtime }: {
   projectPath?: string;
   current: CurrentTaskError[];
@@ -69,6 +79,27 @@ export default function TaskErrorPanel({ projectPath, current, stages, runtime }
   const [busy, setBusy] = useState(false);
   const [clearThrough, setClearThrough] = useState<number | null>(null);
   const [refresh, setRefresh] = useState(0);
+  const [worker, setWorker] = useState<AiWorkerDiagnostics | null>(null);
+  const [workerReadError, setWorkerReadError] = useState("");
+  const [checkingWorker, setCheckingWorker] = useState(false);
+  const [workerCheckResult, setWorkerCheckResult] = useState("");
+  const [clearWorkerThrough, setClearWorkerThrough] = useState<number | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    async function poll() {
+      try {
+        const result = await getAiWorkerDiagnostics();
+        if (live) { setWorker(result); setWorkerReadError(""); }
+      } catch (error) {
+        if (live) setWorkerReadError(String(error));
+      }
+      if (live) timer = setTimeout(poll, 1500);
+    }
+    void poll();
+    return () => { live = false; clearTimeout(timer); };
+  }, [refresh]);
 
   useEffect(() => {
     if (!projectPath) return;
@@ -113,7 +144,8 @@ export default function TaskErrorPanel({ projectPath, current, stages, runtime }
 
   const groups = page?.groups ?? [];
   const stageLabel = (value: string) => stages[value] ?? value;
-  const platform = page ? `PhotoFactory ${page.version} · ${page.platform} ${page.architecture}` : "PhotoFactory";
+  const appInfo = page ?? worker;
+  const platform = appInfo ? `PhotoFactory ${appInfo.version} · ${appInfo.platform} ${appInfo.architecture}` : "PhotoFactory";
   const failureCounts = page
     ? `人脸失败 ${page.failed_faces} · 分类失败 ${page.failed_classifications} · 有错误记录的待重试任务 ${page.retryable} · 已忽略 ${page.ignored_count}`
     : "";
@@ -172,8 +204,52 @@ export default function TaskErrorPanel({ projectPath, current, stages, runtime }
     }, (count) => `已清空 ${count} 条历史错误记录`, "没有可清空的历史错误记录");
   }
 
+  async function runWorkerCheck(withPhoto = false) {
+    setCheckingWorker(true);
+    setActionError("");
+    setWorkerCheckResult("");
+    try {
+      if (withPhoto) {
+        const path = await open({ title: "选择一张照片测试 AI", multiple: false });
+        if (typeof path !== "string") return;
+        const { faces, tags } = await checkAiPhoto(path);
+        const faceResult = "Ok" in faces ? `人脸检测成功，找到 ${faces.Ok} 张人脸` : `人脸检测失败\n${faces.Err}`;
+        const sceneResult = "Ok" in tags ? `场景分类成功，返回 ${tags.Ok} 个标签` : `场景分类失败\n${tags.Err}`;
+        setWorkerCheckResult(`${faceResult}\n${sceneResult}`);
+      } else {
+        await startAiWorker(worker?.port);
+        setWorkerCheckResult("本地 AI 服务已通过启动检查");
+      }
+    } catch (error) {
+      setWorkerCheckResult(String(error));
+    } finally {
+      setCheckingWorker(false);
+      setRefresh((value) => value + 1);
+    }
+  }
+
+  const workerStatus = worker ? `${workerStatuses[worker.status]} · 127.0.0.1:${worker.port}${worker.pid ? ` · PID ${worker.pid}` : ""}` : "";
+  const workerEntries = worker?.entries ?? [];
+  const latestWorkerEntries = [...workerEntries].reverse();
+  const lastWorkerError = latestWorkerEntries.find((entry) => entry.source === "error" || entry.source === "warning");
+
+  function clearWorkerHistory() {
+    if (clearWorkerThrough == null) return;
+    void act(async () => {
+      await clearAiWorkerDiagnostics(clearWorkerThrough);
+      setClearWorkerThrough(null);
+      return 1;
+    }, () => "已清空 AI 服务日志");
+  }
+
   async function copy() {
-    const report = [platform, runtime, failureCounts, ...current.map(({ label, message, occurredAt }) =>
+    const serviceReport = worker ? [
+      `本地 AI 服务 · ${workerStatus}`,
+      ...(worker.log_error ? [`日志文件错误\n${worker.log_error}`] : []),
+      ...workerEntries.map((entry) =>
+        `${errorTime(entry.occurred_at)} · ${logSources[entry.source]}${entry.pid ? ` · PID ${entry.pid}` : ""}\n${entry.message}`),
+    ].join("\n\n") : workerReadError;
+    const report = [platform, runtime, serviceReport, workerCheckResult, failureCounts, ...current.map(({ label, message, occurredAt }) =>
       `${occurredAt ? `${errorTime(occurredAt)} · ` : ""}${label}\n${message}`),
       ...groups.map((group) => [
         `${stageLabel(group.key.stage)} · ${group.occurrences} 条记录`,
@@ -195,14 +271,52 @@ export default function TaskErrorPanel({ projectPath, current, stages, runtime }
     <h3 id="task-error-title" className="task-column-title px-1 text-sm font-semibold">错误与诊断</h3>
     <div className="task-card">
       <header className="task-card-padding ui-toolbar min-h-[var(--ui-control-height)] justify-between border-b border-surface-secondary">
-        {page && <p className="text-xs text-text-secondary">{platform}</p>}
+        {appInfo && <p className="text-xs text-text-secondary">{platform}</p>}
         {!showIgnored && <div className="ui-toolbar">
-          <button type="button" className="ui-button" disabled={!current.length && !groups.length} onClick={() => void copy()}>复制本页诊断</button>
+          <button type="button" className="ui-button" disabled={!worker && !workerReadError && !current.length && !groups.length} onClick={() => void copy()}>复制本页诊断</button>
           <button type="button" className="ui-button" disabled={busy || !page?.history_through}
             onClick={() => setClearThrough(page?.history_through ?? null)}>清空错误历史</button>
         </div>}
       </header>
       <div className="task-card-padding space-y-[var(--ui-gap)]">
+        <section aria-label="本地 AI 服务" className="rounded-lg border border-surface-secondary p-3 text-xs">
+          <div className="ui-toolbar justify-between">
+            <div>
+              <h4 className="text-sm font-medium">本地 AI 服务</h4>
+              <p className="mt-1 text-text-secondary">{workerStatus || (workerReadError ? "状态读取失败" : "正在读取服务状态…")}</p>
+            </div>
+            <div className="ui-toolbar">
+              <button type="button" className="ui-button" disabled={checkingWorker || worker?.status === "starting"} onClick={() => void runWorkerCheck()}>检查 AI 服务</button>
+              <button type="button" className="ui-button" disabled={checkingWorker || worker?.status === "starting"} onClick={() => void runWorkerCheck(true)}>测试单张照片</button>
+            </div>
+          </div>
+          {workerReadError && <p className="mt-2 break-words text-red-500">{workerReadError}</p>}
+          {worker?.log_error && <p className="mt-2 break-words text-red-500">日志文件错误 · {worker.log_error}</p>}
+          {lastWorkerError && <div className="mt-2 text-red-500">
+            <ErrorTimestamp timestamp={lastWorkerError.occurred_at} />
+            <p className="mt-1 break-words">{lastWorkerError.message.split("\n")[0]}</p>
+          </div>}
+          {checkingWorker && <p role="status" className="mt-2 text-text-secondary">正在检查 AI 服务…</p>}
+          {workerCheckResult && <p role="status" className="mt-2 whitespace-pre-wrap break-words text-text-secondary">{workerCheckResult}</p>}
+          {workerEntries.length > 0 && <details className="mt-2">
+            <summary className="cursor-pointer py-1 text-accent-link">服务日志（{workerEntries.length} 条）</summary>
+            <ol className="mt-2 max-h-72 space-y-2 overflow-auto rounded-md bg-surface-primary p-2">
+              {latestWorkerEntries.map((entry) => <li key={entry.id} className="min-w-0">
+                <p className="text-text-secondary"><ErrorTimestamp timestamp={entry.occurred_at} /> · {logSources[entry.source]}{entry.pid ? ` · PID ${entry.pid}` : ""}</p>
+                <p className={`whitespace-pre-wrap break-words ${entry.source === "error" ? "text-red-500" : ""}`}>{entry.message}</p>
+              </li>)}
+            </ol>
+            <div className="ui-toolbar mt-2">
+              {clearWorkerThrough == null
+                ? <button type="button" className="ui-button" disabled={busy}
+                    onClick={() => setClearWorkerThrough(workerEntries[workerEntries.length - 1].id)}>清空服务日志</button>
+                : <>
+                  <button type="button" className="ui-button" disabled={busy} onClick={() => setClearWorkerThrough(null)}>取消</button>
+                  <button type="button" className="ui-button text-red-500" disabled={busy} onClick={clearWorkerHistory}>确认清空服务日志</button>
+                </>}
+            </div>
+          </details>}
+        </section>
         {clearThrough != null && <div className="space-y-2 rounded-lg border border-surface-secondary bg-surface-primary p-3 text-sm">
           <p>清空此照片库当前的历史错误记录？失败任务仍可重试。</p>
           <div className="ui-toolbar">
@@ -234,8 +348,8 @@ export default function TaskErrorPanel({ projectPath, current, stages, runtime }
             {page?.stages.map((value) => <option key={value} value={value}>{stageLabel(value)}</option>)}
           </select>}
         </div>
-        {actionMessage && <p role="status" className="text-sm text-text-secondary">{actionMessage}</p>}
-        {actionError && <p role="alert" className="break-words text-sm text-red-500">{actionError}</p>}
+        {actionMessage && <p role="status" className="whitespace-pre-wrap break-words text-sm text-text-secondary">{actionMessage}</p>}
+        {actionError && <p role="alert" className="whitespace-pre-wrap break-words text-sm text-red-500">{actionError}</p>}
         {(loadError || detailError) && <div role="alert" className="space-y-2 text-sm text-red-500">
           <p className="break-words">无法读取记录：{loadError || detailError}</p>
           <button type="button" className="ui-button" onClick={() => setRefresh((value) => value + 1)}>重新读取记录</button>

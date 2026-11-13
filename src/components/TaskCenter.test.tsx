@@ -1,14 +1,21 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
+import { open } from "@tauri-apps/plugin-dialog";
 import * as api from "../api/tauri";
 import { useStore } from "../hooks/usePhotos";
 import type { Project } from "../types";
 import TaskCenter from "./TaskCenter";
 
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
+
 vi.mock("../api/tauri", () => ({
   getThumbnailProcessingStatus: vi.fn(async () => ({ running: false, processed: 10, succeeded: 8, failed: 2, total_pending: 0, last_error: "无法读取原文件" })),
   getAiPipelineStatus: vi.fn(async () => ({ status: "error", stage: "error", processed: 3, total: 10, failed: 1, last_error: "模型无法加载" })),
   getAiRuntime: vi.fn(async () => ({ models: { face_detection: "DmlExecutionProvider" }, face_batch: { photos: 10, preview_hits: 4 } })),
+  getAiWorkerDiagnostics: vi.fn(async () => ({ version: "0.1.7", platform: "windows", architecture: "x86_64", status: "idle", port: 9876, pid: null, entries: [], log_error: null })),
+  startAiWorker: vi.fn(async () => "AI worker ready"),
+  checkAiPhoto: vi.fn(),
+  clearAiWorkerDiagnostics: vi.fn(),
   getThumbnailPerformance: vi.fn(async () => "balanced"),
   setThumbnailPerformance: vi.fn(async () => {}),
   getLibraryJobs: vi.fn(async () => []),
@@ -130,4 +137,30 @@ it("clears the confirmed history snapshot and leaves the failed tasks available"
   expect(await screen.findByText("已清空 7 条历史错误记录")).toBeInTheDocument();
   expect(api.clearTaskErrorHistory).toHaveBeenCalledWith("/test", 7);
   expect(screen.getByRole("button", { name: "重试失败" })).toBeEnabled();
+});
+
+it("copies worker crash details and can test a photo without opening a library", async () => {
+  const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  const writeText = vi.fn(async () => {});
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+  vi.mocked(api.getAiWorkerDiagnostics).mockResolvedValueOnce({
+    version: "0.1.7", platform: "windows", architecture: "x86_64",
+    status: "exited", port: 9876, pid: 42, log_error: null,
+    entries: [{ id: 1, occurred_at: 1794510000, source: "error", pid: 42, message: "AI 服务进程已退出（exit code: 120）\n详细堆栈" }],
+  });
+  vi.mocked(open).mockResolvedValueOnce("D:\\测试.jpeg");
+  vi.mocked(api.checkAiPhoto).mockResolvedValueOnce({ faces: { Ok: 2 }, tags: { Err: "broken data stream" } });
+  try {
+    render(<TaskCenter />);
+    fireEvent.click(screen.getByRole("button", { name: "后台任务" }));
+    expect(await screen.findByText("进程已退出 · 127.0.0.1:9876 · PID 42")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "复制本页诊断" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(expect.stringContaining("详细堆栈")));
+    fireEvent.click(screen.getByRole("button", { name: "测试单张照片" }));
+    await waitFor(() => expect(api.checkAiPhoto).toHaveBeenCalledWith("D:\\测试.jpeg"));
+    expect(await screen.findByText(/人脸检测成功，找到 2 张人脸/)).toHaveTextContent("broken data stream");
+  } finally {
+    if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
+    else Reflect.deleteProperty(navigator, "clipboard");
+  }
 });

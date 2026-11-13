@@ -8,13 +8,37 @@ from unittest.mock import patch
 from PIL import Image
 from pillow_heif import register_heif_opener
 
-from server import DetectFacesRequest, detect_faces
+from server import AiTag, ClassifyRequest, DetectFacesRequest, classify, detect_faces
 
 from face_detector import FaceDetector
 from inference_runtime import InferenceModel, loaded_providers
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_classification_uses_fresh_preview_when_jpeg_decode_fails(self):
+        class Classifier:
+            def classify_image(self, image):
+                assert image.getpixel((0, 0)) == (13, 45, 67)
+                return [AiTag(label="fixture", confidence=1.0)]
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "broken.jpeg"
+            preview = Path(directory) / "preview.webp"
+            Image.new("RGB", (32, 32)).save(source)
+            source.write_bytes(source.read_bytes()[:-15])
+            Image.new("RGB", (16, 16), (13, 45, 67)).save(preview, lossless=True)
+            missing = Path(directory) / "missing.webp"
+            request = ClassifyRequest(paths=[str(source)], previews={str(source): [str(missing), str(preview)]})
+            with patch("server.load_scene_classifier", return_value=Classifier()), \
+                 patch("server.load_semantic_classifier", return_value=None):
+                result = classify(request).results[0]
+                self.assertIsNone(result.error)
+                self.assertEqual(result.tags[0].label, "fixture")
+                os.utime(preview, (1, 1))
+                result = classify(request).results[0]
+                self.assertIn("无法解码原图", result.error)
+                self.assertEqual(result.tags, [])
+
     def test_gpu_failure_falls_back_per_model_and_updates_status(self):
         class FakeSession:
             def __init__(self, _path, *, sess_options, providers):

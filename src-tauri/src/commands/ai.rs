@@ -1,12 +1,16 @@
 // src-tauri/src/commands/ai.rs
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
-use std::sync::{atomic::AtomicBool, Mutex};
+use std::process::Stdio;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
 use std::time::Duration;
 use tauri::{Emitter, State};
 
 use crate::ai_worker::client::AiWorkerClient;
+use crate::ai_worker::diagnostics::{Snapshot, Source, WorkerDiagnostics, WorkerStatus};
 use crate::commands::project::{get_conn, AppState};
 use crate::commands::tag_rules;
 use crate::db::{ai_task_dao, classification_dao, face_dao, photo_dao, task_error_dao};
@@ -88,7 +92,10 @@ pub struct AiWorkerState {
     pub client: Mutex<Option<AiWorkerClient>>,
     pub port: u16,
     pub process: Mutex<Option<std::process::Child>>,
+    pub start_lock: tokio::sync::Mutex<()>,
     pub pipeline_running: AtomicBool,
+    pub shutting_down: AtomicBool,
+    pub diagnostics: WorkerDiagnostics,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -208,18 +215,16 @@ pub async fn cmd_restore_task_photo(
     .map_err(|error| AppError::Internal(error.to_string()))?
 }
 
-async fn record_ai_batch_failure(
-    conn: &mut rusqlite::Connection,
-    stage: &str,
-    photos: &[crate::models::Photo],
-    error: AppError,
-    worker: State<'_, AiWorkerState>,
+fn describe_ai_request_error(
+    error: &AppError,
+    worker: &AiWorkerState,
+    port: u16,
     elapsed: Duration,
-) -> AppResult<()> {
+) -> String {
     use std::error::Error;
     let message = error.to_string();
     let mut detail = message.clone();
-    if let AppError::Http(http) = &error {
+    if let AppError::Http(http) = error {
         if http.is_timeout() {
             detail.push_str("\n错误类型：本地 AI 请求超时");
         } else if http.is_connect() {
@@ -233,31 +238,113 @@ async fn record_ai_batch_failure(
             source = cause.source();
         }
     }
-    let (process, exited) = match worker.process.lock().unwrap().as_mut() {
+    let process = match worker.process.lock().unwrap().as_mut() {
         Some(child) => {
             let pid = child.id();
             match child.try_wait() {
-                Ok(Some(status)) => (format!("PID {pid}，已退出（{status}）"), true),
-                Ok(None) => (format!("PID {pid}，进程仍在运行"), false),
-                Err(error) => (format!("PID {pid}，无法读取进程状态：{error}"), false),
+                Ok(Some(status)) => format!("PID {pid}，已退出（{status}）"),
+                Ok(None) => format!("PID {pid}，进程仍在运行"),
+                Err(error) => format!("PID {pid}，无法读取进程状态：{error}"),
             }
         }
-        None => ("未记录本地 AI 进程".into(), false),
+        None => "未记录本地 AI 进程".into(),
     };
     detail.push_str(&format!(
         "\n请求用时：{:.2} 秒\nAI 服务：127.0.0.1:{} · {process}",
         elapsed.as_secs_f64(),
-        worker.port
+        port
     ));
+    detail
+}
+
+fn record_ai_batch_failure(
+    conn: &rusqlite::Connection,
+    stage: &str,
+    photos: &[crate::models::Photo],
+    error: &AppError,
+    worker: &AiWorkerState,
+    elapsed: Duration,
+) -> AppResult<()> {
+    let port = worker
+        .client
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or(worker.port, |client| client.port);
+    let detail = describe_ai_request_error(error, worker, port, elapsed);
+    worker.diagnostics.record(Source::Error, None, &detail);
     let ids: Vec<_> = photos.iter().filter_map(|photo| photo.id).collect();
-    ai_task_dao::mark_batch_failed(conn, &ids, stage, &message, &detail)?;
-    if exited {
-        let port = worker.port;
-        cmd_start_ai_worker(port, worker)
-            .await
-            .map_err(|error| AppError::AiWorker(format!("本地 AI 服务重启失败：{error}")))?;
+    ai_task_dao::mark_batch_failed(conn, &ids, stage, &error.to_string(), &detail)
+}
+
+fn worker_exit_status(worker: &AiWorkerState) -> Option<std::process::ExitStatus> {
+    let mut process = worker.process.lock().unwrap();
+    let child = process.as_mut()?;
+    let status = child.try_wait().ok().flatten()?;
+    if !worker.shutting_down.load(Ordering::Acquire) {
+        worker.diagnostics.exited(child.id(), &status.to_string());
     }
-    Ok(())
+    Some(status)
+}
+
+fn ai_service_unavailable(error: &AppError, worker: &AiWorkerState) -> bool {
+    matches!(error, AppError::Http(http) if http.is_connect())
+        || worker_exit_status(worker).is_some()
+}
+
+async fn request_ai_batch<T, F, Fut>(
+    worker: &AiWorkerState,
+    mut request: F,
+) -> AppResult<AppResult<T>>
+where
+    F: FnMut(AiWorkerClient) -> Fut,
+    Fut: std::future::Future<Output = AppResult<T>>,
+{
+    // A service outage leaves claimed photos pending. A request error from
+    // a reachable service is recorded against the batch and processing continues.
+    let existing = worker.client.lock().unwrap().clone();
+    let client = match existing {
+        Some(client) => client,
+        None => ensure_ai_worker(worker.port, worker).await?.0,
+    };
+    let port = client.port;
+    let started = std::time::Instant::now();
+    let first_error = match request(client).await {
+        Err(error) if ai_service_unavailable(&error, worker) => error,
+        result => return Ok(result),
+    };
+    let detail = describe_ai_request_error(&first_error, worker, port, started.elapsed());
+    eprintln!("本地 AI 服务中断，正在恢复并重试当前批次：{detail}");
+    worker.diagnostics.record(
+        Source::Error,
+        None,
+        &format!("AI 服务中断，正在恢复并重试当前批次。\n{detail}"),
+    );
+    let (client, _) = ensure_ai_worker(port, worker).await.map_err(|error| {
+        AppError::AiWorker(format!(
+            "本地 AI 服务恢复失败，照片仍待处理。\n{error}\n{detail}"
+        ))
+    })?;
+    let started = std::time::Instant::now();
+    match request(client).await {
+        Err(error) if ai_service_unavailable(&error, worker) => {
+            let detail = describe_ai_request_error(&error, worker, port, started.elapsed());
+            worker.diagnostics.record(Source::Error, None, &detail);
+            Err(AppError::AiWorker(format!(
+                "本地 AI 服务重试后仍不可用，照片仍待处理。\n{detail}"
+            )))
+        }
+        result => {
+            if result.is_ok() {
+                worker.diagnostics.record(
+                    Source::Service,
+                    None,
+                    "AI 服务恢复后，当前批次已返回结果。",
+                );
+            }
+            Ok(result)
+        }
+    }
 }
 
 fn read_pipeline_status(conn: &rusqlite::Connection) -> AppResult<AiPipelineStatus> {
@@ -328,6 +415,155 @@ fn read_pipeline_status(conn: &rusqlite::Connection) -> AppResult<AiPipelineStat
 
 #[tauri::command]
 pub async fn cmd_start_ai_worker(port: u16, state: State<'_, AiWorkerState>) -> AppResult<String> {
+    ensure_ai_worker(port, &state)
+        .await
+        .map(|(_, message)| message)
+}
+
+#[tauri::command]
+pub fn cmd_get_ai_worker_diagnostics(state: State<'_, AiWorkerState>) -> Snapshot {
+    worker_exit_status(&state);
+    state.diagnostics.snapshot(state.port)
+}
+
+#[tauri::command]
+pub async fn cmd_clear_ai_worker_diagnostics(
+    through: u64,
+    state: State<'_, AiWorkerState>,
+) -> AppResult<()> {
+    let diagnostics = state.diagnostics.clone();
+    tokio::task::spawn_blocking(move || diagnostics.clear(through))
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))??;
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+pub struct PhotoAiCheck {
+    faces: Result<usize, String>,
+    tags: Result<usize, String>,
+}
+
+#[tauri::command]
+pub async fn cmd_check_ai_photo(
+    path: String,
+    state: State<'_, AiWorkerState>,
+) -> AppResult<PhotoAiCheck> {
+    check_ai_photo(path, &state).await
+}
+
+async fn check_ai_photo(path: String, worker: &AiWorkerState) -> AppResult<PhotoAiCheck> {
+    if !std::path::Path::new(&path).is_file() {
+        return Err(AppError::InvalidPath(path));
+    }
+    worker.diagnostics.record(
+        Source::Service,
+        None,
+        &format!("开始单张照片测试 · {path}"),
+    );
+    let cache = tempfile::tempdir()?;
+    let cache_path = cache.path().to_string_lossy();
+    let face_response = request_ai_batch(worker, |client| {
+        let paths = vec![path.clone()];
+        let cache_path = cache_path.as_ref();
+        async move {
+            client
+                .detect_faces(paths, cache_path, Default::default())
+                .await
+        }
+    })
+    .await?;
+    let faces = face_response
+        .map_err(|error| error.to_string())
+        .and_then(|response| {
+            let result = response
+                .results
+                .into_iter()
+                .find(|result| result.path == path)
+                .ok_or_else(|| "AI 服务未返回人脸检测结果".to_string())?;
+            result.error.map_or(Ok(result.faces.len()), Err)
+        });
+
+    let request = crate::models::ClassifyRequest {
+        paths: vec![path.clone()],
+        model: "scene_v2".into(),
+        previews: Default::default(),
+    };
+    let request = &request;
+    let tags = request_ai_batch(
+        worker,
+        |client| async move { client.classify(request).await },
+    )
+    .await
+    .and_then(|result| result)
+    .map_err(|error| error.to_string())
+    .and_then(|response| {
+        let result = response
+            .results
+            .into_iter()
+            .find(|result| result.path == path)
+            .ok_or_else(|| "AI 服务未返回场景分类结果".to_string())?;
+        result.error.map_or(Ok(result.tags.len()), Err)
+    });
+    for (label, result) in [("人脸检测", &faces), ("场景分类", &tags)] {
+        let (source, outcome) = match result {
+            Ok(count) => (Source::Service, format!("成功，返回 {count} 项结果")),
+            Err(error) => (Source::Error, error.clone()),
+        };
+        worker.diagnostics.record(
+            source,
+            None,
+            &format!("{label}单张测试 · {outcome}\n{path}"),
+        );
+    }
+    Ok(PhotoAiCheck { faces, tags })
+}
+
+pub async fn monitor_ai_worker(app: tauri::AppHandle) {
+    use tauri::Manager;
+    let state = app.state::<AiWorkerState>();
+    while !state.shutting_down.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        worker_exit_status(&state);
+    }
+}
+
+async fn ensure_ai_worker(port: u16, state: &AiWorkerState) -> AppResult<(AiWorkerClient, String)> {
+    // Startup and recovery can be requested by more than one screen or task.
+    let _starting = state.start_lock.lock().await;
+    if state.shutting_down.load(Ordering::Acquire) {
+        return Err(AppError::AiWorker("PhotoFactory 正在退出".into()));
+    }
+    let existing = state.client.lock().unwrap().clone();
+    if let Some(client) = existing {
+        if client.port == port
+            && worker_exit_status(state).is_none()
+            && client.health_check().await.unwrap_or(false)
+        {
+            return Ok((client, format!("AI worker already running on port {port}")));
+        }
+    }
+    *state.client.lock().unwrap() = None;
+    state
+        .diagnostics
+        .status(WorkerStatus::Starting, port, None, "正在启动本地 AI 服务。");
+    match start_ai_worker_process(port, state).await {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            if !state.shutting_down.load(Ordering::Acquire) {
+                state
+                    .diagnostics
+                    .status(WorkerStatus::Failed, port, None, &error.to_string());
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn start_ai_worker_process(
+    port: u16,
+    state: &AiWorkerState,
+) -> AppResult<(AiWorkerClient, String)> {
     // Find either the development Python sources or the bundled standalone worker.
     let ai_worker_dir = find_ai_worker_dir().ok_or_else(|| {
         AppError::AiWorker(
@@ -347,20 +583,16 @@ pub async fn cmd_start_ai_worker(port: u16, state: State<'_, AiWorkerState>) -> 
         let _ = existing.kill();
         let _ = existing.wait();
     }
-    // Clean up a stale development worker on the same port.
-    kill_process_on_port(port)?;
-    // Small delay to ensure port is free
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let mut command = if bundled_worker.is_file() {
-        println!("Starting bundled AI worker: {}", bundled_worker.display());
-        crate::process::background_command(&bundled_worker)
+    let (mut command, program) = if bundled_worker.is_file() {
+        (
+            crate::process::background_command(&bundled_worker),
+            bundled_worker,
+        )
     } else if server_py.is_file() {
         let python = ai_worker_python(&ai_worker_dir);
-        println!("Starting development AI worker with: {}", python.display());
         let mut command = crate::process::background_command(&python);
         command.arg(&server_py);
-        command
+        (command, python)
     } else {
         return Err(AppError::AiWorker(format!(
             "AI service executable is missing from {}",
@@ -368,12 +600,23 @@ pub async fn cmd_start_ai_worker(port: u16, state: State<'_, AiWorkerState>) -> 
         )));
     };
     let models_dir = ai_worker_dir.join("models");
+    state.diagnostics.record(
+        Source::Service,
+        None,
+        &format!(
+            "执行文件：{}\n模型目录：{}",
+            program.display(),
+            models_dir.display()
+        ),
+    );
     let ai_threads = std::thread::available_parallelism()
         .map(|count| (count.get() / 2).clamp(2, 6))
         .unwrap_or(2)
         .to_string();
+    let instance_id = uuid::Uuid::new_v4().to_string();
     let mut child = command
         .env("AI_WORKER_PORT", port.to_string())
+        .env("PHOTOFACTORY_AI_INSTANCE", &instance_id)
         .env("AI_MODELS_DIR", &models_dir)
         .env("PHOTFACTORY_AI_THREADS", &ai_threads)
         .env("OMP_NUM_THREADS", &ai_threads)
@@ -384,54 +627,69 @@ pub async fn cmd_start_ai_worker(port: u16, state: State<'_, AiWorkerState>) -> 
         .spawn()
         .map_err(|e| AppError::AiWorker(format!("Failed to start local AI service: {}", e)))?;
 
-    println!(
-        "AI worker process spawned (PID: {}), waiting for it on port {}...",
-        child.id(),
-        port
+    let pid = child.id();
+    state.diagnostics.status(
+        WorkerStatus::Starting,
+        port,
+        Some(pid),
+        "AI 服务进程已启动，正在等待就绪。",
     );
 
     if let Some(stderr) = child.stderr.take() {
+        let diagnostics = state.diagnostics.clone();
         std::thread::spawn(move || {
             drain_worker_log(BufReader::new(stderr), |line| {
+                diagnostics.output(Source::Stderr, pid, line);
                 let _ = writeln!(std::io::stderr().lock(), "[AI worker stderr] {line}");
             });
         });
     }
     if let Some(stdout) = child.stdout.take() {
+        let diagnostics = state.diagnostics.clone();
         std::thread::spawn(move || {
             drain_worker_log(BufReader::new(stdout), |line| {
+                diagnostics.output(Source::Stdout, pid, line);
                 let _ = writeln!(std::io::stdout().lock(), "[AI worker stdout] {line}");
             });
         });
     }
 
-    // Store the process
+    // The close handler sets the flag before taking the process lock.
     {
         let mut guard = state.process.lock().unwrap();
+        if state.shutting_down.load(Ordering::Acquire) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AppError::AiWorker("PhotoFactory 正在退出".into()));
+        }
         *guard = Some(child);
     }
 
     // First launch may include macOS verification of bundled native libraries.
-    let ready = tokio::time::timeout(Duration::from_secs(60), wait_for_health(port))
+    let client = AiWorkerClient::new(port, instance_id);
+    let ready = tokio::time::timeout(Duration::from_secs(60), wait_for_health(&client, state))
         .await
-        .unwrap_or(false);
-    if ready {
-        *state.client.lock().unwrap() = Some(AiWorkerClient::new(port));
-        Ok(format!(
-            "AI worker started on port {} (PID: {})",
-            port,
-            state.process.lock().unwrap().as_ref().unwrap().id()
-        ))
-    } else {
-        // Kill the process since it didn't start
+        .unwrap_or_else(|_| {
+            Err(AppError::AiWorker(format!(
+                "本地 AI 服务启动超时（端口 {port}，PID {pid}）"
+            )))
+        });
+    if let Err(error) = ready {
         let mut guard = state.process.lock().unwrap();
         if let Some(mut child) = guard.take() {
             let _ = child.kill();
+            let _ = child.wait();
         }
-        Err(AppError::AiWorker(
-            "AI worker failed to start. Check that Python dependencies are installed and model files exist.".into()
-        ))
+        return Err(error);
     }
+    *state.client.lock().unwrap() = Some(client.clone());
+    state
+        .diagnostics
+        .status(WorkerStatus::Ready, port, Some(pid), "本地 AI 服务已就绪。");
+    Ok((
+        client,
+        format!("AI worker started on port {port} (PID: {pid})"),
+    ))
 }
 
 fn drain_worker_log(mut reader: impl BufRead, mut log: impl FnMut(&str)) {
@@ -467,37 +725,6 @@ pub(crate) fn ai_worker_python(ai_worker_dir: &std::path::Path) -> std::path::Pa
     } else {
         std::path::PathBuf::from("python3")
     }
-}
-
-/// Kill a stale development process listening on the given port (Unix only).
-#[cfg(unix)]
-fn kill_process_on_port(port: u16) -> AppResult<()> {
-    let output = Command::new("lsof")
-        .args(["-ti", &format!(":{}", port)])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| AppError::AiWorker(format!("lsof failed: {}", e)))?;
-    if output.status.success() {
-        let pids = String::from_utf8_lossy(&output.stdout);
-        for pid in pids.lines() {
-            if let Ok(pid_num) = pid.trim().parse::<i32>() {
-                unsafe { libc::kill(pid_num, libc::SIGTERM) };
-                println!(
-                    "Killed previous process on port {} (PID: {})",
-                    port, pid_num
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn kill_process_on_port(_port: u16) -> AppResult<()> {
-    // The managed child above covers normal lifecycle on Windows. Avoid relying
-    // on Unix-only lsof; a genuinely occupied port is reported by the worker.
-    Ok(())
 }
 
 /// Find the ai_worker directory by checking common locations
@@ -567,24 +794,21 @@ pub(crate) fn find_ai_worker_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Poll /health endpoint until ready or timeout
-async fn wait_for_health(port: u16) -> bool {
-    let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{}/health", port);
-    let mut attempts = 0;
+async fn wait_for_health(client: &AiWorkerClient, state: &AiWorkerState) -> AppResult<()> {
     loop {
-        attempts += 1;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        if let Ok(resp) = client
-            .get(&url)
-            .timeout(Duration::from_secs(2))
-            .send()
-            .await
-        {
-            if resp.status().is_success() {
-                println!("AI worker ready after {attempts} attempts");
-                return true;
-            }
+        if state.shutting_down.load(Ordering::Acquire) {
+            return Err(AppError::AiWorker("PhotoFactory 正在退出".into()));
         }
+        if let Some(status) = worker_exit_status(state) {
+            return Err(AppError::AiWorker(format!(
+                "本地 AI 服务在启动时退出（端口 {}，{status}）",
+                client.port
+            )));
+        }
+        if client.health_check().await.unwrap_or(false) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -594,7 +818,7 @@ pub async fn cmd_run_ai_classification(
     state: State<'_, AppState>,
     worker_state: State<'_, AiWorkerState>,
 ) -> AppResult<usize> {
-    let mut conn = get_conn(state.clone())?;
+    let conn = get_conn(state.clone())?;
     let project = {
         let guard = state.project.lock().unwrap();
         guard
@@ -616,24 +840,12 @@ pub async fn cmd_run_ai_classification(
         return Ok(0);
     }
 
-    // Check if client exists, auto-start if not
-    let needs_start = {
-        let guard = worker_state.client.lock().unwrap();
-        guard.is_none()
-    };
-    if needs_start {
-        cmd_start_ai_worker(worker_state.port, worker_state.clone()).await?;
-    }
-
-    let client = {
-        let guard = worker_state.client.lock().unwrap();
-        guard
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| AppError::AiWorker("Worker not started".into()))?
-    };
-
     let model = project.ai_models.scene_classification.clone();
+    let preview_caches = [
+        project.large_thumbnails_path(),
+        project.medium_thumbnails_path(),
+        project.small_thumbnails_path(),
+    ];
 
     // Process in batches to avoid HTTP timeout
     let batch_limit = 20usize;
@@ -641,21 +853,51 @@ pub async fn cmd_run_ai_classification(
 
     for chunk in pending.chunks(batch_limit) {
         let paths: Vec<String> = chunk.iter().map(|p| p.path.clone()).collect();
+        let previews = paths
+            .iter()
+            .filter_map(|path| {
+                let candidates: Vec<_> = preview_caches
+                    .iter()
+                    .filter_map(|cache| {
+                        crate::thumbnail::generator::find_thumbnail_path(path, cache)
+                    })
+                    .map(|preview| preview.to_string_lossy().into_owned())
+                    .collect();
+                (!candidates.is_empty()).then(|| (path.clone(), candidates))
+            })
+            .collect();
         println!("Classifying batch of {} photos...", paths.len());
+        let request = crate::models::ClassifyRequest {
+            paths,
+            model: model.clone(),
+            previews,
+        };
+        let request = &request;
         let started = std::time::Instant::now();
-        let response = match client.classify(paths, model.clone()).await {
-            Ok(response) => response,
-            Err(error) => {
+        let response = match request_ai_batch(&worker_state, |client| async move {
+            client.classify(request).await
+        })
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
                 record_ai_batch_failure(
-                    &mut conn,
+                    &conn,
                     ai_task_dao::CLASSIFICATION_STAGE,
                     chunk,
-                    error,
-                    worker_state.clone(),
+                    &error,
+                    &worker_state,
                     started.elapsed(),
-                )
-                .await?;
+                )?;
                 continue;
+            }
+            Err(error) => {
+                ai_task_dao::release_claimed_tasks(
+                    &conn,
+                    ai_task_dao::CLASSIFICATION_STAGE,
+                    &claimed,
+                )?;
+                return Err(error);
             }
         };
 
@@ -749,7 +991,7 @@ pub async fn cmd_run_face_detection(
     state: State<'_, AppState>,
     worker_state: State<'_, AiWorkerState>,
 ) -> AppResult<usize> {
-    let mut conn = get_conn(state.clone())?;
+    let conn = get_conn(state.clone())?;
     let project = {
         let guard = state.project.lock().unwrap();
         guard
@@ -771,23 +1013,6 @@ pub async fn cmd_run_face_detection(
         return Ok(0);
     }
 
-    // Check if client exists, auto-start if not
-    let needs_start = {
-        let guard = worker_state.client.lock().unwrap();
-        guard.is_none()
-    };
-    if needs_start {
-        cmd_start_ai_worker(worker_state.port, worker_state.clone()).await?;
-    }
-
-    let client = {
-        let guard = worker_state.client.lock().unwrap();
-        guard
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| AppError::AiWorker("Worker not started".into()))?
-    };
-
     let batch_limit = 10usize;
     let mut total_count = 0;
     let now = chrono::Utc::now().timestamp();
@@ -808,7 +1033,7 @@ pub async fn cmd_run_face_detection(
         let paths: Vec<String> = chunk.iter().map(|p| p.path.clone()).collect();
         println!("Detecting faces in {} photos...", paths.len());
         let large_cache = project.large_thumbnails_path();
-        let previews = paths
+        let previews: std::collections::HashMap<_, _> = paths
             .iter()
             .filter_map(|path| {
                 crate::thumbnail::generator::find_thumbnail_path(path, &large_cache)
@@ -816,19 +1041,28 @@ pub async fn cmd_run_face_detection(
             })
             .collect();
         let started = std::time::Instant::now();
-        let response = match client.detect_faces(paths, temp_path, previews).await {
-            Ok(response) => response,
-            Err(error) => {
+        let response = match request_ai_batch(&worker_state, |client| {
+            let paths = paths.clone();
+            let previews = previews.clone();
+            async move { client.detect_faces(paths, temp_path, previews).await }
+        })
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
                 record_ai_batch_failure(
-                    &mut conn,
+                    &conn,
                     ai_task_dao::FACE_STAGE,
                     chunk,
-                    error,
-                    worker_state.clone(),
+                    &error,
+                    &worker_state,
                     started.elapsed(),
-                )
-                .await?;
+                )?;
                 continue;
+            }
+            Err(error) => {
+                ai_task_dao::release_claimed_tasks(&conn, ai_task_dao::FACE_STAGE, &claimed)?;
+                return Err(error);
             }
         };
 
