@@ -123,9 +123,10 @@ function TrackPhotoMarker({ photo, displayPosition, selected, onView }: {
   </>;
 }
 
-export default function PhotoTrackPanel({ onClose, onViewPhoto }: {
+export default function PhotoTrackPanel({ active = true, onClose, onViewPhoto }: {
+  active?: boolean;
   onClose: () => void;
-  onViewPhoto: (id: number) => void;
+  onViewPhoto: (id: number, photos: TrackPhoto[]) => void;
 }) {
   const map = useMap();
   const panelContentId = useId();
@@ -150,7 +151,8 @@ export default function PhotoTrackPanel({ onClose, onViewPhoto }: {
   const timeline = useRef<HTMLOListElement>(null);
   const day = days.find((item) => item.date === date);
   const points = day?.points ?? [];
-  const photo = points.flatMap((point) => point.photos).find((item) => item.id === selectedPhoto);
+  const dayPhotos = points.flatMap((point) => point.photos);
+  const photo = dayPhotos.find((item) => item.id === selectedPhoto);
   useMapEvents({
     click: () => setExpanded(null),
     zoomstart: () => setExpanded(null),
@@ -158,13 +160,13 @@ export default function PhotoTrackPanel({ onClose, onViewPhoto }: {
   });
 
   useEffect(() => {
-    if (!expanded) return;
+    if (!active || !expanded) return;
     const escape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !useStore.getState().lightboxPhotoId) setExpanded(null);
     };
     document.addEventListener("keydown", escape);
     return () => document.removeEventListener("keydown", escape);
-  }, [expanded]);
+  }, [active, expanded]);
 
   useEffect(() => {
     mounted.current = true;
@@ -292,7 +294,7 @@ export default function PhotoTrackPanel({ onClose, onViewPhoto }: {
       selected={item.id === selectedPhoto} onView={() => {
         const pointId = points.find((point) => point.photos.some((candidate) => candidate.id === item.id))?.photos[0].id;
         selectPhoto(item.id, pointId ?? item.id);
-        onViewPhoto(item.id);
+        onViewPhoto(item.id, expanded?.photos ?? dayPhotos);
       }} />)}
     {createPortal(
       <section ref={panel} aria-label="拍摄轨迹" className="absolute top-14 z-[1100] flex max-h-[calc(100%-4.5rem)] flex-col gap-3 overflow-auto rounded-xl border border-surface-secondary bg-bg-secondary p-3 text-sm text-text-primary shadow-xl"
@@ -388,7 +390,7 @@ export default function PhotoTrackPanel({ onClose, onViewPhoto }: {
                 </li>;
               })}
             </ol>
-            {photo && <TrackThumbnail key={photo.id} photo={photo} onView={() => onViewPhoto(photo.id)} />}
+            {photo && <TrackThumbnail key={photo.id} photo={photo} onView={() => onViewPhoto(photo.id, dayPhotos)} />}
             <label>轨迹名称<input className="ui-button mt-1 w-full" maxLength={100} placeholder="例如：黄山 · 1 月 2 日" value={name}
               disabled={busy} onChange={(event) => setName(event.target.value)} /></label>
             <div className="flex gap-2">

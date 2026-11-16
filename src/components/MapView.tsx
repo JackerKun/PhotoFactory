@@ -15,7 +15,7 @@ import PhotoTrackPanel from "./PhotoTrackPanel";
 import Icon from "./Icon";
 import type { OfflineMapPackage } from "../api/tauri";
 import type { MapSearchResult } from "../api/tauri";
-import { useStore } from "../hooks/usePhotos";
+import { useStore, type LightboxSource } from "../hooks/usePhotos";
 import { useOfflineMapPackages, useOfflineMapStore } from "../hooks/useOfflineMaps";
 import { mapPinIcon } from "./mapPin";
 import { buildSpiderOffsets, photoThumbnailIcon } from "../utils/mapSpider";
@@ -57,14 +57,16 @@ function readViewport(): Viewport {
 }
 
 interface Props {
-  onSelectPhoto: (id: number) => void;
-  onOpenLightbox?: (id: number) => void;
+  active?: boolean;
+  onSelectPhoto: (id: number, source?: LightboxSource) => void;
+  onOpenLightbox?: (id: number, source: LightboxSource) => void;
   photoDetailsOpen?: boolean;
 }
 
-function MapViewport({ onBoundsChange }: { onBoundsChange: (bounds: L.LatLngBounds) => void }) {
+function MapViewport({ active, onBoundsChange }: { active: boolean; onBoundsChange: (bounds: L.LatLngBounds) => void }) {
   const map = useMapEvents({
     moveend: () => {
+      if (!active) return;
       const { lat, lng } = map.wrapLatLng(map.getCenter());
       sessionViewport = { center: [lat, lng], zoom: map.getZoom() };
       try { localStorage.setItem(VIEWPORT_KEY, JSON.stringify(sessionViewport)); }
@@ -73,10 +75,18 @@ function MapViewport({ onBoundsChange }: { onBoundsChange: (bounds: L.LatLngBoun
     },
   });
 
+  const wasHidden = useRef(false);
   useEffect(() => {
-    // Leaflet doesn't emit moveend on mount. Load photos in the initial view.
+    if (!active) {
+      wasHidden.current = true;
+      return;
+    }
+    if (wasHidden.current) {
+      map.invalidateSize({ pan: false });
+      wasHidden.current = false;
+    }
     onBoundsChange(map.getBounds());
-  }, [map, onBoundsChange]);
+  }, [active, map, onBoundsChange]);
 
   return null;
 }
@@ -298,8 +308,8 @@ function ExpandedClusterPager({ expanded, pageCount, onPageChange, onClose }: {
 
 function ClusterLayer({ photos, onSelectPhoto, onOpenLightbox, photoDetailsOpen }: {
   photos: Photo[];
-  onSelectPhoto: (id: number) => void;
-  onOpenLightbox?: (id: number) => void;
+  onSelectPhoto: (id: number, source: LightboxSource) => void;
+  onOpenLightbox?: (id: number, source: LightboxSource) => void;
   photoDetailsOpen: boolean;
 }) {
   const map = useMap();
@@ -377,6 +387,12 @@ function ClusterLayer({ photos, onSelectPhoto, onOpenLightbox, photoDetailsOpen 
   }, [expanded, expandedPhotos, map, zoom]);
 
   const pageCount = expanded ? Math.ceil(expanded.count / SPIDER_PAGE_SIZE) : 0;
+  const mapSource = { items: photos };
+  const clusterSource = (): LightboxSource => ({
+    items: expanded && indexRef.current
+      ? indexRef.current.getLeaves(expanded.id, expanded.count, 0).map((leaf) => leaf.properties)
+      : photos,
+  });
 
   return (
     <>
@@ -413,8 +429,8 @@ function ClusterLayer({ photos, onSelectPhoto, onOpenLightbox, photoDetailsOpen 
           <PhotoMarker
             key={`photo-${photo.id}`}
             photo={photo}
-            onSelectPhoto={onSelectPhoto}
-            onOpenLightbox={onOpenLightbox}
+            onSelectPhoto={(id) => onSelectPhoto(id, mapSource)}
+            onOpenLightbox={onOpenLightbox && ((id) => onOpenLightbox(id, mapSource))}
             map={map}
             photoDetailsOpen={photoDetailsOpen}
           />
@@ -429,8 +445,8 @@ function ClusterLayer({ photos, onSelectPhoto, onOpenLightbox, photoDetailsOpen 
           />
           <PhotoMarker
             photo={{ ...photo, latitude: position.lat, longitude: position.lng }}
-            onSelectPhoto={onSelectPhoto}
-            onOpenLightbox={onOpenLightbox}
+            onSelectPhoto={(id) => onSelectPhoto(id, clusterSource())}
+            onOpenLightbox={onOpenLightbox && ((id) => onOpenLightbox(id, clusterSource()))}
             map={map}
             thumbnailMarker
             photoDetailsOpen={photoDetailsOpen}
@@ -450,12 +466,15 @@ function ClusterLayer({ photos, onSelectPhoto, onOpenLightbox, photoDetailsOpen 
   );
 }
 
-export default React.memo(function MapView({ onSelectPhoto, onOpenLightbox, photoDetailsOpen = false }: Props) {
+export default React.memo(function MapView({ active = true, onSelectPhoto, onOpenLightbox, photoDetailsOpen = false }: Props) {
   const [initialViewport] = useState(readViewport);
   const mapLayer = useOfflineMapStore((state) => state.layer);
   const setMapLayer = useOfflineMapStore((state) => state.setLayer);
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [bounds, setBounds] = useState<L.LatLngBounds | null>(null);
+  const updateBounds = useCallback((next: L.LatLngBounds) => {
+    setBounds((current) => current?.equals(next) ? current : next);
+  }, []);
   const [searchTarget, setSearchTarget] = useState<MapSearchResult | null>(null);
   const [offlineTarget, setOfflineTarget] = useState<OfflineMapPackage | null>(null);
   const [trackOpen, setTrackOpen] = useState(false);
@@ -470,7 +489,7 @@ export default React.memo(function MapView({ onSelectPhoto, onOpenLightbox, phot
   }, [setMapLayer]);
 
   useEffect(() => {
-    if (!bounds) return;
+    if (!active || !bounds) return;
     let cancelled = false;
     // Coalesce rapid pan/zoom updates. The cancellation guard prevents a slower,
     // stale query from replacing data for the current viewport.
@@ -485,19 +504,20 @@ export default React.memo(function MapView({ onSelectPhoto, onOpenLightbox, phot
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [bounds]);
+  }, [active, bounds]);
 
   return (
     <div className="relative isolate h-full">
       <MapContainer center={initialViewport.center} zoom={initialViewport.zoom} className="absolute inset-0 z-0 h-full w-full">
         <CachedTileLayer layer={mapLayer} />
-        <MapViewport onBoundsChange={setBounds} />
-        <RequestedPhotoFocus request={mapFocusRequest} onHandled={clearMapFocusRequest} />
+        <MapViewport active={active} onBoundsChange={updateBounds} />
+        <RequestedPhotoFocus request={active ? mapFocusRequest : null} onHandled={clearMapFocusRequest} />
         <SearchTarget target={searchTarget} />
         <OfflinePackageFocus target={offlineTarget} />
         {trackOpen && projectPath ? <PhotoTrackPanel key={projectPath}
           onClose={() => setTrackOpen(false)}
-          onViewPhoto={onOpenLightbox ?? onSelectPhoto}
+          active={active}
+          onViewPhoto={(id, items) => (onOpenLightbox ?? onSelectPhoto)(id, { items })}
         /> : <ClusterLayer
           photos={photos}
           onSelectPhoto={onSelectPhoto}

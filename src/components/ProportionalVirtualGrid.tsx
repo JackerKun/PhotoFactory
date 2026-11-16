@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { useStore } from "../hooks/usePhotos";
+import { photoFilterKey, useStore } from "../hooks/usePhotos";
 import type { Photo } from "../types";
 import PhotoCard from "./PhotoCard";
 import { matchesTimeline, type TimelineJump } from "../utils/photoTimeline";
@@ -95,7 +95,7 @@ export default React.memo(function ProportionalVirtualGrid({
   const scrollRef = useRef<HTMLDivElement>(null);
   const lastScrollTop = useRef(useStore.getState().photoGridScrollOffsets.proportional);
   const restoredScroll = useRef(false);
-  const previousFilterKey = useRef(JSON.stringify(filter));
+  const filterKey = photoFilterKey(filter);
   const jumpAttemptRef = useRef<{ requestId: number; photoCount: number } | null>(null);
   const [width, setWidth] = useState(800);
 
@@ -124,16 +124,6 @@ export default React.memo(function ProportionalVirtualGrid({
   });
 
   useEffect(() => { virtualizer.measure(); }, [rows, virtualizer]);
-
-  useEffect(() => {
-    const currentFilterKey = JSON.stringify(filter);
-    if (previousFilterKey.current !== currentFilterKey) {
-      previousFilterKey.current = currentFilterKey;
-      lastScrollTop.current = 0;
-      restoredScroll.current = true;
-      if (scrollRef.current) scrollRef.current.scrollTop = 0;
-    }
-  }, [filter]);
 
   useEffect(() => {
     if (restoredScroll.current || !scrollRef.current) return;
@@ -175,8 +165,8 @@ export default React.memo(function ProportionalVirtualGrid({
   }, [hasNext, loadMore, loading, onTimelineJumpComplete, onVisiblePhotoChange, photos, rows, timelineJump, virtualizer]);
 
   useEffect(() => () => {
-    useStore.getState().setPhotoGridScrollOffset("proportional", lastScrollTop.current);
-  }, []);
+    useStore.getState().setPhotoGridScrollOffset("proportional", lastScrollTop.current, filterKey);
+  }, [filterKey]);
 
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;

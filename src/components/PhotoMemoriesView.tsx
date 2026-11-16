@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type Ref, type UIEventHandler } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getThumbnailPath, setPhotoMemoryPreferences } from "../api/tauri";
 import { usePhotoMemories } from "../hooks/usePhotoMemories";
@@ -155,14 +155,16 @@ export function MemoryDetail({ memory, root, onBack }: {
   </section>;
 }
 
-export default function PhotoMemoriesView({ memories, size, loading, error, onOpen }: {
+export default function PhotoMemoriesView({ memories, size, loading, error, onOpen, scrollRef, onScroll }: {
   memories: PhotoMemory[];
   size: number;
   loading: boolean;
   error: string | null;
   onOpen: (id: number) => void;
+  scrollRef?: Ref<HTMLElement>;
+  onScroll?: UIEventHandler<HTMLElement>;
 }) {
-  return <section aria-busy={loading} className="album-catalog min-h-0 flex-1 overflow-y-auto">
+  return <section ref={scrollRef} onScroll={onScroll} aria-busy={loading} className="album-catalog min-h-0 flex-1 overflow-y-auto">
     {error && <p role="alert" className="mb-4 break-words rounded-xl border border-red-500/30 bg-red-500/10 p-3 text-sm">回忆读取失败。{error}</p>}
     {!error && memories.length === 0 && <p role="status" className="py-12 text-center text-text-muted">{loading ? "正在整理回忆…" : "没有符合条件的回忆"}</p>}
     <div className="album-cover-grid grid" style={albumGridStyle(size)}>

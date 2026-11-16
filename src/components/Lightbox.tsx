@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { imageErrorMessage } from "../utils/imageError";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { useStore } from "../hooks/usePhotos";
+import { useStore, type LightboxItem } from "../hooks/usePhotos";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import * as api from "../api/tauri";
 import type { FaceCluster, FaceDetection, Photo, PhotoEdit } from "../types";
@@ -21,9 +21,17 @@ const thumbCache = new Map<number, string>();
 interface Props { photoId: number; onClose: () => void }
 
 export default React.memo(function Lightbox({ photoId, onClose }: Props) {
-  const { photos: storePhotos, setLightboxPhotoId, selectedPhotoId, setSelectedPhotoId, updatePhotoInList } = useStore();
+  const { setLightboxPhotoId, selectedPhotoId, setSelectedPhotoId, updatePhotoInList } = useStore();
   const faceDataRevision = useStore((state) => state.faceDataRevision);
-  const [photos, setPhotos] = useState<Photo[]>([]);
+  const source = useStore((state) => state.lightboxSource);
+  const [folderPhotos, setFolderPhotos] = useState<Photo[]>([]);
+  const [extraPhotos, setExtraPhotos] = useState<readonly LightboxItem[]>([]);
+  const [hasNext, setHasNext] = useState(true);
+  const [nextError, setNextError] = useState("");
+  const pendingNext = useRef(false);
+  const photos = useMemo(() => source
+    ? [...source.items, ...extraPhotos]
+    : folderPhotos, [source, extraPhotos, folderPhotos]);
   const [currentPhoto, setCurrentPhotoState] = useState<Photo | null>(null);
   const currentIndex = useMemo(() => photos.findIndex((p) => p.id === photoId), [photos, photoId]);
   const prevPhotoIdRef = useRef(photoId);
@@ -36,45 +44,63 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
     prevPhotoIdRef.current = photoId;
   }, [photoId, selectedPhotoId, setSelectedPhotoId]);
 
-  // Build a stable, folder-local navigation context. Map markers are loaded by
-  // viewport and the main grid is paged, so neither collection is suitable for
-  // a lightbox filmstrip.
   useEffect(() => {
-    const existing = photos.find((photo) => photo.id === photoId);
+    // Explicit result lists own navigation. Only a standalone photo uses its folder.
+    const existing = source ? undefined : folderPhotos.find((photo) => photo.id === photoId);
     if (existing) {
       setCurrentPhotoState(existing);
       return;
     }
-
     let cancelled = false;
-    setCurrentPhotoState(null);
-    Promise.allSettled([api.getPhoto(photoId), api.getLightboxPhotos(photoId)])
-      .then(([photoResult, siblingsResult]) => {
+    const loadPhoto = async () => {
+      try {
+        const photo = await api.getPhoto(photoId);
         if (cancelled) return;
-        if (photoResult.status === "rejected") throw photoResult.reason;
-        const photo = photoResult.value;
-        const siblings = siblingsResult.status === "fulfilled" ? siblingsResult.value : [];
-        const context = siblings.some((item) => item.id === photoId) ? siblings : [photo];
-        setPhotos(context);
         setCurrentPhotoState(photo);
-      })
-      .catch((error) => {
+        if (source) return;
+        const siblings = await api.getLightboxPhotos(photoId).catch(() => []);
+        if (!cancelled) setFolderPhotos(siblings.some((item) => item.id === photoId) ? siblings : [photo]);
+      } catch (error) {
         if (cancelled) return;
         console.error(error);
-        const fallback = storePhotos.find((photo) => photo.id === photoId);
-        if (fallback) {
-          setPhotos(storePhotos);
-          setCurrentPhotoState(fallback);
-        }
-      });
+        const fallback = useStore.getState().photos.find((photo) => photo.id === photoId);
+        setCurrentPhotoState(fallback ?? null);
+        if (!source && fallback) setFolderPhotos([fallback]);
+      }
+    };
+    setCurrentPhotoState(null);
+    void loadPhoto();
     return () => { cancelled = true; };
-  }, [photoId, photos, storePhotos]);
+  }, [photoId, source, folderPhotos]);
 
-  // Navigate
-  const navigate = useCallback((direction: -1 | 1) => {
-    const newPhoto = photos[currentIndex + direction];
-    if (newPhoto?.id) setLightboxPhotoId(newPhoto.id);
-  }, [photos, currentIndex, setLightboxPhotoId]);
+  const canLoadNext = hasNext && !!source?.loadNext;
+  const navigate = useCallback(async (direction: -1 | 1) => {
+    if (currentIndex < 0) return;
+    const nextPhoto = photos[currentIndex + direction];
+    if (nextPhoto?.id != null) {
+      setLightboxPhotoId(nextPhoto.id);
+      return;
+    }
+    if (direction < 0 || !canLoadNext || !source?.loadNext || pendingNext.current) return;
+
+    pendingNext.current = true;
+    setNextError("");
+    try {
+      const nextPage = await source.loadNext(photos);
+      if (useStore.getState().lightboxSource !== source) return;
+      const knownIds = new Set(photos.map((photo) => photo.id));
+      const newPhotos = nextPage.filter((photo) => photo.id != null && !knownIds.has(photo.id));
+      setHasNext(newPhotos.length > 0);
+      setExtraPhotos((items) => [...items, ...newPhotos]);
+      if (newPhotos[0]?.id != null && useStore.getState().lightboxPhotoId === photoId) {
+        setLightboxPhotoId(newPhotos[0].id);
+      }
+    } catch (error) {
+      if (useStore.getState().lightboxSource === source) setNextError(String(error));
+    } finally {
+      pendingNext.current = false;
+    }
+  }, [photos, currentIndex, canLoadNext, source, photoId, setLightboxPhotoId]);
 
   // Filmstrip virtualizer
   const filmstripRef = useRef<HTMLDivElement>(null);
@@ -291,7 +317,7 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
 
   const updateCurrentPhoto = useCallback((updates: Partial<Photo>) => {
     setCurrentPhotoState((photo) => photo ? { ...photo, ...updates } : photo);
-    setPhotos((items) => items.map((photo) => photo.id === photoId ? { ...photo, ...updates } : photo));
+    setFolderPhotos((items) => items.map((photo) => photo.id === photoId ? { ...photo, ...updates } : photo));
     updatePhotoInList(photoId, updates);
   }, [photoId, updatePhotoInList]);
 
@@ -543,7 +569,7 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
         )}
 
         {/* Right arrow */}
-        {currentIndex < photos.length - 1 && zoom <= 1 && (
+        {currentIndex >= 0 && (currentIndex < photos.length - 1 || canLoadNext) && zoom <= 1 && (
           <button
             onClick={() => navigate(1)}
             className="absolute right-4 z-10 text-white/60 hover:text-white text-4xl p-2"
@@ -636,13 +662,14 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
           })}
         </div>
       </div>
+      {nextError && <p role="alert" className="absolute bottom-24 right-4 max-w-sm rounded bg-black/80 p-2 text-sm text-white">无法加载下一页：{nextError}。可再次向右重试。</p>}
       <KeyboardShortcutsDialog open={showShortcuts} onClose={() => setShowShortcuts(false)} />
     </div>
   );
 });
 
 // Separate component for filmstrip thumbnails with lazy loading
-function FilmstripThumbnail({ photo }: { photo: Photo }) {
+function FilmstripThumbnail({ photo }: { photo: LightboxItem }) {
   const [thumbUrl, setThumbUrl] = useState<string | null>(() => thumbCache.get(photo.id!) ?? null);
 
   useEffect(() => {
@@ -656,7 +683,7 @@ function FilmstripThumbnail({ photo }: { photo: Photo }) {
       }
     }).catch(() => {
       // Fallback: for small files, try file URL directly
-      if (!cancelled && photo.file_size <= 30 * 1024 * 1024) {
+      if (!cancelled && photo.path && photo.file_size != null && photo.file_size <= 30 * 1024 * 1024) {
         const url = convertFileSrc(photo.path);
         thumbCache.set(photo.id!, url);
         setThumbUrl(url);

@@ -79,6 +79,29 @@ it("scrolls the lightbox filmstrip in both directions with a vertical mouse whee
   expect(useStore.getState().lightboxPhotoId).toBe(1);
 });
 
+it("follows the result order and loads its next page without looking up folder siblings", async () => {
+  const loadNext = vi.fn().mockResolvedValueOnce([photo(7)]).mockResolvedValueOnce([]);
+  useStore.getState().openLightbox(4, { items: [photo(4), photo(9)], loadNext });
+  function Viewer() {
+    const id = useStore((state) => state.lightboxPhotoId);
+    return id == null ? null : <Lightbox photoId={id} onClose={vi.fn()} />;
+  }
+  render(<MemoryRouter><Viewer /></MemoryRouter>);
+  await screen.findByRole("img", { name: "4.jpg" });
+
+  fireEvent.keyDown(document.body, { key: "ArrowRight" });
+  await screen.findByRole("img", { name: "9.jpg" });
+  expect(loadNext).not.toHaveBeenCalled();
+
+  fireEvent.keyDown(document.body, { key: "ArrowRight" });
+  await screen.findByRole("img", { name: "7.jpg" });
+  expect(loadNext).toHaveBeenCalledWith([photo(4), photo(9)]);
+
+  fireEvent.keyDown(document.body, { key: "ArrowLeft" });
+  await waitFor(() => expect(useStore.getState().lightboxPhotoId).toBe(9));
+  expect(api.getLightboxPhotos).not.toHaveBeenCalled();
+});
+
 it("names the original group from the photo detail and refreshes both photos and the active filter", async () => {
   useStore.setState({ selectedPhotoId: 1, filter: { person_id: 41 } });
   const page = (id: number) => <MemoryRouter><ActiveFilters /><Lightbox photoId={id} onClose={vi.fn()} /></MemoryRouter>;

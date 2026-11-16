@@ -28,6 +28,7 @@ interface Props {
   onClose: () => void;
   width?: number;
   embedded?: boolean;
+  onOpenLightbox?: () => void;
   onEditingFaceChange?: (faceId: number | null) => void;
 }
 
@@ -821,7 +822,7 @@ function LocationSection({ photo, onGpsSaved, dirtyRef, pendingRef, onOpenBatchE
 
 // ---- Main PhotoDetail ----
 
-export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, embedded = false, onEditingFaceChange }: Props) {
+export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, embedded = false, onOpenLightbox, onEditingFaceChange }: Props) {
   const [photo, setPhoto] = useState<Photo | null>(null);
   const [faces, setFaces] = useState<FaceDetection[]>([]);
   const [faceClusters, setFaceClusters] = useState<FaceCluster[]>([]);
@@ -847,7 +848,14 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
   const previewDecodeRetriesRef = useRef(0);
   const previewDecodeTimerRef = useRef<number | null>(null);
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
-  const { setLightboxPhotoId } = useStore();
+  const openLargePhoto = () => {
+    if (onOpenLightbox) return onOpenLightbox();
+    const state = useStore.getState();
+    if (state.selectedPhotoId === photoId && state.selectedLightboxSource) {
+      state.openLightbox(photoId, state.selectedLightboxSource);
+    }
+    else state.setLightboxPhotoId(photoId);
+  };
   const requestMapFocus = useStore((state) => state.requestMapFocus);
   const faceDataRevision = useStore((state) => state.faceDataRevision);
   const markFaceDataChanged = useStore((state) => state.markFaceDataChanged);
@@ -1158,7 +1166,7 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
         {!embedded && (
           <div
             className="aspect-[4/3] bg-surface-primary rounded-lg overflow-hidden cursor-zoom-in"
-            onDoubleClick={() => setLightboxPhotoId(photoId)}
+            onDoubleClick={openLargePhoto}
             onContextMenu={(event) => {
               event.preventDefault();
               event.stopPropagation();
@@ -1177,7 +1185,7 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
         )}
 
         <div className="flex flex-wrap gap-2">
-          {!embedded && <button type="button" className="ui-button" onClick={() => setLightboxPhotoId(photoId)}>查看大图</button>}
+          {!embedded && <button type="button" className="ui-button" onClick={openLargePhoto}>查看大图</button>}
           <button type="button" className="ui-button" onClick={() => api.revealInFileManager(photo.path).catch((error) => setActionError(String(error)))}>文件位置</button>
         </div>
           <div className="flex items-center gap-3 border-t border-surface-secondary pt-2">

@@ -13,7 +13,6 @@ import { buildJustifiedRows } from "./ProportionalVirtualGrid";
 import { calculateColumnCount } from "../hooks/useVirtualGrid";
 import { matchesTimeline, photoTimelinePosition, type TimelinePosition } from "../utils/photoTimeline";
 
-interface Props { onSelectPhoto: (id: number) => void; }
 const GAP = 4;
 const typeLabels: Record<SmartAlbum["album_type"], string> = {
   travel: "旅行", monthly: "月度精选", themed: "主题", person: "人物", manual: "手工相册", person_combination: "人物组合",
@@ -90,7 +89,7 @@ function Dialog({ title, children, onClose }: { title: string; children: React.R
   return <div className="fixed inset-0 z-[1200] flex items-center justify-center bg-black/35 p-5" onMouseDown={onClose}><div className="max-h-[85vh] w-full max-w-4xl overflow-hidden rounded-2xl bg-bg-secondary shadow-2xl" onMouseDown={(e) => e.stopPropagation()}><div className="flex h-14 items-center justify-between border-b border-surface-secondary px-5"><h3 className="font-semibold">{title}</h3><button onClick={onClose} className="rounded p-2 text-text-muted hover:bg-surface-primary">✕</button></div>{children}</div></div>;
 }
 
-export default React.memo(function SmartAlbumView({ onSelectPhoto }: Props) {
+export default React.memo(function SmartAlbumView() {
   const [section, setSection] = useState<"albums" | "memories">("albums");
   const [memoryQuery, setMemoryQuery] = useState("");
   const [memoryFilter, setMemoryFilter] = useState("all");
@@ -133,7 +132,7 @@ export default React.memo(function SmartAlbumView({ onSelectPhoto }: Props) {
   const pickerLoadingRef = useRef(false);
   const pickerRequestRef = useRef(0);
   const [albumCardSize, setAlbumCardSize] = useState(() => Number(localStorage.getItem("photofactory.smartAlbumCardSize")) || 220);
-  const { thumbnailShape, thumbnailSize, setThumbnailShape, setSelectedPhotoId, setLightboxPhotoId, selectedPhotoId } = useStore();
+  const { thumbnailShape, thumbnailSize, setThumbnailShape, setSelectedPhotoId, openLightbox, selectedPhotoId } = useStore();
 
   const refreshAlbums = useCallback(async () => {
     const next = await api.getSmartAlbums() as SmartAlbum[]; setAlbums(next);
@@ -189,11 +188,22 @@ export default React.memo(function SmartAlbumView({ onSelectPhoto }: Props) {
   }, [pickerCursor, pickerQuery]);
   useEffect(() => { if (!pickerOpen) return; const timer = setTimeout(() => void loadPicker(true), 250); return () => clearTimeout(timer); }, [pickerOpen, pickerQuery]);
   const toggleSelection = (photo: Photo) => setSelection((current) => { const next = new Set(current); next.has(photo.id!) ? next.delete(photo.id!) : next.add(photo.id!); return next; });
-  const handlePhoto = (photo: Photo) => { if (selectionMode) return toggleSelection(photo); onSelectPhoto(photo.id!); setSelectedPhotoId(photo.id!); };
+  const handlePhoto = (photo: Photo) => {
+    if (selectionMode) return toggleSelection(photo);
+    setSelectedPhotoId(photo.id!, { items: detailPhotos });
+  };
+
+  const catalogOffsets = useRef({ albums: 0, memories: 0 });
+  const catalogRef = useCallback((node: HTMLElement | null) => {
+    if (node) node.scrollTop = catalogOffsets.current[section];
+  }, [section]);
+  const saveCatalogOffset = (event: React.UIEvent<HTMLElement>) => {
+    catalogOffsets.current[section] = event.currentTarget.scrollTop;
+  };
 
   if (selectedAlbum) return <div className="flex h-full flex-col">
     <header className="ui-toolbar border-b border-surface-secondary bg-bg-secondary px-[var(--workspace-inline)] py-[var(--ui-gap)]">
-      <button type="button" onClick={() => { setSelectedAlbum(null); setSelectionMode(false); setSelection(new Set()); }} className="ui-button">← 返回</button>
+      <button type="button" onClick={() => { setSelectedPhotoId(null); setSelectedAlbum(null); setSelectionMode(false); setSelection(new Set()); }} className="ui-button">← 返回</button>
       <h2 className="min-w-0 truncate text-xl font-bold">{selectedAlbum.name}</h2>
       <span className="text-sm text-text-muted">{albumPhotos.length}/{selectedAlbum.photo_count} 张</span>
       <span className="rounded bg-accent-primary/10 px-2 py-0.5 text-xs text-accent-link">{typeLabels[selectedAlbum.album_type]}</span>
@@ -226,7 +236,7 @@ export default React.memo(function SmartAlbumView({ onSelectPhoto }: Props) {
       </>}
       <span className="ml-auto text-xs text-text-muted">{detailPhotos.length} 张</span>
     </div>
-    <div className="flex min-h-0 flex-1">{loading && albumPhotos.length === 0 ? <div className="flex flex-1 items-center justify-center text-text-muted">正在加载相册…</div> : <AlbumPhotoGrid photos={detailPhotos} shape={thumbnailShape} size={thumbnailSize} selectedId={selectedPhotoId} selectionMode={selectionMode} selection={selection} jump={timelineJump} onVisible={setVisiblePhoto} onPhoto={handlePhoto} onDouble={(photo) => setLightboxPhotoId(photo.id!)} />}<PhotoTimelineRail buckets={buckets} ascending={detailSort === "date-asc"} active={photoTimelinePosition(visiblePhoto)} onJump={(position) => { setTimelineJump(null); requestAnimationFrame(() => setTimelineJump(position)); }} /></div>
+    <div className="flex min-h-0 flex-1">{loading && albumPhotos.length === 0 ? <div className="flex flex-1 items-center justify-center text-text-muted">正在加载相册…</div> : <AlbumPhotoGrid photos={detailPhotos} shape={thumbnailShape} size={thumbnailSize} selectedId={selectedPhotoId} selectionMode={selectionMode} selection={selection} jump={timelineJump} onVisible={setVisiblePhoto} onPhoto={handlePhoto} onDouble={(photo) => openLightbox(photo.id!, { items: detailPhotos })} />}<PhotoTimelineRail buckets={buckets} ascending={detailSort === "date-asc"} active={photoTimelinePosition(visiblePhoto)} onJump={(position) => { setTimelineJump(null); requestAnimationFrame(() => setTimelineJump(position)); }} /></div>
     {pickerOpen && <Dialog title="向相册添加照片" onClose={() => setPickerOpen(false)}><div className="flex h-[70vh] flex-col p-4"><input autoFocus value={pickerQuery} onChange={(e) => setPickerQuery(e.target.value)} className="ui-input mb-3" placeholder="按文件名、日期、人物、标签或 EXIF 搜索…" /><div ref={pickerScrollRef} onScroll={(event) => { const element = event.currentTarget; if (pickerHasMore && !pickerLoading && element.scrollHeight - element.scrollTop - element.clientHeight < 500) void loadPicker(false); }} className="grid flex-1 auto-rows-max content-start grid-cols-4 gap-2 overflow-y-auto pr-1">{pickerPhotos.map((photo) => <button key={photo.id} onClick={() => setPickerSelection((current) => { const next = new Set(current); next.has(photo.id!) ? next.delete(photo.id!) : next.add(photo.id!); return next; })} className={`relative block w-full aspect-square self-start overflow-hidden rounded-lg border-2 ${pickerSelection.has(photo.id!) ? "border-accent-primary" : "border-transparent"}`}><AlbumCoverThumbnail photoId={photo.id!} /><span className="absolute bottom-0 left-0 right-0 truncate bg-black/55 px-1 py-0.5 text-left text-xs text-white">{photo.filename}</span></button>)}{pickerLoading && <div className="col-span-4 py-3 text-center text-sm text-text-muted">正在加载更多照片…</div>}{!pickerHasMore && pickerPhotos.length > 0 && <div className="col-span-4 py-3 text-center text-xs text-text-muted">已加载全部 {pickerPhotos.length} 张照片</div>}</div><div className="mt-3 flex items-center justify-between"><span className="text-xs text-text-muted">已加载 {pickerPhotos.length} 张 · 已选择 {pickerSelection.size} 张</span><div className="flex gap-2"><button onClick={() => setPickerOpen(false)} className="ui-button">取消</button><button disabled={!pickerSelection.size} onClick={async () => { await api.addPhotosToAlbum(selectedAlbum.id, [...pickerSelection]); setPickerOpen(false); await loadAlbumPhotos(selectedAlbum); await refreshAlbums(); }} className="ui-button-primary">添加 {pickerSelection.size} 张</button></div></div></div></Dialog>}
   </div>;
 
@@ -331,7 +341,7 @@ export default React.memo(function SmartAlbumView({ onSelectPhoto }: Props) {
       </div>
       {showingAlbums && generationFeedback && <p role={generationFeedback.error ? "alert" : "status"} className={`absolute right-4 top-full max-w-[min(28rem,85%)] break-words rounded-lg border border-surface-secondary bg-bg-secondary px-3 py-2 text-sm shadow-md ${generationFeedback.error ? "text-red-500" : "text-text-secondary"}`}>{generationFeedback.text}</p>}
     </header>
-    {showingAlbums ? <section className="album-catalog min-h-0 flex-1 overflow-y-auto">
+    {showingAlbums ? <section ref={catalogRef} onScroll={saveCatalogOffset} className="album-catalog min-h-0 flex-1 overflow-y-auto">
       {visibleAlbums.length === 0 && <p className="py-12 text-center text-text-muted">没有符合条件的相册</p>}
       <div className="album-cover-grid grid" style={albumGridStyle(albumCardSize)}>
         {visibleAlbums.map((album) => <AlbumCoverCard
@@ -353,6 +363,8 @@ export default React.memo(function SmartAlbumView({ onSelectPhoto }: Props) {
       loading={memoryState.loading}
       error={memoryState.error}
       onOpen={setSelectedMemoryId}
+      scrollRef={catalogRef}
+      onScroll={saveCatalogOffset}
     />}
     {createOpen && <Dialog title="新建手工相册" onClose={() => setCreateOpen(false)}><form className="p-5" onSubmit={async (e) => { e.preventDefault(); if (!newAlbumName.trim()) return; const id = await api.createManualAlbum(newAlbumName); setCreateOpen(false); setNewAlbumName(""); const nextAlbums = await api.getSmartAlbums() as SmartAlbum[]; setAlbums(nextAlbums); const next = nextAlbums.find((album) => album.id === id); if (next) setSelectedAlbum(next); }}><label className="text-sm text-text-muted">相册名称</label><input autoFocus value={newAlbumName} onChange={(e) => setNewAlbumName(e.target.value)} className="ui-input mt-2 w-full" placeholder="例如：家庭精选" /><div className="mt-5 flex justify-end gap-2"><button type="button" onClick={() => setCreateOpen(false)} className="ui-button">取消</button><button className="ui-button-primary">创建并添加照片</button></div></form></Dialog>}
   </div>;

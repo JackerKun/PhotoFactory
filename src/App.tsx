@@ -1,5 +1,5 @@
 import { Component, useState, useEffect, useCallback, useMemo, useRef, type ReactNode } from "react";
-import { HashRouter, Routes, Route, Navigate, useNavigate, useSearchParams, useLocation } from "react-router-dom";
+import { HashRouter, Navigate, useNavigate, useSearchParams, useLocation, useNavigationType } from "react-router-dom";
 import { listen } from "@tauri-apps/api/event";
 import Sidebar from "./components/Sidebar";
 import AppUpdates from "./components/AppUpdates";
@@ -12,7 +12,7 @@ import SmartAlbumView from "./components/SmartAlbumView";
 import LibraryToolsView from "./components/LibraryToolsView";
 import ImportModal from "./components/ImportModal";
 import Lightbox from "./components/Lightbox";
-import { useStore } from "./hooks/usePhotos";
+import { useStore, photoFilterKey, type LightboxSource } from "./hooks/usePhotos";
 import { usePreparePhotoMemories } from "./hooks/usePhotoMemories";
 import { useKeyboardNavigation } from "./hooks/useKeyboardNavigation";
 import type { AiProcessingStatus, ViewMode } from "./types";
@@ -53,11 +53,12 @@ function FilterSync() {
   const location = useLocation();
   const navigate = useNavigate();
   const { filter, setFilter, loadPhotos, project, setPhotoRoute } = useStore();
+  const navigationType = useNavigationType();
   const isPhotoRoute = location.pathname === "/" || location.pathname === "/grid";
   const syncingFromUrl = useRef(false);
   const urlFilter = useMemo(() => photoFilterFromSearchParams(searchParams), [searchParams]);
-  const urlFilterKey = JSON.stringify(urlFilter);
-  const filterKey = JSON.stringify(filter);
+  const urlFilterKey = photoFilterKey(urlFilter);
+  const filterKey = photoFilterKey(filter);
 
   // Initialize filter from URL when route/params change
   useEffect(() => {
@@ -68,8 +69,8 @@ function FilterSync() {
       // changing Zustand so the stale store value cannot immediately erase the
       // just-opened URL and start an infinite navigation loop.
       syncingFromUrl.current = true;
-      setFilter(urlFilter, true);
-      loadPhotos();
+      setFilter(urlFilter, true, navigationType === "POP");
+      if (!useStore.getState().photos.length) loadPhotos();
     } else {
       const state = useStore.getState();
       if (state.photos.length === 0 && !state.loading) loadPhotos();
@@ -93,9 +94,9 @@ function FilterSync() {
     const finalQs = params.toString();
     const target = `${location.pathname}${finalQs ? "?" + finalQs : ""}`;
     if (`${location.pathname}${location.search}` !== target) {
-      navigate(target, { replace: true });
+      navigate(target, { replace: true, state: location.state });
     }
-  }, [filterKey, urlFilterKey, isPhotoRoute, location.pathname, location.search, navigate, searchParams]);
+  }, [filterKey, urlFilterKey, isPhotoRoute, location.pathname, location.search, location.state, navigate, searchParams]);
 
   return null;
 }
@@ -105,6 +106,13 @@ function AppLayout({ children, viewMode }: { children: React.ReactNode; viewMode
   const { project, setProject, lightboxPhotoId, setLightboxPhotoId, selectedPhotoId, setSelectedPhotoId, photos, gpsBatchSession, closeGpsBatchEditor, batchGpsPending, setBatchGpsPending } = useStore();
   const updatePhotoInList = useStore((s) => s.updatePhotoInList);
   const navigate = useNavigate();
+  const previousView = useRef(viewMode);
+  useEffect(() => {
+    if (previousView.current === viewMode) return;
+    previousView.current = viewMode;
+    setSelectedPhotoId(null);
+    setLightboxPhotoId(null);
+  }, [viewMode, setSelectedPhotoId, setLightboxPhotoId]);
   const hasStandalonePhotoDetail = viewMode === "grid" || viewMode === "albums" || viewMode === "map";
   const [showImport, setShowImport] = useState(!project);
   const [sidebarWidth, setSidebarWidth] = useState(() => {
@@ -279,7 +287,9 @@ function AppLayout({ children, viewMode }: { children: React.ReactNode; viewMode
             style={{ right: detailWidth - 2 }}
             onPointerDown={(event) => beginResize("detail", event)}
           ><span className="absolute inset-y-0 -left-1 -right-1" /></div>
-          <PhotoDetail width={detailWidth} photoId={selectedPhotoId} onClose={() => setSelectedPhotoId(null)} />
+          <PhotoDetail width={detailWidth} photoId={selectedPhotoId}
+            onOpenLightbox={viewMode === "grid" ? () => useStore.getState().openLightbox(selectedPhotoId, gridLightboxSource()) : undefined}
+            onClose={() => setSelectedPhotoId(null)} />
         </>
       )}
       {lightboxPhotoId && !gpsBatchSession && <Lightbox photoId={lightboxPhotoId} onClose={() => setLightboxPhotoId(null)} />}
@@ -326,11 +336,25 @@ function AppLayout({ children, viewMode }: { children: React.ReactNode; viewMode
   );
 }
 
+function gridLightboxSource(): LightboxSource {
+  const { photos, filter, cursor, hasNext } = useStore.getState();
+  let nextCursor = hasNext ? cursor : null;
+  return {
+    items: photos,
+    loadNext: nextCursor ? async () => {
+      if (!nextCursor) return [];
+      const page = await api.getPhotos(nextCursor, 200, filter);
+      nextCursor = page.has_more ? page.next_cursor : null;
+      return page.photos;
+    } : undefined,
+  };
+}
+
 function GridPage() {
   const { photos, thumbnailSize, lightboxPhotoId, selectedPhotoId, setSelectedPhotoId } = useStore();
   const project = useStore((s) => s.project);
   const gpsEditorOpen = useStore((s) => s.gpsBatchSession !== null);
-  const setLightboxPhotoId = useStore((s) => s.setLightboxPhotoId);
+  const openLightbox = useStore((s) => s.openLightbox);
   const updatePhotoInList = useStore((s) => s.updatePhotoInList);
 
   const handleSelectPhoto = useCallback((id: number) => {
@@ -345,8 +369,8 @@ function GridPage() {
 
   const handleOpenPhoto = useCallback((id: number) => {
     setSelectedPhotoId(null);
-    setLightboxPhotoId(id);
-  }, [setLightboxPhotoId, setSelectedPhotoId]);
+    openLightbox(id, gridLightboxSource());
+  }, [openLightbox, setSelectedPhotoId]);
 
   const handleRatePhoto = useCallback(async (id: number, rating: number) => {
     await api.updatePhotosRating([id], rating);
@@ -371,62 +395,65 @@ function GridPage() {
   });
 
   return (
-    <AppLayout viewMode="grid">
-      <PhotoGrid
-        onSelectPhoto={handleSelectPhoto}
-        onDoubleClickPhoto={handleOpenPhoto}
-        selectedPhotoId={selectedPhotoId}
-      />
-    </AppLayout>
+    <PhotoGrid
+      onSelectPhoto={handleSelectPhoto}
+      onDoubleClickPhoto={handleOpenPhoto}
+      selectedPhotoId={selectedPhotoId}
+    />
   );
 }
 
-function MapPage() {
-  const setLightboxPhotoId = useStore((s) => s.setLightboxPhotoId);
+function MapPage({ active }: { active: boolean }) {
+  const openLightbox = useStore((s) => s.openLightbox);
   const setSelectedPhotoId = useStore((s) => s.setSelectedPhotoId);
   const photoDetailsOpen = useStore((s) => s.selectedPhotoId != null);
   return (
-    <AppLayout viewMode="map">
-      <MapView
-        onSelectPhoto={setSelectedPhotoId}
-        onOpenLightbox={setLightboxPhotoId}
-        photoDetailsOpen={photoDetailsOpen}
-      />
-    </AppLayout>
+    <MapView
+      onSelectPhoto={setSelectedPhotoId}
+      onOpenLightbox={openLightbox}
+      active={active}
+      photoDetailsOpen={photoDetailsOpen}
+    />
   );
 }
 
-function FacesPage() {
-  return (
-    <AppLayout viewMode="faces">
-      <FaceView />
-    </AppLayout>
-  );
-}
-
-function TagsPage() {
+function Workspace() {
+  const location = useLocation();
   const navigate = useNavigate();
-  const handleSelectTag = useCallback((label: string) => {
-    navigate(photoRouteForTag(label));
+  const projectRoot = useStore((state) => state.project?.root_path);
+  const mode = location.pathname.slice(1) || "grid";
+  const viewMode = (["grid", "map", "faces", "tags", "albums", "library"] as const)
+    .find((view) => mode === view);
+  const openTag = useCallback((label: string) => {
+    navigate(photoRouteForTag(label), { state: { returnTo: "tags" } });
   }, [navigate]);
-  return (
-    <AppLayout viewMode="tags">
-      <TagView onSelectTag={handleSelectTag} />
-    </AppLayout>
-  );
+
+  if (!viewMode) return <Navigate to="/" replace />;
+  return <AppLayout viewMode={viewMode}>
+    <WorkspacePanels key={projectRoot} viewMode={viewMode} openTag={openTag} />
+  </AppLayout>;
 }
 
-function AlbumsPage() {
-  const setSelectedPhotoId = useStore((s) => s.setSelectedPhotoId);
-  return (
-    <AppLayout viewMode="albums">
-      <SmartAlbumView onSelectPhoto={setSelectedPhotoId} />
-    </AppLayout>
-  );
-}
+function WorkspacePanels({ viewMode, openTag }: { viewMode: ViewMode; openTag: (label: string) => void }) {
+  const [visited, setVisited] = useState(() => new Set<ViewMode>());
+  useEffect(() => {
+    if (visited.has(viewMode)) return;
+    setVisited(new Set(visited).add(viewMode));
+  }, [viewMode, visited]);
 
-function LibraryPage() {
-  return <AppLayout viewMode="library"><LibraryToolsView /></AppLayout>;
+  return <>
+    {viewMode === "grid" && <GridPage />}
+    {(viewMode === "map" || visited.has("map")) &&
+      <section hidden={viewMode !== "map"} className="h-full"><MapPage active={viewMode === "map"} /></section>}
+    {(viewMode === "faces" || visited.has("faces")) &&
+      <section hidden={viewMode !== "faces"} className="h-full"><FaceView active={viewMode === "faces"} /></section>}
+    {(viewMode === "tags" || visited.has("tags")) &&
+      <section hidden={viewMode !== "tags"} className="h-full"><TagView onSelectTag={openTag} /></section>}
+    {(viewMode === "albums" || visited.has("albums")) &&
+      <section hidden={viewMode !== "albums"} className="h-full"><SmartAlbumView /></section>}
+    {(viewMode === "library" || visited.has("library")) &&
+      <section hidden={viewMode !== "library"} className="h-full"><LibraryToolsView /></section>}
+  </>;
 }
 
 export default function App() {
@@ -434,16 +461,7 @@ export default function App() {
   return (
     <AppUpdates>
       <HashRouter>
-        <Routes>
-          <Route path="/" element={<GridPage />} />
-          <Route path="/grid" element={<GridPage />} />
-          <Route path="/map" element={<MapPage />} />
-          <Route path="/faces" element={<FacesPage />} />
-          <Route path="/tags" element={<TagsPage />} />
-          <Route path="/albums" element={<AlbumsPage />} />
-          <Route path="/library" element={<LibraryPage />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
+        <Workspace />
       </HashRouter>
     </AppUpdates>
   );

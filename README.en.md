@@ -9,18 +9,18 @@ PhotoFactory is a local-first desktop photograph manager built with Tauri 2, Rus
 
 **Screenshot provenance:** these are browser captures of the actual React components with mocked Tauri commands and 36 generated images. People, classifications, confidence scores, GPS, albums and metadata are seeded examples, not model predictions. They do not validate the native backend, Windows installers or AI accuracy. See [capture notes](docs/screenshots/README.md).
 
-Version **0.1.8** is under active development. Try a copy of your photographs first. Pagination, virtualization and incremental processing are implementation mechanisms, not evidence of a completed 100,000-photo benchmark.
+Version **0.1.9** is under active development. Try a copy of your photographs first. Pagination, virtualization and incremental processing are implementation mechanisms, not evidence of a completed 100,000-photo benchmark.
 
 ## Interface tour
 
 | Workspace | Purpose |
 | --- | --- |
 | Photos | Directory indexing, incremental updates, square / proportional grids, timeline navigation, keyword and EXIF filters, sorting, favorites and ratings. |
-| Viewer | Zoom, pan, folder filmstrip, metadata, tags and existing face results. Double-click a photograph, then press `I` for details. |
+| Viewer | Zoom, pan, filmstrip in the current result order, metadata, tags and existing face results. Double-click a photograph, then press `I` for details. |
 | People | Local face analysis, naming, merging, review, and group photos filtered by people or group size. Automatic merging of unnamed people supports preview and undo. |
 | Tags | Scene and semantic results grouped by source; editable tags allow manual correction. |
 | Map | Standard and satellite layers, offline map import and export, GPS photograph previews, capture tracks, address search, and coordinate editing. |
-| Albums | Time-, person-, place- and content-based organization with search and pagination. |
+| Albums and Memories | Browse automatic and manual albums. Review photo selection, tag or favorite memories, play them in a full-screen loop, and export video. |
 | Library tools | Jobs, intelligent search, similar-photo candidates, RAW+JPEG stacks, stories, trash, edit parameters, XMP and additional read-only storage sources. |
 
 ![Viewer and metadata panel demonstration](docs/screenshots/viewer.webp)
@@ -31,6 +31,8 @@ Version **0.1.8** is under active development. Try a copy of your photographs fi
 
 ![Demonstration albums](docs/screenshots/albums.webp)
 
+![Memory detail with playback, video export, and tags](docs/screenshots/memory-detail.webp)
+
 ![Map with synthetic Shanghai coordinates and preserved attribution](docs/screenshots/map.webp)
 
 ![Library tool entry points](docs/screenshots/tools.webp)
@@ -39,9 +41,11 @@ In the map toolbar, open **Capture tracks (拍摄轨迹)**, select an area, opti
 
 Run `./startOffline.sh` to open the standalone offline map tool in a browser. Export one layer as `.mbtiles` or both layers as `.pfmap`, then import the package through the map toolbar. PhotoFactory stores imported maps under `.pf/maps/offline/` and fetches missing tiles online when available. The map also exports imported and cached tiles. See the [offline map guide](docs/OFFLINE_MAPS.md).
 
-The sidebar offers light, dark, and system themes. The background tasks panel shows thumbnail and AI progress, with low, balanced, and full thumbnail performance settings.
+The sidebar has theme, update check, and GitHub controls. The background tasks panel shows thumbnail and AI progress, with low, balanced, and full thumbnail performance settings. Its diagnostics show grouped errors, timestamps, affected files, and local AI service logs.
 
-The [Chinese user guide](docs/USER_GUIDE.md) explains the workflows and keyboard shortcuts. Import indexes existing files rather than moving or copying them. Select the original directory containing `.pf/project.json` to reopen a project. Use incremental scanning when adding photographs instead of rebuilding every person group.
+![Background tasks and example AI diagnostics](docs/screenshots/diagnostics.webp)
+
+Import indexes photographs in place. Select the original directory containing `.pf/project.json` to reopen a project. Use incremental scanning when adding photographs. Workflows and keyboard shortcuts are covered in the [illustrated Chinese PDF](docs/PhotoFactory-User-Guide-zh-CN.pdf) and [Chinese web guide](docs/USER_GUIDE.md).
 
 ## Development
 

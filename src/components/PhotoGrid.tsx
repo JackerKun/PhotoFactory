@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useCallback, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
-import { useStore } from "../hooks/usePhotos";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
+import { photoFilterKey, useStore } from "../hooks/usePhotos";
 import { useVirtualGrid, calculateColumnCount } from "../hooks/useVirtualGrid";
 import PhotoCard from "./PhotoCard";
 import ThumbnailToolbar from "./ThumbnailToolbar";
@@ -26,7 +26,7 @@ function SquareVirtualGrid({ onSelectPhoto, onDoubleClickPhoto, selectedPhotoId,
   const [width, setWidth] = useState(800);
   const lastScrollTop = useRef(useStore.getState().photoGridScrollOffsets.square);
   const restoredScroll = useRef(false);
-  const previousFilterKey = useRef(JSON.stringify(filter));
+  const filterKey = photoFilterKey(filter);
   const jumpAttemptRef = useRef<{ requestId: number; photoCount: number } | null>(null);
 
   useEffect(() => {
@@ -49,16 +49,6 @@ function SquareVirtualGrid({ onSelectPhoto, onDoubleClickPhoto, selectedPhotoId,
     gap: GAP,
     overscan: 3,
   });
-
-  useEffect(() => {
-    const currentFilterKey = JSON.stringify(filter);
-    if (previousFilterKey.current !== currentFilterKey) {
-      previousFilterKey.current = currentFilterKey;
-      lastScrollTop.current = 0;
-      restoredScroll.current = true;
-      if (parentRef.current) parentRef.current.scrollTop = 0;
-    }
-  }, [filter, parentRef]);
 
   useEffect(() => {
     if (restoredScroll.current || !parentRef.current) return;
@@ -99,8 +89,8 @@ function SquareVirtualGrid({ onSelectPhoto, onDoubleClickPhoto, selectedPhotoId,
   }, [columnCount, hasNext, loadMore, loading, onTimelineJumpComplete, onVisiblePhotoChange, photos, timelineJump, virtualizer]);
 
   useEffect(() => () => {
-    useStore.getState().setPhotoGridScrollOffset("square", lastScrollTop.current);
-  }, []);
+    useStore.getState().setPhotoGridScrollOffset("square", lastScrollTop.current, filterKey);
+  }, [filterKey]);
 
   const handleScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
     const element = event.currentTarget;
@@ -273,15 +263,18 @@ export default function PhotoGrid({ onSelectPhoto, onDoubleClickPhoto, selectedP
 
   // Back handler for person header - navigates to faces with the original tab
   const savedTab = searchParams.get("tab");
+  const returnTo = useLocation().state?.returnTo;
   const handleBack = useCallback(() => {
-    if (urlTag) {
+    if (returnTo === (urlTag ? "tags" : "faces")) {
+      navigate(-1);
+    } else if (urlTag) {
       navigate("/tags");
     } else if (savedTab) {
       navigate(`/faces?tab=${savedTab}`);
     } else {
       navigate("/faces");
     }
-  }, [urlTag, savedTab, navigate]);
+  }, [urlTag, savedTab, returnTo, navigate]);
 
   const handleClearFilters = useCallback(() => {
     clearPhotoFilters();
@@ -323,9 +316,9 @@ export default function PhotoGrid({ onSelectPhoto, onDoubleClickPhoto, selectedP
       <ThumbnailToolbar />
       <div className="flex min-h-0 flex-1">
         {thumbnailShape === "proportional" ? (
-          <ProportionalVirtualGrid key="proportional" {...surfaceProps} />
+          <ProportionalVirtualGrid key={`proportional:${photoFilterKey(filter)}`} {...surfaceProps} />
         ) : (
-          <SquareVirtualGrid key="square" {...surfaceProps} />
+          <SquareVirtualGrid key={`square:${photoFilterKey(filter)}`} {...surfaceProps} />
         )}
         <PhotoTimelineRail active={activeTimelinePosition} onJump={handleTimelineJump} />
       </div>

@@ -6,13 +6,17 @@
 
 | 文件 | 内容 |
 | --- | --- |
+| `import.webp` | 导入与打开项目窗口 |
 | `library.webp` | 照片网格、目录、筛选与年月导航 |
 | `viewer.webp` | 大图、详情、标签与文件夹胶片条 |
 | `people.webp` | 两个预置人物分组 |
 | `tags.webp` | 预置分类、来源与可信度 |
 | `albums.webp` | 预置月度、主题与人物相册 |
-| `map.webp` | 预置上海坐标、模拟地名候选和在线 OSM 底图 |
+| `memories.webp` | 两组预置回忆 |
+| `memory-detail.webp` | 回忆详情、播放、导出和标签 |
+| `map.webp` | 预置上海坐标、拍摄轨迹与在线 OSM 底图 |
 | `tools.webp` | 智能工具入口，未执行分析任务 |
+| `diagnostics.webp` | 模拟 AI 服务日志、场景分类失败和受影响照片 |
 
 地图瓦片需要联网，并保留 Leaflet / OpenStreetMap 署名；截图中的地名搜索候选由模拟接口提供，不是地址搜索服务验收。独立演示只展示本地生成的图片，不发送个人照片。
 
@@ -26,6 +30,6 @@ npm install
 npm run capture
 ```
 
-工具在 `.capture/` 创建独立前端副本，复用仓库现有 Vite / React / Tailwind 依赖，用固定演示文件替代原生命令。仅监听 `127.0.0.1:1437`；端口被占用时先停止同一截图工具的旧实例。输出默认写到 `docs/screenshots/`，可用 `PHOTOFACTORY_SCREENSHOT_DIR` 改变。关闭浏览器和服务后，`.capture/` 留作复查，不提交到 Git。
+工具在系统临时目录创建独立前端副本，复用仓库现有 Vite / React / Tailwind 依赖，用固定演示文件替代原生命令。仅监听 `127.0.0.1:1437`。输出默认写到 `docs/screenshots/`，可用 `PHOTOFACTORY_SCREENSHOT_DIR` 改变。截图完成后关闭浏览器和服务并删除前端副本。
 
-图片只能用于介绍界面和入口。重新生成后检查：照片加载、完整样式、地图署名、没有个人路径、没有错误提示和截断，以及 README 中的来源声明仍正确。模拟命令不用于生产应用。
+重新生成后检查照片加载、文字和布局、地图署名及演示路径。后台任务截图应保留预置错误和服务日志，其余截图应显示正常加载的界面。

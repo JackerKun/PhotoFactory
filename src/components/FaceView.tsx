@@ -6,7 +6,7 @@ import * as api from "../api/tauri";
 import { useStore } from "../hooks/usePhotos";
 import GroupPhotosView from "./GroupPhotosView";
 
-interface Props {}
+interface Props { active?: boolean }
 
 const FACE_PAGE_SIZE = 96;
 
@@ -110,13 +110,14 @@ type TabKey = "named" | "unnamed" | "review";
 const faceActionClass = "w-full rounded-lg px-3 py-2 text-left hover:bg-surface-primary focus-visible:outline focus-visible:outline-accent-primary disabled:opacity-50";
 const faceActionHeadingClass = "px-3 py-1 text-xs font-medium text-text-muted";
 
-export default React.memo(function FaceView(_props: Props) {
-  const [searchParams] = useSearchParams();
+export default React.memo(function FaceView({ active = true }: Props) {
+  const [searchParams, setSearchParams] = useSearchParams();
   const initialTab = (searchParams.get("tab") as TabKey) || "named";
   const [clusters, setClusters] = useState<FaceCluster[]>([]);
   const [activeTab, setActiveTab] = useState<TabKey>(initialTab);
   const activeTabRef = useRef<TabKey>(initialTab);
   const pageRequest = useRef(0);
+  const loadedClusters = useRef({ tab: initialTab, count: 0 });
   const faceDataRevision = useStore((state) => state.faceDataRevision);
   const projectRoot = useStore((state) => state.project?.root_path);
   const [pageTotal, setPageTotal] = useState(0);
@@ -127,11 +128,11 @@ export default React.memo(function FaceView(_props: Props) {
   // Keep activeTab in sync with URL when navigating back from person photos
   useEffect(() => {
     const tabFromUrl = searchParams.get("tab") as TabKey;
-    if (tabFromUrl && tabFromUrl !== activeTab) {
+    if (active && ["named", "unnamed", "review"].includes(tabFromUrl) && tabFromUrl !== activeTab) {
       activeTabRef.current = tabFromUrl;
       setActiveTab(tabFromUrl);
     }
-  }, [searchParams.get("tab")]);
+  }, [active, searchParams.get("tab")]);
 
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editName, setEditName] = useState("");
@@ -177,13 +178,23 @@ export default React.memo(function FaceView(_props: Props) {
     const isCurrent = () => pageRequest.current === requestId && activeTabRef.current === requestedTab;
     setPageLoading(true);
     try {
+      const count = loadedClusters.current.tab === requestedTab
+        ? Math.max(FACE_PAGE_SIZE, loadedClusters.current.count)
+        : FACE_PAGE_SIZE;
       const [page, nextFaceCount, nextUnassignedCount] = await Promise.all([
         api.getClusterPage(requestedTab, 0, FACE_PAGE_SIZE),
         api.getFaceDetectionCount().catch(() => 0),
         api.getUnassignedFaceCount().catch(() => 0),
       ]);
+      const items = page.items;
+      for (let offset = items.length; isCurrent() && offset < Math.min(count, page.total); offset = items.length) {
+        const next = await api.getClusterPage(requestedTab, offset, FACE_PAGE_SIZE);
+        if (!next.items.length) break;
+        items.push(...next.items);
+      }
       if (isCurrent()) {
-        setClusters(page.items);
+        loadedClusters.current = { tab: requestedTab, count: items.length };
+        setClusters(items);
         setPageTotal(page.total);
         setTabCounts({ named: page.named_count, unnamed: page.unnamed_count, review: page.review_count });
         setFaceCount(nextFaceCount);
@@ -211,6 +222,7 @@ export default React.memo(function FaceView(_props: Props) {
     try {
       const page = await api.getClusterPage(requestedTab, clusters.length, FACE_PAGE_SIZE);
       if (!isCurrent()) return;
+      loadedClusters.current = { tab: requestedTab, count: clusters.length + page.items.length };
       setClusters((current) => {
         const known = new Set(current.map((cluster) => cluster.id));
         return [...current, ...page.items.filter((cluster) => !known.has(cluster.id))];
@@ -650,6 +662,7 @@ export default React.memo(function FaceView(_props: Props) {
                 if (activeTab === tab) return;
                 activeTabRef.current = tab;
                 setActiveTab(tab);
+                setSearchParams({ tab }, { replace: true });
                 setClusters([]);
                 setPageTotal(0);
                 setMergeMode(false);
@@ -745,7 +758,7 @@ export default React.memo(function FaceView(_props: Props) {
                 if (mergeMode) {
                   toggleMergeSelection(cluster.id!);
                 } else {
-                  navigate(`/?tab=${activeTab}&person=${cluster.id}`);
+                  navigate(`/?tab=${activeTab}&person=${cluster.id}`, { state: { returnTo: "faces" } });
                 }
               }}
               onDoubleClick={(e) => {

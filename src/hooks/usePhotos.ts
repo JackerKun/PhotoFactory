@@ -10,6 +10,12 @@ interface GpsBatchSession {
   sourcePhoto?: Photo;
 }
 
+export type LightboxItem = Pick<Photo, "id" | "filename"> & Partial<Pick<Photo, "path" | "file_size">>;
+export interface LightboxSource {
+  items: readonly LightboxItem[];
+  loadNext?: (items: readonly LightboxItem[]) => Promise<readonly LightboxItem[]>;
+}
+
 interface AppState {
   project: Project | null;
   setProject: (p: Project | null) => void;
@@ -25,7 +31,9 @@ interface AppState {
   photoRoute: string;
   photoGridScrollOffsets: Record<"square" | "proportional", number>;
   lightboxPhotoId: number | null;
+  lightboxSource: LightboxSource | null;
   selectedPhotoId: number | null;
+  selectedLightboxSource: LightboxSource | null;
   faceDataRevision: number;
   markFaceDataChanged: () => void;
   ratingSelectionMode: boolean;
@@ -48,14 +56,15 @@ interface AppState {
   queuePreload: (photoIds: number[]) => void;
   clearPreloadQueue: () => void;
   _photoRequestGeneration: number;
-  setFilter: (filter: Partial<PhotoFilter>, replace?: boolean) => void;
+  setFilter: (filter: Partial<PhotoFilter>, replace?: boolean, restore?: boolean) => void;
   clearPhotoFilters: () => void;
   setThumbnailShape: (shape: "square" | "proportional") => void;
   setThumbnailSize: (size: number) => void;
   setPhotoRoute: (route: string) => void;
-  setPhotoGridScrollOffset: (shape: "square" | "proportional", offset: number) => void;
+  setPhotoGridScrollOffset: (shape: "square" | "proportional", offset: number, filterKey?: string) => void;
   setLightboxPhotoId: (id: number | null) => void;
-  setSelectedPhotoId: (id: number | null) => void;
+  openLightbox: (id: number, source: LightboxSource) => void;
+  setSelectedPhotoId: (id: number | null, source?: LightboxSource) => void;
   setAiProcessingStatus: (status: AiProcessingStatus | null) => void;
   updatePhotoInList: (photoId: number, updates: Partial<Photo>) => void;
   updatePhotosInList: (photoIds: number[], updates: Partial<Photo>) => void;
@@ -64,13 +73,22 @@ interface AppState {
   reset: () => void;
 }
 
+export function photoFilterKey(filter: PhotoFilter) {
+  return JSON.stringify(Object.entries(filter).filter(([, value]) => value !== undefined).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+type PhotoListSnapshot = Pick<AppState, "photos" | "totalPhotos" | "cursor" | "hasNext" | "photoGridScrollOffsets">;
+const photoLists = new Map<string, PhotoListSnapshot>();
+
 export const useStore = create<AppState>((set, get) => ({
   project: null,
   setProject: (p) => set((state) => {
     if (p?.root_path === state.project?.root_path) return { project: p };
+    photoLists.clear();
     return {
       project: p, photos: [], totalPhotos: 0, cursor: null, hasNext: false,
-      loading: false, photoLoadError: null,
+      loading: false, photoLoadError: null, photoGridScrollOffsets: { square: 0, proportional: 0 },
+      lightboxPhotoId: null, lightboxSource: null, selectedPhotoId: null, selectedLightboxSource: null,
       gpsBatchSession: null, batchGpsPending: new Map(),
       _photoRequestGeneration: state._photoRequestGeneration + 1,
     };
@@ -87,9 +105,14 @@ export const useStore = create<AppState>((set, get) => ({
   photoRoute: "/",
   photoGridScrollOffsets: { square: 0, proportional: 0 },
   lightboxPhotoId: null,
+  lightboxSource: null,
   selectedPhotoId: null,
+  selectedLightboxSource: null,
   faceDataRevision: 0,
-  markFaceDataChanged: () => set((state) => ({ faceDataRevision: state.faceDataRevision + 1 })),
+  markFaceDataChanged: () => {
+    photoLists.clear();
+    set((state) => ({ faceDataRevision: state.faceDataRevision + 1 }));
+  },
   ratingSelectionMode: false,
   ratingSelection: [],
   setRatingSelectionMode: (enabled) => set({ ratingSelectionMode: enabled, ratingSelection: [] }),
@@ -113,9 +136,18 @@ export const useStore = create<AppState>((set, get) => ({
   thumbnailProcessingStatus: null,
   preloadQueue: [],
   _photoRequestGeneration: 0,
-  setFilter: (partial, replace = false) => set((state) => {
+  setFilter: (partial, replace = false, restore = false) => set((state) => {
     const nextFilter = replace ? { ...partial } : { ...state.filter, ...partial };
-    if (JSON.stringify(nextFilter) === JSON.stringify(state.filter)) return state;
+    const previousKey = photoFilterKey(state.filter);
+    const nextKey = photoFilterKey(nextFilter);
+    if (previousKey === nextKey) return state;
+    if (state.photos.length) {
+      photoLists.delete(previousKey);
+      const { photos, totalPhotos, cursor, hasNext, photoGridScrollOffsets } = state;
+      photoLists.set(previousKey, { photos, totalPhotos, cursor, hasNext, photoGridScrollOffsets });
+      if (photoLists.size > 6) photoLists.delete(photoLists.keys().next().value!);
+    }
+    const snapshot = restore ? photoLists.get(nextKey) : undefined;
     return {
       filter: nextFilter,
       photos: [],
@@ -127,6 +159,7 @@ export const useStore = create<AppState>((set, get) => ({
       preloadQueue: [],
       ratingSelection: [],
       photoGridScrollOffsets: { square: 0, proportional: 0 },
+      ...snapshot,
       _photoRequestGeneration: state._photoRequestGeneration + 1,
     };
   }),
@@ -153,14 +186,20 @@ export const useStore = create<AppState>((set, get) => ({
   setThumbnailShape: (shape) => set({ thumbnailShape: shape }),
   setThumbnailSize: (size) => set({ thumbnailSize: size }),
   setPhotoRoute: (route) => set({ photoRoute: route }),
-  setPhotoGridScrollOffset: (shape, offset) => set((state) => ({
-    photoGridScrollOffsets: {
-      ...state.photoGridScrollOffsets,
-      [shape]: Math.max(0, offset),
-    },
+  setPhotoGridScrollOffset: (shape, offset, key = photoFilterKey(get().filter)) => {
+    if (key === photoFilterKey(get().filter)) {
+      set((state) => ({ photoGridScrollOffsets: { ...state.photoGridScrollOffsets, [shape]: offset } }));
+    } else {
+      const snapshot = photoLists.get(key);
+      if (snapshot) snapshot.photoGridScrollOffsets = { ...snapshot.photoGridScrollOffsets, [shape]: offset };
+    }
+  },
+  setLightboxPhotoId: (id) => set((state) => ({
+    lightboxPhotoId: id,
+    lightboxSource: id == null ? null : state.lightboxSource,
   })),
-  setLightboxPhotoId: (id) => set({ lightboxPhotoId: id }),
-  setSelectedPhotoId: (id) => set({ selectedPhotoId: id }),
+  openLightbox: (id, source) => set({ lightboxPhotoId: id, lightboxSource: source }),
+  setSelectedPhotoId: (id, source) => set({ selectedPhotoId: id, selectedLightboxSource: source ?? null }),
   setAiProcessingStatus: (status) => set({ aiProcessingStatus: status }),
   setThumbnailProcessingStatus: (status) => set({ thumbnailProcessingStatus: status }),
   queuePreload: (photoIds: number[]) => {
@@ -238,10 +277,12 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
   reset: () => {
+    photoLists.clear();
     const state = get();
     set({
       photos: [], totalPhotos: 0, cursor: null, hasNext: false, filter: {},
       selectedPhotoId: null, lightboxPhotoId: null,
+      selectedLightboxSource: null, lightboxSource: null,
       ratingSelectionMode: false, ratingSelection: [],
       gpsBatchSession: null, batchGpsPending: new Map(),
       mapFocusRequest: null,

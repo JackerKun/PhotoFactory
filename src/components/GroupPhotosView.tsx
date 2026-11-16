@@ -95,7 +95,7 @@ export default function GroupPhotosView() {
   const selectedPhotoId = useStore((s) => s.selectedPhotoId);
   const faceDataRevision = useStore((s) => s.faceDataRevision);
   const setSelectedPhotoId = useStore((s) => s.setSelectedPhotoId);
-  const setLightboxPhotoId = useStore((s) => s.setLightboxPhotoId);
+  const openLightbox = useStore((s) => s.openLightbox);
   const showGroupList = view === "groups" && !activeGroup;
   const exactFilter = exact && personIds.length > 0;
   const groupTitle = activeGroup?.person_ids.map((id, index) =>
@@ -199,7 +199,13 @@ export default function GroupPhotosView() {
       <div className="people-grid">
         {items.map(({ photo, people_count, unconfirmed_count }) => <article key={photo.id} className="people-card rounded-xl border border-surface-secondary/70 bg-bg-secondary">
           <div className="aspect-square overflow-hidden rounded-lg">
-            <PhotoCard photo={photo} showFilename={false} isSelected={selectedPhotoId === photo.id} onClick={() => setSelectedPhotoId(photo.id!)} onDoubleClick={() => setLightboxPhotoId(photo.id!)} />
+            <PhotoCard photo={photo} showFilename={false} isSelected={selectedPhotoId === photo.id} onClick={() => setSelectedPhotoId(photo.id!)} onDoubleClick={() => openLightbox(photo.id!, {
+              items: items.map((item) => item.photo),
+              loadNext: more ? async (photos) => {
+                const next = await fetchPhotos(photos[photos.length - 1]?.id ?? undefined);
+                return next.map((item) => item.photo);
+              } : undefined,
+            })} />
           </div>
           <p className="mt-1.5 truncate px-1 text-sm font-medium" title={photo.filename}>{photo.filename}</p>
           <p className="px-1 text-xs text-text-muted">{people_count} 人{unconfirmed_count > 0 && ` · ${unconfirmed_count} 人待确认`}</p>

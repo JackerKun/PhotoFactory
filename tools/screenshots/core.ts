@@ -4,6 +4,13 @@ const project={name:'PhotoFactory · 合成演示资料库',root_path:'/demo/Pho
 const tags=[{id:1,name:'旅途 · 演示',color:'#5B8DEF',photo_count:12},{id:2,name:'山野 · 演示',color:'#48A899',photo_count:18},{id:3,name:'待整理 · 演示',color:'#D9A34A',photo_count:6}];
 const clusters=[{id:1,name:'示例人物 A',face_count:6,photo_count:6,confidence:'high',created_at:1750000000},{id:2,name:'示例人物 B',face_count:6,photo_count:6,confidence:'high',created_at:1750000000}];
 const albums=[{id:1,name:'六月手记 · 演示',album_type:'monthly',rule_json:'{}',cover_photo_id:31,photo_count:6,created_at:'2025-06-20',updated_at:'2025-06-20'},{id:2,name:'山野与日落 · 演示',album_type:'themed',rule_json:'{}',cover_photo_id:4,photo_count:18,created_at:'2025-06-20',updated_at:'2025-06-20'},{id:3,name:'示例人物 A',album_type:'person',rule_json:'{}',cover_photo_id:1,photo_count:6,created_at:'2025-06-20',updated_at:'2025-06-20'}];
+const memories=[
+ {id:1,kind:'event',title:'六月手记 · 演示',start_at:1749718800,end_at:1750150800,source_count:6,cover_photo_id:31,photo_ids:[31,32,33,34,35,36],location:'上海',gps_count:5,people:[],scene:'旅途',indexed_count:6,favorite:true,tags:['旅途']},
+ {id:2,kind:'anniversary',title:'往年此时 · 演示',start_at:1735808400,end_at:1736240400,source_count:6,cover_photo_id:5,photo_ids:[1,2,3,4,5,6],location:'上海',gps_count:6,people:[],scene:'街景',indexed_count:6,favorite:false,tags:[]},
+];
+const demoTime=1750410000;
+const brokenPhoto={photo_id:35,filename:'DEMO_0035.jpg',path:'/demo/PhotoFactory/2025/35.jpg',attempts:1,occurred_at:demoTime,ignored:false,can_ignore:true};
+const decodeError='演示错误：原图解码失败，没有可用的缓存预览。';
 const page=(items:any[])=>({items,total:items.length,offset:0,has_more:false});
 function filter(f:any={}) {return photos.filter(p=>(!f.keyword||JSON.stringify(p).toLowerCase().includes(f.keyword.toLowerCase()))&&(!f.has_favorite||p.is_favorite)&&(!f.rating_min||p.rating>=f.rating_min)&&(!f.year||new Date(p.taken_at*1000).getUTCFullYear()===f.year)&&(!f.month||new Date(p.taken_at*1000).getUTCMonth()+1===f.month)&&(!f.person_id||p.id%6===f.person_id)&&(!f.tag||p.id%3===0)).sort((a,b)=>b.taken_at-a.taken_at)}
 export function convertFileSrc(p:string){return p.startsWith('/demo/')&&p.endsWith('.jpg')?`/demo/${Number(p.split('/').pop()?.replace('.jpg',''))}.jpg`:p;}
@@ -14,14 +21,23 @@ export async function invoke(cmd:string,a:any={}) : Promise<any> {
  case 'cmd_get_last_project_path':return null;
  case 'cmd_get_recent_projects':return ['/demo/PhotoFactory'];
  case 'cmd_open_project':case 'cmd_create_project':opened=true;return project;
- case 'cmd_get_photos':case 'cmd_get_smart_album_photos':{const p=filter(a.filter);return {photos:p,next_cursor:null,has_more:false,total_count:p.length}};
+ case 'cmd_get_photos':{const p=filter(a.filter);return {photos:p,next_cursor:null,has_more:false,total_count:p.length}};
+ case 'cmd_get_smart_album_photos':return photos.slice(30).map(p=>[p.id,p.id]);
  case 'cmd_get_photo':return photos.find(p=>p.id===id);
  case 'cmd_get_lightbox_photos':return photos;
  case 'cmd_get_thumbnail_path':return `/demo/${id}.jpg`;
  case 'cmd_get_photo_data_url':return convertFileSrc(a.photoPath??'/demo/1.jpg');
  case 'cmd_get_face_thumbnail':case 'cmd_get_cluster_face_thumbnail':return `${location.origin}/demo/${id===2?2:1}.jpg`;
  case 'cmd_get_thumbnail_processing_status':return {running:false,batch_size:0,total_pending:0,processed:0,succeeded:0,failed:0,current_file:null,last_error:null};
- case 'cmd_get_ai_pipeline_status':return {status:'idle',stage:null,processed:0,total:0,failed:0};
+ case 'cmd_get_ai_pipeline_status':return {status:'done',stage:'done',processed:36,total:36,failed:1,updated_at:demoTime};
+ case 'cmd_get_ai_runtime':return {available:['CPUExecutionProvider'],models:{scene:'CPUExecutionProvider',face_detection:'CPUExecutionProvider'},face_batch:{photos:6,preview_hits:4,elapsed_ms:820,decode_ms:64,detect_ms:612,embed_ms:140},cluster_ms:72};
+ case 'cmd_get_ai_worker_diagnostics':return {status:'ready',port:9876,pid:4200,entries:[
+  {id:1,occurred_at:demoTime-15,source:'service',pid:4200,message:'本地 AI 服务已就绪。'},
+  {id:2,occurred_at:demoTime,source:'warning',pid:4200,message:decodeError+'\n'+brokenPhoto.path},
+ ],log_error:null,version:'0.1.8',platform:'windows',architecture:'x86_64'};
+ case 'cmd_get_task_errors':return {groups:[{key:{stage:'classification',reason:decodeError,through:1},message:decodeError,occurrences:1,first_occurred_at:demoTime,occurred_at:demoTime}],stages:['classification'],next_before:null,history_through:1,retryable:0,failed_faces:0,failed_classifications:1,ignored_count:0,platform:'windows',architecture:'x86_64',version:'0.1.8'};
+ case 'cmd_get_task_error_photos':return {photos:[brokenPhoto],next_after:null,total:1,can_ignore:1};
+ case 'cmd_check_for_update':return {current_version:'0.1.8',latest_release:null};
  case 'cmd_get_photo_directories':return ['/demo/PhotoFactory/2025'];
  case 'cmd_get_photo_timeline':return [6,5,4,3,2,1].map(month=>({year:2025,month,count:6}));
  case 'cmd_get_photo_filter_options':return {formats:[{value:'jpg',count:36}],cameras:[{value:'DEMO Demo Camera',count:36}],exposure_times:[{value:'1/125',count:36}],iso_min:100,iso_max:400,aperture_min:5.6,aperture_max:5.6};
@@ -38,14 +54,17 @@ export async function invoke(cmd:string,a:any={}) : Promise<any> {
  case 'cmd_get_face_ai_version_status':return {upgrade_available:false};
  case 'cmd_get_thumbnail_performance':return 'balanced';
  case 'cmd_set_thumbnail_performance':return null;
- case 'cmd_worker_health':return false;
+ case 'cmd_worker_health':return true;
  case 'cmd_get_person_detail':return {person_id:id,user_name:`示例人物 ${id===2?'B':'A'}`,face_count:6,confidence:'high',first_seen:'2025-01-01',last_seen:'2025-06-20',cover_photo_id:id};
  case 'cmd_get_person_timeline':case 'cmd_get_person_scene_tags':return [];
  case 'cmd_get_smart_albums':return albums;
+ case 'cmd_get_photo_memories':return memories;
  case 'cmd_get_photos_with_gps':return photos.filter(p=>p.latitude!=null);
  case 'cmd_search_map_location':return [{lat:31.234,lng:121.475,display_name:'上海市 · 演示定位（模拟接口）'}];
  case 'cmd_list_offline_maps':return [];
- case 'cmd_get_map_tile_status':return {url:`https://tile.openstreetmap.org/${a.z}/${a.x}/${a.y}.png`,source:'cache'};
+ case 'cmd_list_photo_tracks':return [{id:1,name:'上海漫步 · 演示',settings:{bounds:[121.465,31.224,121.489,31.244],start_date:'2025-06-12',end_date:'2025-06-16',joined_gaps:[]}}];
+ case 'cmd_get_track_photos':return photos.slice(30,35).map((photo,i)=>({...photo,taken_at:1749790800+i*600,latitude:31.229+i*.0017,longitude:121.467+i*.003}));
+ case 'cmd_get_map_tile_status':return {url:`https://tile.openstreetmap.org/${a.z}/${a.x}/${a.y}.png`,source:'network'};
  case 'cmd_get_map_tile':return `https://tile.openstreetmap.org/${a.z}/${a.x}/${a.y}.png`;
  case 'cmd_get_library_jobs':return [];
  case 'cmd_get_duplicate_groups':case 'cmd_get_raw_jpeg_stacks':case 'cmd_get_trashed_photos':case 'cmd_get_ignored_faces':return page([]);
