@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -24,6 +25,18 @@ ARCHIVES = {
     ),
 }
 DESTINATION = Path(__file__).resolve().parents[1] / "build" / "exiftool"
+
+
+def rename_staged(source: Path, destination: Path) -> None:
+    # Windows scanners can briefly hold files as soon as they are extracted.
+    for delay in (0.25, 0.5, 1, 2, 4, 0):
+        try:
+            source.rename(destination)
+            return
+        except OSError as error:
+            if not delay or getattr(error, "winerror", None) not in (5, 32, 33):
+                raise
+            time.sleep(delay)
 
 
 def stage(platform: str, local_archive: Path | None) -> None:
@@ -54,9 +67,9 @@ def stage(platform: str, local_archive: Path | None) -> None:
         if platform == "windows":
             with zipfile.ZipFile(archive) as distribution:
                 distribution.extractall(work)
-            (work / f"exiftool-{VERSION}_64").rename(staged)
-            (staged / "exiftool(-k).exe").rename(staged / executable)
-            command = [str(staged / executable)]
+            rename_staged(work / f"exiftool-{VERSION}_64", staged)
+            rename_staged(staged / "exiftool(-k).exe", staged / executable)
+            command = [str(DESTINATION / executable)]
         else:
             prefix = f"exiftool-{SOURCE_COMMIT}"
             with tarfile.open(archive, "r:gz") as distribution:
@@ -68,19 +81,22 @@ def stage(platform: str, local_archive: Path | None) -> None:
                 distribution.extractall(work, members=members, filter="data")
             (work / prefix).rename(staged)
             (staged / executable).chmod(0o755)
-            command = ["/usr/bin/perl", str(staged / executable)]
+            command = ["/usr/bin/perl", str(DESTINATION / executable)]
 
         if not (staged / support_file).is_file():
             raise FileNotFoundError(f"ExifTool support file missing: {support_file}")
-        native = sys.platform == ("win32" if platform == "windows" else "darwin")
-        if native:
-            reported = subprocess.check_output([*command, "-ver"], text=True).strip()
-            if reported != VERSION:
-                raise ValueError(f"Unexpected ExifTool version: {reported}")
-        (staged / marker.name).write_text(sha256 + "\n")
         if DESTINATION.exists():
             shutil.rmtree(DESTINATION)
-        staged.rename(DESTINATION)
+        rename_staged(staged, DESTINATION)
+
+    # Verify in place. Windows ARM64 can retain handles to the x64 launcher
+    # after it exits, which prevents moving the resource directory afterward.
+    native = sys.platform == ("win32" if platform == "windows" else "darwin")
+    if native:
+        reported = subprocess.check_output([*command, "-ver"], text=True).strip()
+        if reported != VERSION:
+            raise ValueError(f"Unexpected ExifTool version: {reported}")
+    marker.write_text(sha256 + "\n")
     print(f"Staged ExifTool {VERSION} for {platform}: {DESTINATION}")
 
 

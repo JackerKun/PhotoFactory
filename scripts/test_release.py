@@ -2,6 +2,7 @@ import importlib.util
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -81,6 +82,40 @@ class ReleaseTests(unittest.TestCase):
     def test_missing_installer_rejected(self):
         with self.assertRaises(ValueError):
             release.collect(self.root, '1.2.3', 'Windows', 'arm64', 'x64', 'missing')
+
+
+class ExifToolStagingTests(unittest.TestCase):
+    def test_windows_verifies_executable_in_final_directory(self):
+        spec = importlib.util.spec_from_file_location(
+            'prepare_exiftool', Path(__file__).with_name('prepare-exiftool.py')
+        )
+        prepare = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(prepare)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / 'exiftool.zip'
+            destination = root / 'build' / 'exiftool'
+            with zipfile.ZipFile(archive, 'w') as bundle:
+                prefix = f'exiftool-{prepare.VERSION}_64'
+                bundle.writestr(f'{prefix}/exiftool(-k).exe', b'launcher')
+                bundle.writestr(f'{prefix}/exiftool_files/exiftool.pl', b'runtime')
+            checksum = release.digest(archive)
+            marker = destination / '.archive-sha256'
+
+            def verify(command, *, text):
+                self.assertEqual(command, [str(destination / 'exiftool.exe'), '-ver'])
+                self.assertTrue(Path(command[0]).is_file())
+                self.assertFalse(marker.exists())
+                return prepare.VERSION
+
+            with (
+                patch.object(prepare, 'DESTINATION', destination),
+                patch.dict(prepare.ARCHIVES, {'windows': ('unused', checksum)}),
+                patch.object(prepare.sys, 'platform', 'win32'),
+                patch.object(prepare.subprocess, 'check_output', side_effect=verify),
+            ):
+                prepare.stage('windows', archive)
+            self.assertEqual(marker.read_text().strip(), checksum)
 
 
 if __name__ == '__main__':
