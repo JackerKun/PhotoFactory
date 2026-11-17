@@ -37,10 +37,13 @@ fn row_to_photo(row: &rusqlite::Row) -> Result<Photo, rusqlite::Error> {
         is_favorite: row.get::<_, i32>(20)? != 0,
         rating: row.get(21)?,
         imported_at: row.get(22)?,
+        lens_make: row.get(23)?,
+        lens_model: row.get(24)?,
+        focal_length: row.get(25)?,
     })
 }
 
-const PHOTO_COLS: &str = "id, path, filename, file_size, file_mtime, width, height, format, taken_at, camera_make, camera_model, exposure_time, f_number, iso, latitude, longitude, orientation, thumbnail_status, ai_status, deleted, is_favorite, rating, imported_at";
+const PHOTO_COLS: &str = "id, path, filename, file_size, file_mtime, width, height, format, taken_at, camera_make, camera_model, exposure_time, f_number, iso, latitude, longitude, orientation, thumbnail_status, ai_status, deleted, is_favorite, rating, imported_at, lens_make, lens_model, focal_length";
 
 pub fn insert_photo(
     conn: &rusqlite::Connection,
@@ -48,8 +51,8 @@ pub fn insert_photo(
     exif: &ExifData,
 ) -> AppResult<i64> {
     let inserted = conn.execute(
-        "INSERT OR IGNORE INTO photos (path, filename, file_size, file_mtime, width, height, format, taken_at, camera_make, camera_model, exposure_time, f_number, iso, latitude, longitude, orientation, is_favorite, rating, imported_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 0, 0, ?17)",
-        params![file_info.path, file_info.filename, file_info.file_size, file_info.file_mtime, exif.width, exif.height, Path::new(&file_info.path).extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_lowercase()), exif.taken_at, exif.camera_make, exif.camera_model, exif.exposure_time, exif.f_number, exif.iso, exif.latitude, exif.longitude, exif.orientation, Utc::now().timestamp()],
+        "INSERT OR IGNORE INTO photos (path, filename, file_size, file_mtime, width, height, format, taken_at, camera_make, camera_model, exposure_time, f_number, iso, latitude, longitude, orientation, is_favorite, rating, imported_at, lens_make, lens_model, focal_length) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 0, 0, ?17, ?18, ?19, ?20)",
+        params![file_info.path, file_info.filename, file_info.file_size, file_info.file_mtime, exif.width, exif.height, Path::new(&file_info.path).extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_lowercase()), exif.taken_at, exif.camera_make, exif.camera_model, exif.exposure_time, exif.f_number, exif.iso, exif.latitude, exif.longitude, exif.orientation, Utc::now().timestamp(), exif.lens_make, exif.lens_model, exif.focal_length],
     )?;
     if inserted == 0 {
         let mut stmt = conn.prepare("SELECT id FROM photos WHERE path = ?1")?;

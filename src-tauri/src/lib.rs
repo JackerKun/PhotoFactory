@@ -14,7 +14,7 @@ pub mod time_tagger;
 
 pub use commands::project::AppState;
 
-use std::fs;
+use std::{fs, io::Write, sync::Mutex};
 use std::path::Path;
 
 use crate::error::{AppError, AppResult};
@@ -47,9 +47,40 @@ pub fn load_project(root_path: &str) -> AppResult<Project> {
     Ok(project)
 }
 
+static PROJECT_CONFIG_WRITE: Mutex<()> = Mutex::new(());
+
 pub fn save_project_json(project: &Project) -> AppResult<()> {
-    let content = serde_json::to_string_pretty(project)?;
-    fs::write(project.project_json_path(), content)?;
+    let _guard = PROJECT_CONFIG_WRITE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    write_project_json(project)
+}
+
+// Keep settings saved by another task while a scan is using an older project snapshot.
+pub fn update_project_json(
+    project: &Project,
+    update: impl FnOnce(&mut Project),
+) -> AppResult<Project> {
+    let _guard = PROJECT_CONFIG_WRITE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut latest = match fs::read_to_string(project.project_json_path()) {
+        Ok(content) => serde_json::from_str(&content)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => project.clone(),
+        Err(error) => return Err(error.into()),
+    };
+    latest.root_path.clone_from(&project.root_path);
+    update(&mut latest);
+    write_project_json(&latest)?;
+    Ok(latest)
+}
+
+fn write_project_json(project: &Project) -> AppResult<()> {
+    let content = serde_json::to_vec_pretty(project)?;
+    let mut file = tempfile::NamedTempFile::new_in(project.pf_path())?;
+    file.write_all(&content)?;
+    file.persist(project.project_json_path())
+        .map_err(|error| error.error)?;
     Ok(())
 }
 

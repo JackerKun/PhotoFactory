@@ -126,6 +126,30 @@ class FaceClustererTests(unittest.TestCase):
 
         self.assertEqual(groups, [[10, 20]])
 
+    def test_post_merge_can_use_one_named_destination_per_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            assignments = {"00000100.npy": 10, "00000200.npy": 20, "00000300.npy": 30}
+            for filename in assignments:
+                np.save(os.path.join(directory, filename), np.array([1.0, 0.0]))
+            groups = plan_automatic_cluster_merges(
+                directory, assignments, 0.72, named_cluster_ids=[20, 30]
+            )
+            self.assertEqual(len(groups), 1)
+            self.assertIn(10, groups[0])
+            self.assertEqual(len(set(groups[0]) & {20, 30}), 1)
+            self.assertEqual(
+                plan_automatic_cluster_merges(directory, assignments, 0.72, named_cluster_ids=[10, 20, 30]),
+                [],
+            )
+
+    def test_post_merge_can_find_pairs_below_the_old_cutoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            np.save(os.path.join(directory, "00012300.npy"), np.array([1.0, 0.0]))
+            np.save(os.path.join(directory, "00012400.npy"), np.array([0.48, 0.8773]))
+            assignments = {"00012300.npy": 10, "00012400.npy": 20}
+            self.assertEqual(plan_automatic_cluster_merges(directory, assignments, 0.60), [])
+            self.assertEqual(plan_automatic_cluster_merges(directory, assignments, 0.40), [[10, 20]])
+
     def test_post_merge_never_joins_people_from_the_same_photo(self):
         with tempfile.TemporaryDirectory() as directory:
             # First six hex digits encode the same photo id; final byte is face index.

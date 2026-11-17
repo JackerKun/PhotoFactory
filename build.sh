@@ -134,19 +134,24 @@ if [[ "$HOST_MODE" == "unsupported" ]]; then
   exit 1
 fi
 
-if [[ "${RUN_TESTS:-0}" == "1" ]]; then
-  echo "Running frontend tests..."
-  npm test -- --run
-  echo "Running Rust tests..."
-  cargo test --locked --manifest-path "$PROJECT_DIR/src-tauri/Cargo.toml" --lib
-fi
-
 if [[ "$MODE" == "macos" && -n "$TARGET" ]]; then
   case "$(uname -m):$TARGET" in
     arm64:aarch64-apple-darwin|x86_64:x86_64-apple-darwin) ;;
     *) echo "Build the app and AI Worker on a matching native macOS runner" >&2; exit 1 ;;
   esac
 fi
+if [[ "$MODE" == "windows" ]]; then
+  python scripts/prepare-exiftool.py windows
+else
+  python3 scripts/prepare-exiftool.py macos
+fi
+if [[ "${RUN_TESTS:-0}" == "1" ]]; then
+  echo "Running frontend tests..."
+  npm test -- --run
+  echo "Running Rust tests..."
+  PATH="$PROJECT_DIR/build/exiftool:$PATH" cargo test --locked --manifest-path "$PROJECT_DIR/src-tauri/Cargo.toml" --lib
+fi
+
 prepare_ai_worker
 
 if [[ "$MODE" == "macos" ]]; then

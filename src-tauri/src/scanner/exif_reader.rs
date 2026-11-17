@@ -10,6 +10,9 @@ pub struct ExifData {
     pub height: Option<i32>,
     pub camera_make: Option<String>,
     pub camera_model: Option<String>,
+    pub lens_make: Option<String>,
+    pub lens_model: Option<String>,
+    pub focal_length: Option<f64>,
     pub exposure_time: Option<String>,
     pub f_number: Option<String>,
     pub iso: Option<u32>,
@@ -59,6 +62,25 @@ pub fn read_exif(path: &Path) -> AppResult<ExifData> {
     }
     if let Some(field) = exif.get_field(exif::Tag::Model, exif::In::PRIMARY) {
         data.camera_model = Some(field.display_value().to_string());
+    }
+
+    let lens_text = |tag| {
+        let field = exif.get_field(tag, exif::In::PRIMARY)?;
+        let exif::Value::Ascii(strings) = &field.value else {
+            return None;
+        };
+        let value = String::from_utf8_lossy(strings.first()?).trim().to_owned();
+        (!value.is_empty()).then_some(value)
+    };
+    data.lens_make = lens_text(exif::Tag::LensMake);
+    data.lens_model = lens_text(exif::Tag::LensModel);
+    if let Some(field) = exif.get_field(exif::Tag::FocalLength, exif::In::PRIMARY) {
+        if let exif::Value::Rational(values) = &field.value {
+            data.focal_length = values
+                .first()
+                .filter(|value| value.num > 0 && value.denom > 0)
+                .map(|value| f64::from(value.num) / f64::from(value.denom));
+        }
     }
 
     // ExposureTime

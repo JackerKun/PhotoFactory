@@ -34,6 +34,10 @@ export async function openProject(rootPath: string): Promise<Project> {
   return invoke<Project>("cmd_open_project", { rootPath });
 }
 
+export function renameProject(rootPath: string, name: string): Promise<Project> {
+  return invoke("cmd_rename_project", { rootPath, name });
+}
+
 export async function scanProject(): Promise<number> {
   return invoke<number>("cmd_scan_project");
 }
@@ -52,6 +56,33 @@ export async function getPhotoTimeline(filter: PhotoFilter): Promise<PhotoTimeli
 
 export async function getPhotoFilterOptions(filter: PhotoFilter): Promise<PhotoFilterOptions> {
   return invoke<PhotoFilterOptions>("cmd_get_photo_filter_options", { filter });
+}
+
+export interface CaptureExifPatch {
+  camera_make?: string;
+  camera_model?: string;
+  lens_make?: string;
+  lens_model?: string;
+  focal_length?: number;
+  exposure_time?: string;
+  f_number?: string;
+  iso?: number;
+  capture_time?: string;
+}
+
+export interface ExifBatchResult {
+  updated: number;
+  files_written: number;
+  files_failed: number;
+  file_errors: string[];
+}
+
+export function updateBatchExif(photoIds: number[], patch: CaptureExifPatch, writeOriginals: boolean) {
+  return invoke<ExifBatchResult>("cmd_update_batch_exif", { photoIds, patch, writeOriginals });
+}
+
+export function updateBatchTags(photoIds: number[], tagIds: number[], newName: string | null, remove: boolean) {
+  return invoke<number>("cmd_update_batch_tags", { photoIds, tagIds, newName, remove });
 }
 
 export async function updatePhotosRating(photoIds: number[], rating: number): Promise<number> {
@@ -110,8 +141,8 @@ export interface FaceClusterPage {
   review_count: number;
 }
 
-export async function getClusterPage(tab: "named" | "unnamed" | "review", offset = 0, limit = 96): Promise<FaceClusterPage> {
-  return invoke<FaceClusterPage>("cmd_get_cluster_page", { tab, offset, limit });
+export async function getClusterPage(tab: "named" | "unnamed" | "review", offset = 0, limit = 96, clusterId?: number): Promise<FaceClusterPage> {
+  return invoke<FaceClusterPage>("cmd_get_cluster_page", { tab, offset, limit, clusterId });
 }
 
 export async function renameCluster(clusterId: number, name: string): Promise<void> {
@@ -120,6 +151,10 @@ export async function renameCluster(clusterId: number, name: string): Promise<vo
 
 export async function confirmFaceCluster(clusterId: number): Promise<void> {
   return invoke("cmd_confirm_face_cluster", { clusterId });
+}
+
+export function confirmFaceClusters(clusterIds: number[]): Promise<number> {
+  return invoke("cmd_confirm_face_clusters", { clusterIds });
 }
 
 export async function mergeClusters(fromId: number, toId: number): Promise<void> {
@@ -362,14 +397,16 @@ export interface AutomaticFaceMergeCandidate {
   cluster_ids: number[];
   similarity: number;
   face_count: number;
+  named_target_id?: number | null;
+  named_target_name?: string | null;
 }
 
 export async function previewAutoMergeUnnamedFaces(threshold: number): Promise<AutomaticFaceMergeCandidate[]> {
   return invoke<AutomaticFaceMergeCandidate[]>("cmd_preview_auto_merge_unnamed_faces", { threshold });
 }
 
-export async function applyAutoMergeUnnamedFaces(mergeGroups: number[][], threshold: number): Promise<string> {
-  return invoke<string>("cmd_apply_auto_merge_unnamed_faces", { mergeGroups, threshold });
+export async function applyAutoMergeUnnamedFaces(mergeGroups: number[][], threshold: number, namedTargetIds: number[]): Promise<string> {
+  return invoke<string>("cmd_apply_auto_merge_unnamed_faces", { mergeGroups, threshold, namedTargetIds });
 }
 
 export async function rejectAutoMergeCandidate(clusterIds: number[]): Promise<void> {
@@ -735,7 +772,8 @@ export const smartSearch = (query:string, includePrivate=false, offset=0, limit=
 export const getDuplicateGroups = (offset=0, limit=20) => invoke<Paged<DuplicateGroup>>("cmd_get_duplicate_groups", { offset, limit });
 export const getRawJpegStacks = (offset=0, limit=20) => invoke<Paged<DuplicateGroup>>("cmd_get_raw_jpeg_stacks", { offset, limit });
 export const getDuplicateGroupPhotos = (groupId:string, offset=0, limit=60) => invoke<Paged<LibraryPhoto>>("cmd_get_duplicate_group_photos", { groupId, offset, limit });
-export const trashDuplicateGroup = (groupId:string) => invoke<number>("cmd_trash_duplicate_group", { groupId });
+export const trashDuplicateGroup = (groupId: string, photoIds?: number[]) =>
+  invoke<number>("cmd_trash_duplicate_group", { groupId, photoIds });
 export const movePhotosToTrash = (photoIds:number[], reason:string) => invoke<number>("cmd_move_photos_to_trash", { photoIds, reason });
 export const getTrashedPhotos = (offset=0, limit=60) => invoke<Paged<LibraryPhoto>>("cmd_get_trashed_photos", { offset, limit });
 export const restoreTrashedPhotos = (photoIds:number[]) => invoke<number>("cmd_restore_trashed_photos", { photoIds });

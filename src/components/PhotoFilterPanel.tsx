@@ -7,6 +7,7 @@ import Icon from "./Icon";
 const emptyOptions: PhotoFilterOptions = { formats: [], cameras: [], exposure_times: [], iso_min: null, iso_max: null, aperture_min: null, aperture_max: null };
 
 export default React.memo(function PhotoFilterPanel() {
+  const metadataRevision = useStore((state) => state.photoMetadataRevision);
   const filter = useStore((state) => state.filter);
   const setFilter = useStore((state) => state.setFilter);
   const [open, setOpen] = useState(false);
@@ -26,7 +27,7 @@ export default React.memo(function PhotoFilterPanel() {
   useEffect(() => {
     if (!open) return;
     api.getPhotoFilterOptions(optionsFilter).then(setOptions).catch(console.error);
-  }, [open, optionsFilter]);
+  }, [open, optionsFilter, metadataRevision]);
   useEffect(() => {
     if (!open) return;
     const close = (event: MouseEvent) => { if (!rootRef.current?.contains(event.target as Node)) setOpen(false); };

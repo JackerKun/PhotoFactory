@@ -55,6 +55,10 @@ export default function LibraryToolsView(){
   const [query,setQuery]=useState(""),[results,setResults]=useState<Paged<LibraryPhoto>>(emptyPage),[selected,setSelected]=useState<Set<number>>(new Set()),[includePrivate,setIncludePrivate]=useState(false);
   const [duplicates,setDuplicates]=useState<Paged<DuplicateGroup>>(emptyPage),[stacks,setStacks]=useState<Paged<DuplicateGroup>>(emptyPage),[trash,setTrash]=useState<Paged<LibraryPhoto>>(emptyPage);
   const [activeGroup,setActiveGroup]=useState<DuplicateGroup|null>(null),[groupPhotos,setGroupPhotos]=useState<Paged<LibraryPhoto>>(emptyPage);
+  const [groupSelected, setGroupSelected] = useState(new Set<number>());
+  const [groupBusy, setGroupBusy] = useState(false);
+  const [groupMessage, setGroupMessage] = useState("");
+  const [groupError, setGroupError] = useState("");
   const [ignored,setIgnored]=useState<Paged<IgnoredFace>>(emptyPage),[ignoredSelected,setIgnoredSelected]=useState<Set<number>>(new Set());
   const [stories,setStories]=useState<Paged<StoryEvent>>(emptyPage),[activeStory,setActiveStory]=useState<StoryEvent|null>(null),[storyPhotos,setStoryPhotos]=useState<Paged<LibraryPhoto>>(emptyPage);
   const [plugins,setPlugins]=useState<ModelPlugin[]>([]),[sources,setSources]=useState<StorageSource[]>([]),[settings,setSettings]=useState<Record<string,string>>({});
@@ -67,7 +71,58 @@ export default function LibraryToolsView(){
   const submittedSearch = useRef({ query: "", includePrivate: false });
   const search=async(loadMore=false)=>{setBusy(true);try{const request=loadMore?submittedSearch.current:{query,includePrivate};const next=await api.smartSearch(request.query,request.includePrivate,loadMore?results.items.length:0);submittedSearch.current=request;setResults(loadMore?append(results,next):next);if(!loadMore)setSelected(new Set())}catch(e){setNotice(String(e))}finally{setBusy(false)}};
   const toggle=(id:number)=>setSelected(v=>{const n=new Set(v);n.has(id)?n.delete(id):n.add(id);return n});
-  const openGroup=async(g:DuplicateGroup)=>{setGroupPhotos(emptyPage());setActiveGroup(g);setGroupPhotos(await api.getDuplicateGroupPhotos(g.group_id))};
+  const openGroup = async (group: DuplicateGroup) => {
+    setGroupPhotos(emptyPage());
+    setGroupSelected(new Set());
+    setGroupMessage("");
+    setGroupError("");
+    setActiveGroup(group);
+    setGroupBusy(true);
+    try {
+      setGroupPhotos(await api.getDuplicateGroupPhotos(group.group_id));
+    } catch (error) {
+      setGroupError(String(error));
+    } finally {
+      setGroupBusy(false);
+    }
+  };
+
+  const loadMoreGroupPhotos = async () => {
+    if (!activeGroup || groupBusy || !groupPhotos.has_more) return;
+    setGroupBusy(true);
+    setGroupError("");
+    try {
+      const next = await api.getDuplicateGroupPhotos(activeGroup.group_id, groupPhotos.items.length);
+      setGroupPhotos((current) => append(current, next));
+    } catch (error) {
+      setGroupError(String(error));
+    } finally {
+      setGroupBusy(false);
+    }
+  };
+
+  const trashSelected = async () => {
+    if (!activeGroup || !groupSelected.size || groupBusy) return;
+    if (!window.confirm(`将选中的 ${groupSelected.size} 张照片移入资料库回收站？`)) return;
+    setGroupBusy(true);
+    setGroupError("");
+    setGroupMessage("");
+    try {
+      const count = await api.trashDuplicateGroup(activeGroup.group_id, [...groupSelected]);
+      setGroupSelected(new Set());
+      setGroupMessage(`已将 ${count} 张照片移入资料库回收站。`);
+      setGroupPhotos(emptyPage());
+      await Promise.all([
+        api.getDuplicateGroupPhotos(activeGroup.group_id).then(setGroupPhotos),
+        refreshAll(),
+        useStore.getState().loadPhotos(),
+      ]);
+    } catch (error) {
+      setGroupError(String(error));
+    } finally {
+      setGroupBusy(false);
+    }
+  };
   const scrollRef = useRef<HTMLDivElement>(null);
   const storyOffset = useRef(0);
   const openStory = async (story: StoryEvent) => {
@@ -112,7 +167,51 @@ export default function LibraryToolsView(){
 
     {tab==="cleanup"&&<section className="mt-5 grid gap-5 lg:grid-cols-2"><div className="rounded-xl bg-bg-secondary p-4"><h2 className="font-semibold">相似/重复照片</h2><p className="text-xs text-text-secondary">分组分页，每组只预览前 8 张。</p><div className="mt-3 space-y-3">{duplicates.items.map(g=><div className="rounded-lg border p-3" key={g.group_id}><div className="flex flex-wrap justify-between gap-2"><span>{g.count} 张 · 推荐 #{g.best_photo_id}</span><div className="flex gap-2"><button className={secondary} onClick={()=>openGroup(g)}>查看全部</button><button className={secondary} onClick={()=>act(()=>api.trashDuplicateGroup(g.group_id),"非最佳照片已移入回收站")}>保留最佳</button></div></div><div className="mt-2 grid grid-cols-4 gap-2">{g.photo_ids.map(id=><Thumb key={id} id={id} label={id===g.best_photo_id?"推荐":""}/>)}</div></div>)}</div><More page={duplicates} busy={busy} onMore={async()=>setDuplicates(append(duplicates,await api.getDuplicateGroups(duplicates.items.length)))}/></div><div className="space-y-5"><div className="rounded-xl bg-bg-secondary p-4"><h2 className="font-semibold">RAW + JPEG 堆栈</h2>{stacks.items.map(s=><div key={s.group_id} className="mt-2 flex justify-between rounded bg-surface-primary p-2 text-sm"><span className="truncate">{s.group_id}</span><span>{s.count} 张</span></div>)}<More page={stacks} busy={busy} onMore={async()=>setStacks(append(stacks,await api.getRawJpegStacks(stacks.items.length)))}/></div><div className="rounded-xl bg-bg-secondary p-4"><h2 className="font-semibold">资料库回收站</h2><div className="mt-3 grid grid-cols-3 gap-2">{trash.items.map(p=><div key={p.id}><Thumb id={p.id} label={p.filename} onClick={()=>openResult(p.id,trash,api.getTrashedPhotos)}/><button className="mt-1 w-full text-xs text-blue-600 dark:text-blue-300" onClick={()=>act(()=>api.restoreTrashedPhotos([p.id]),"照片已恢复")}>恢复</button></div>)}</div><More page={trash} busy={busy} onMore={async()=>setTrash(append(trash,await api.getTrashedPhotos(trash.items.length)))}/></div></div></section>}
 
-    {activeGroup&&<div className="fixed inset-0 z-[950] flex items-center justify-center bg-black/45 p-8" onClick={()=>setActiveGroup(null)}><div className="max-h-full w-full max-w-5xl overflow-auto rounded-2xl bg-bg-primary p-5" onClick={e=>e.stopPropagation()}><div className="flex justify-between"><div><h2 className="font-semibold">相似照片组</h2><p className="text-sm">{groupPhotos.total} 张，推荐 #{activeGroup.best_photo_id}</p></div><button className={secondary} onClick={()=>setActiveGroup(null)}>关闭</button></div><div className="mt-4 grid grid-cols-3 gap-3 md:grid-cols-6">{groupPhotos.items.map(p=><Thumb key={p.id} id={p.id} label={p.best_in_group?"推荐保留":p.filename} onClick={()=>openResult(p.id,groupPhotos,(offset)=>api.getDuplicateGroupPhotos(activeGroup.group_id,offset))}/>)}</div><More page={groupPhotos} busy={busy} onMore={async()=>setGroupPhotos(append(groupPhotos,await api.getDuplicateGroupPhotos(activeGroup.group_id,groupPhotos.items.length)))}/></div></div>}
+    {activeGroup && <div className="fixed inset-0 z-[950] flex items-center justify-center bg-black/45 p-8"
+      onClick={() => { if (!groupBusy) setActiveGroup(null); }}>
+      <section role="dialog" aria-modal="true" aria-label="相似照片组"
+        className="max-h-full w-full max-w-5xl overflow-auto rounded-2xl bg-bg-primary p-5"
+        onClick={(event) => event.stopPropagation()}>
+        <div className="flex justify-between">
+          <div>
+            <h2 className="font-semibold">相似照片组</h2>
+            <p className="text-sm text-text-secondary">{groupPhotos.total} 张，已选 {groupSelected.size} 张</p>
+          </div>
+          <button className={secondary} disabled={groupBusy} onClick={() => setActiveGroup(null)}>关闭</button>
+        </div>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <button className={secondary} disabled={groupBusy || !groupPhotos.items.length}
+            onClick={() => setGroupSelected(new Set(groupPhotos.items.map((photo) => photo.id)))}>全选已加载</button>
+          <button className={secondary} disabled={groupBusy || !groupSelected.size}
+            onClick={() => setGroupSelected(new Set())}>清除选择</button>
+          <button className={secondary} disabled={groupBusy || !groupSelected.size}
+            onClick={() => void trashSelected()}>移入回收站（{groupSelected.size} 张）</button>
+        </div>
+        {groupMessage && <p role="status" className="mt-3 text-sm">{groupMessage}</p>}
+        {groupError && <p role="alert" className="mt-3 text-sm text-red-600">{groupError}</p>}
+        <div className="mt-4 grid grid-cols-3 gap-3 md:grid-cols-6">
+          {groupPhotos.items.map((photo) => (
+            <div key={photo.id} className="min-w-0 rounded-lg border border-surface-secondary p-1">
+              <Thumb id={photo.id} label={photo.best_in_group ? "推荐保留" : photo.filename}
+                onClick={() => openResult(photo.id, groupPhotos, (offset) => api.getDuplicateGroupPhotos(activeGroup.group_id, offset))} />
+              <label className="mt-1 flex cursor-pointer items-center gap-1 px-0.5 text-xs">
+                <input type="checkbox" checked={groupSelected.has(photo.id)} disabled={groupBusy}
+                  onChange={(event) => {
+                    const checked = event.target.checked;
+                    setGroupSelected((current) => {
+                      const next = new Set(current);
+                      if (checked) next.add(photo.id); else next.delete(photo.id);
+                      return next;
+                    });
+                  }} />
+                <span className="truncate" title={photo.filename}>{photo.filename}</span>
+              </label>
+            </div>
+          ))}
+        </div>
+        <More page={groupPhotos} busy={groupBusy} onMore={() => void loadMoreGroupPhotos()} />
+      </section>
+    </div>}
 
     {tab==="people"&&<section className="mt-5 rounded-xl bg-bg-secondary p-4"><div className="flex justify-between"><div><h2 className="font-semibold">已忽略人物管理中心</h2><p className="text-sm text-text-secondary">共 {ignored.total} 张；缩略图按页加载。</p></div><button disabled={!ignoredSelected.size} className={button} onClick={()=>act(()=>api.restoreIgnoredFaces([...ignoredSelected]),"所选人脸已恢复")}>恢复所选（{ignoredSelected.size}）</button></div><div className="mt-4 grid grid-cols-3 gap-3 sm:grid-cols-5 md:grid-cols-8">{ignored.items.map(f=><button key={f.id} onClick={()=>setIgnoredSelected(v=>{const n=new Set(v);n.has(f.id)?n.delete(f.id):n.add(f.id);return n})} className={`rounded-lg border p-2 ${ignoredSelected.has(f.id)?"border-accent-primary bg-blue-50 dark:bg-blue-950/40":""}`}><FaceThumb id={f.id}/><div className="mt-1 text-xs">人脸 #{f.id}</div></button>)}</div><More page={ignored} busy={busy} onMore={async()=>setIgnored(append(ignored,await api.getIgnoredFaces(ignored.items.length)))}/></section>}
 

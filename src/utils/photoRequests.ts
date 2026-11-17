@@ -26,10 +26,10 @@ const waitingFaces: (() => void)[] = [];
 let activeFaces = 0;
 
 function startQueuedFaces() {
-  while (activeFaces < 2 && waitingFaces.length) waitingFaces.shift()!();
+  while (activeFaces < 4 && waitingFaces.length) waitingFaces.shift()!();
 }
 
-// The native command has its own limit. This queue also lets a page discard
+// The native command limits new crops separately from disk cache hits. This queue also lets a page discard
 // work that has not yet crossed the IPC boundary when the user navigates away.
 export function queueFaceThumbnail(read: () => Promise<string>, signal?: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {

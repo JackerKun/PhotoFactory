@@ -9,7 +9,7 @@ PhotoFactory is a local-first desktop photograph manager built with Tauri 2, Rus
 
 **Screenshot provenance:** these are browser captures of the actual React components with mocked Tauri commands and 36 generated images. People, classifications, confidence scores, GPS, albums and metadata are seeded examples, not model predictions. They do not validate the native backend, Windows installers or AI accuracy. See [capture notes](docs/screenshots/README.md).
 
-Version **0.1.9** is under active development. Try a copy of your photographs first. Pagination, virtualization and incremental processing are implementation mechanisms, not evidence of a completed 100,000-photo benchmark.
+Version **0.1.10** is under active development. Try a copy of your photographs first. Pagination, virtualization and incremental processing are implementation mechanisms, not evidence of a completed 100,000-photo benchmark.
 
 ## Interface tour
 
@@ -90,7 +90,7 @@ Build status, test results, and temporary installer artifacts are available in [
 - The photograph root contains `.pf/project.json`, `photos.db`, thumbnails, map tiles and AI caches. Back up both originals and project data. The database also holds user organization; deleting `.pf/` loses more than disposable previews. Close the application before a file-level SQLite backup.
 - Local models need initial preparation / downloads. Recognition and similarity suggestions need human review.
 - Maps and address search contact OpenStreetMap, Esri or Nominatim; requested areas / queries go to the service. Cached tiles can be reused offline.
-- OCR optionally uses system Tesseract and installed language data. Writing edited GPS back to originals requires ExifTool and an explicit write operation; storing coordinates in the project database is separate.
+- OCR optionally uses system Tesseract and installed language data. The macOS and Windows installers include ExifTool for writing EXIF and GPS to original files. The project database also stores edits.
 - HEIC / HEIF, RAW, PSD, XCF and EXR preview support depends on platform decoding and installed dependencies.
 - The edit workspace stores parameters. Do not interpret it as a complete RAW development or rendered-output pipeline.
 - Additional storage sources can be indexed read-only. Preserve original backups before testing cleanup or metadata-writing workflows.

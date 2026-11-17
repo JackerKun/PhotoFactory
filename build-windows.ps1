@@ -55,6 +55,10 @@ Assert-NativeSuccess "AI dependency installation"
 & $VenvPython -m pip install --disable-pip-version-check "pyinstaller>=6,<7"
 Assert-NativeSuccess "PyInstaller installation"
 
+python scripts/prepare-exiftool.py windows
+Assert-NativeSuccess "ExifTool packaging"
+$env:Path = "$(Join-Path $ProjectDir 'build\exiftool');$env:Path"
+
 Write-Host "Checking AI models..."
 & $VenvPython "ai_worker\download_models.py"
 Assert-NativeSuccess "AI model validation/download"

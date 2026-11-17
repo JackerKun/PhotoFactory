@@ -239,7 +239,7 @@ export default React.memo(function ProportionalVirtualGrid({
                         isSelected={photo.id === selectedPhotoId}
                         ratingSelectionMode={ratingSelectionMode}
                         ratingSelected={ratingSelection.includes(photo.id!)}
-                        onToggleRatingSelection={() => toggleRatingSelection(photo.id!)}
+                        onToggleRatingSelection={(extend) => toggleRatingSelection(photo.id!, extend)}
                       />
                     </div>
                   );

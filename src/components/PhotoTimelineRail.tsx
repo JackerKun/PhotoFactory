@@ -17,6 +17,7 @@ interface Props {
  * asks the active grid to scroll to that date.
  */
 export default React.memo(function PhotoTimelineRail({ active, onJump, buckets: suppliedBuckets, ascending: suppliedAscending }: Props) {
+  const metadataRevision = useStore((state) => state.photoMetadataRevision);
   const filter = useStore((state) => state.filter);
   const [buckets, setBuckets] = useState<PhotoTimelineBucket[]>([]);
 
@@ -33,7 +34,7 @@ export default React.memo(function PhotoTimelineRail({ active, onJump, buckets: 
         if (!cancelled) setBuckets([]);
       });
     return () => { cancelled = true; };
-  }, [filter, suppliedBuckets]);
+  }, [filter, suppliedBuckets, metadataRevision]);
 
   const groups = useMemo(() => {
     const map = new Map<number, PhotoTimelineBucket[]>();

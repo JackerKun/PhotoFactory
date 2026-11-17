@@ -236,30 +236,17 @@ function AppLayout({ children, viewMode }: { children: React.ReactNode; viewMode
       return;
     }
     const state = useStore.getState();
-    const hasContextFilter = state.filter.person_id != null
-      || !!state.filter.tag
-      || state.filter.year != null
-      || state.filter.month != null
-      || state.filter.has_gps != null
-      || state.filter.has_favorite != null
-      || !!state.filter.keyword
-      || !!state.filter.format
-      || !!state.filter.camera
-      || state.filter.iso_min != null
-      || state.filter.iso_max != null
-      || state.filter.aperture_min != null
-      || state.filter.aperture_max != null
-      || !!state.filter.exposure_time
-      || !!state.filter.orientation_kind
-      || state.filter.rating_min != null
-      || state.filter.rating_max != null;
-    if (hasContextFilter) {
-      state.clearPhotoFilters();
-      navigate("/");
-    } else {
+    if (viewMode !== "grid") {
       navigate(state.photoRoute);
+      return;
     }
-  }, [navigate]);
+    if (Object.entries(state.filter).some(([key, value]) => !key.startsWith("sort_") && value != null && value !== "")) {
+      state.clearPhotoFilters();
+      state.setSelectedPhotoId(null);
+      const params = photoSearchParamsFromFilter(useStore.getState().filter, new URLSearchParams());
+      navigate(params.size ? `/?${params}` : "/", { replace: true });
+    }
+  }, [navigate, viewMode]);
 
   const sourcePhoto = gpsBatchSession?.sourcePhoto;
   const gpsPhotos = sourcePhoto && !photos.some((photo) => photo.id === sourcePhoto.id)
@@ -276,7 +263,7 @@ function AppLayout({ children, viewMode }: { children: React.ReactNode; viewMode
         className="relative z-20 w-1 flex-none cursor-col-resize bg-transparent hover:bg-accent-primary/25 active:bg-accent-primary/40"
         onPointerDown={(event) => beginResize("sidebar", event)}
       ><span className="absolute inset-y-0 -left-1 -right-1" /></div>
-      <main className="flex-1 overflow-hidden">{children}</main>
+      <main className="relative min-w-0 flex-1 overflow-hidden">{children}</main>
       {hasStandalonePhotoDetail && selectedPhotoId && !lightboxPhotoId && (
         <>
           <div
@@ -350,7 +337,7 @@ function gridLightboxSource(): LightboxSource {
   };
 }
 
-function GridPage() {
+function GridPage({ active }: { active: boolean }) {
   const { photos, thumbnailSize, lightboxPhotoId, selectedPhotoId, setSelectedPhotoId } = useStore();
   const project = useStore((s) => s.project);
   const gpsEditorOpen = useStore((s) => s.gpsBatchSession !== null);
@@ -387,7 +374,7 @@ function GridPage() {
     onSelectPhoto: handleSelectPhoto,
     photoIds,
     columnCount,
-    enabled: !!project && !gpsEditorOpen,
+    enabled: active && !!project && !gpsEditorOpen,
     isLightboxOpen: !!lightboxPhotoId,
     onOpenPhoto: handleOpenPhoto,
     onRatePhoto: handleRatePhoto,
@@ -442,7 +429,11 @@ function WorkspacePanels({ viewMode, openTag }: { viewMode: ViewMode; openTag: (
   }, [viewMode, visited]);
 
   return <>
-    {viewMode === "grid" && <GridPage />}
+    {(viewMode === "grid" || visited.has("grid")) &&
+      <section aria-hidden={viewMode !== "grid" || undefined}
+        className={viewMode === "grid" ? "h-full" : "pointer-events-none invisible absolute inset-0"}>
+        <GridPage active={viewMode === "grid"} />
+      </section>}
     {(viewMode === "map" || visited.has("map")) &&
       <section hidden={viewMode !== "map"} className="h-full"><MapPage active={viewMode === "map"} /></section>}
     {(viewMode === "faces" || visited.has("faces")) &&

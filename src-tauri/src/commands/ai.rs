@@ -138,7 +138,9 @@ pub async fn cmd_clear_task_error_history(
 ) -> AppResult<usize> {
     let project = crate::commands::project::current_project(&state)?;
     if project.root_path != project_path {
-        return Err(AppError::Project("照片库已切换，请重新打开后台任务。".into()));
+        return Err(AppError::Project(
+            "照片库已切换，请重新打开后台任务。".into(),
+        ));
     }
     tokio::task::spawn_blocking(move || {
         let conn = crate::db::connection::init_db(&project.db_path())?;
@@ -320,7 +322,7 @@ where
         None,
         &format!("AI 服务中断，正在恢复并重试当前批次。\n{detail}"),
     );
-    let (client, _) = ensure_ai_worker(port, worker).await.map_err(|error| {
+    let (client, _) = ensure_ai_worker(worker.port, worker).await.map_err(|error| {
         AppError::AiWorker(format!(
             "本地 AI 服务恢复失败，照片仍待处理。\n{error}\n{detail}"
         ))
@@ -456,11 +458,9 @@ async fn check_ai_photo(path: String, worker: &AiWorkerState) -> AppResult<Photo
     if !std::path::Path::new(&path).is_file() {
         return Err(AppError::InvalidPath(path));
     }
-    worker.diagnostics.record(
-        Source::Service,
-        None,
-        &format!("开始单张照片测试 · {path}"),
-    );
+    worker
+        .diagnostics
+        .record(Source::Service, None, &format!("开始单张照片测试 · {path}"));
     let cache = tempfile::tempdir()?;
     let cache_path = cache.path().to_string_lossy();
     let face_response = request_ai_batch(worker, |client| {
@@ -528,6 +528,28 @@ pub async fn monitor_ai_worker(app: tauri::AppHandle) {
     }
 }
 
+pub fn shutdown_ai_worker(state: &AiWorkerState) {
+    state.shutting_down.store(true, Ordering::Release);
+    if let Some(mut child) = state.process.lock().unwrap().take() {
+        stop_managed_worker(&mut child);
+    }
+}
+
+fn stop_managed_worker(child: &mut std::process::Child) {
+    // Closing the pipe asks the managed worker to exit even if inference is busy.
+    drop(child.stdin.take());
+    let deadline = std::time::Instant::now() + Duration::from_millis(750);
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 async fn ensure_ai_worker(port: u16, state: &AiWorkerState) -> AppResult<(AiWorkerClient, String)> {
     // Startup and recovery can be requested by more than one screen or task.
     let _starting = state.start_lock.lock().await;
@@ -536,11 +558,12 @@ async fn ensure_ai_worker(port: u16, state: &AiWorkerState) -> AppResult<(AiWork
     }
     let existing = state.client.lock().unwrap().clone();
     if let Some(client) = existing {
-        if client.port == port
+        if (client.port == port || port == state.port)
             && worker_exit_status(state).is_none()
             && client.health_check().await.unwrap_or(false)
         {
-            return Ok((client, format!("AI worker already running on port {port}")));
+            let message = format!("AI worker already running on port {}", client.port);
+            return Ok((client, message));
         }
     }
     *state.client.lock().unwrap() = None;
@@ -580,8 +603,7 @@ async fn start_ai_worker_process(
 
     // Stop the worker we own before replacing it.
     if let Some(mut existing) = state.process.lock().unwrap().take() {
-        let _ = existing.kill();
-        let _ = existing.wait();
+        stop_managed_worker(&mut existing);
     }
     let (mut command, program) = if bundled_worker.is_file() {
         (
@@ -616,12 +638,14 @@ async fn start_ai_worker_process(
     let instance_id = uuid::Uuid::new_v4().to_string();
     let mut child = command
         .env("AI_WORKER_PORT", port.to_string())
+        .env("PHOTOFACTORY_AI_MANAGED", "1")
         .env("PHOTOFACTORY_AI_INSTANCE", &instance_id)
         .env("AI_MODELS_DIR", &models_dir)
         .env("PHOTFACTORY_AI_THREADS", &ai_threads)
         .env("OMP_NUM_THREADS", &ai_threads)
         .env("OPENBLAS_NUM_THREADS", &ai_threads)
         .env("MKL_NUM_THREADS", &ai_threads)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -644,10 +668,22 @@ async fn start_ai_worker_process(
             });
         });
     }
+    let (listen_sender, listen_receiver) = tokio::sync::oneshot::channel::<u16>();
     if let Some(stdout) = child.stdout.take() {
         let diagnostics = state.diagnostics.clone();
         std::thread::spawn(move || {
+            let mut announce = Some(listen_sender);
             drain_worker_log(BufReader::new(stdout), |line| {
+                if let Some(port) = line
+                    .strip_prefix("PHOTOFACTORY_AI_LISTEN_PORT=")
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .filter(|port| *port != 0)
+                {
+                    if let Some(sender) = announce.take() {
+                        let _ = sender.send(port);
+                        return;
+                    }
+                }
                 diagnostics.output(Source::Stdout, pid, line);
                 let _ = writeln!(std::io::stdout().lock(), "[AI worker stdout] {line}");
             });
@@ -658,30 +694,47 @@ async fn start_ai_worker_process(
     {
         let mut guard = state.process.lock().unwrap();
         if state.shutting_down.load(Ordering::Acquire) {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_managed_worker(&mut child);
             return Err(AppError::AiWorker("PhotoFactory 正在退出".into()));
         }
         *guard = Some(child);
     }
 
-    // First launch may include macOS verification of bundled native libraries.
-    let client = AiWorkerClient::new(port, instance_id);
-    let ready = tokio::time::timeout(Duration::from_secs(60), wait_for_health(&client, state))
-        .await
-        .unwrap_or_else(|_| {
-            Err(AppError::AiWorker(format!(
-                "本地 AI 服务启动超时（端口 {port}，PID {pid}）"
-            )))
-        });
-    if let Err(error) = ready {
-        let mut guard = state.process.lock().unwrap();
-        if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+    // The worker reports the port it bound before we verify the instance ID.
+    let ready = tokio::time::timeout(Duration::from_secs(60), async {
+        let actual_port = listen_receiver.await.map_err(|_| {
+            AppError::AiWorker(format!(
+                "本地 AI 服务在监听前退出（请求端口 {port}，PID {pid}）"
+            ))
+        })?;
+        if actual_port != port {
+            state.diagnostics.status(
+                WorkerStatus::Starting,
+                actual_port,
+                Some(pid),
+                &format!("端口 {port} 已占用，AI 服务改用本地端口 {actual_port}。"),
+            );
         }
-        return Err(error);
-    }
+        let client = AiWorkerClient::new(actual_port, instance_id);
+        wait_for_health(&client, state).await?;
+        Ok::<_, AppError>(client)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(AppError::AiWorker(format!(
+            "本地 AI 服务启动超时（PID {pid}）"
+        )))
+    });
+    let client = match ready {
+        Ok(client) => client,
+        Err(error) => {
+            if let Some(mut child) = state.process.lock().unwrap().take() {
+                stop_managed_worker(&mut child);
+            }
+            return Err(error);
+        }
+    };
+    let port = client.port;
     *state.client.lock().unwrap() = Some(client.clone());
     state
         .diagnostics
@@ -706,7 +759,9 @@ fn drain_worker_log(mut reader: impl BufRead, mut log: impl FnMut(&str)) {
 #[test]
 fn worker_log_keeps_draining_after_non_utf8_output() {
     let mut lines = Vec::new();
-    drain_worker_log(&b"\xd6\xd0\xce\xc4\r\nclassification done\n"[..], |line| lines.push(line.to_owned()));
+    drain_worker_log(&b"\xd6\xd0\xce\xc4\r\nclassification done\n"[..], |line| {
+        lines.push(line.to_owned())
+    });
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[1], "classification done");
 }

@@ -9,7 +9,7 @@ use crate::db::photo_dao;
 use crate::error::{AppError, AppResult};
 use crate::models::{Project, ScanResult};
 use crate::thumbnail::processor::ThumbnailProcessor;
-use crate::{create_project, load_project, save_project_json};
+use crate::{create_project, load_project, update_project_json};
 
 /// Authorize the opened library, including .pf caches and additional disks/NAS.
 pub fn allow_project_assets(app: &tauri::AppHandle, project: &Project) -> AppResult<()> {
@@ -121,6 +121,7 @@ pub async fn cmd_scan_project(state: State<'_, AppState>) -> AppResult<usize> {
             .clone()
     };
 
+    let root_path = project.root_path.clone();
     let count = tokio::task::spawn_blocking(move || {
         let conn = init_db(&project.db_path())?;
         scan_and_import_with_conn(&project, &conn)
@@ -129,11 +130,8 @@ pub async fn cmd_scan_project(state: State<'_, AppState>) -> AppResult<usize> {
     .map_err(|e| crate::error::AppError::Project(e.to_string()))??;
 
     let mut guard = state.project.lock().unwrap();
-    if let Some(p) = guard.as_mut() {
-        let conn = init_db(&p.db_path())?;
-        p.total_photos = photo_dao::get_photo_count(&conn)? as i64;
-        p.last_scan = Some(chrono::Utc::now().to_rfc3339());
-        save_project_json(p)?;
+    if let Some(p) = guard.as_mut().filter(|p| p.root_path == root_path) {
+        *p = load_project(&root_path)?;
     }
     Ok(count)
 }
@@ -149,20 +147,35 @@ pub async fn cmd_get_project(state: State<'_, AppState>) -> AppResult<Option<Pro
 }
 
 #[tauri::command]
-pub async fn cmd_incremental_scan(state: State<'_, AppState>) -> AppResult<ScanResult> {
-    let conn = get_conn(state.clone())?;
-    let guard = state.project.lock().unwrap();
+pub async fn cmd_rename_project(
+    root_path: String,
+    name: String,
+    state: State<'_, AppState>,
+) -> AppResult<Project> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 120 || name.chars().any(char::is_control) {
+        return Err(AppError::Project(
+            "请输入 1 到 120 个字符的项目名称。".into(),
+        ));
+    }
+    let mut guard = state.project.lock().unwrap();
     let project = guard
-        .as_ref()
-        .ok_or_else(|| crate::error::AppError::Project("No project open".into()))?
-        .clone();
-    drop(guard);
+        .as_mut()
+        .filter(|project| project.root_path == root_path)
+        .ok_or_else(|| AppError::Project("当前项目已切换，请重新打开改名窗口。".into()))?;
+    let updated = update_project_json(project, |latest| latest.name = name.to_owned())?;
+    *project = updated.clone();
+    Ok(updated)
+}
+
+#[tauri::command]
+pub async fn cmd_incremental_scan(state: State<'_, AppState>) -> AppResult<ScanResult> {
+    let project = current_project(&state)?;
+    let conn = init_db(&project.db_path())?;
     let result = incremental_scan_with_conn(&project, &conn)?;
     let mut guard = state.project.lock().unwrap();
-    if let Some(p) = guard.as_mut() {
-        p.total_photos = photo_dao::get_photo_count(&conn)? as i64;
-        p.last_scan = Some(chrono::Utc::now().to_rfc3339());
-        save_project_json(p)?;
+    if let Some(p) = guard.as_mut().filter(|p| p.root_path == project.root_path) {
+        *p = load_project(&project.root_path)?;
     }
     Ok(result)
 }
@@ -215,9 +228,12 @@ pub fn incremental_scan_with_conn(project: &Project, conn: &Connection) -> AppRe
                 }
                 conn.execute(
                     "UPDATE photos SET filename = ?1, file_size = ?2, file_mtime = ?3,
-                        width = ?4, height = ?5, format = ?6, taken_at = ?7,
-                        camera_make = ?8, camera_model = ?9, exposure_time = ?10,
-                        f_number = ?11, iso = ?12, latitude = ?13, longitude = ?14,
+                        width = ?4, height = ?5, format = ?6, taken_at = COALESCE((SELECT taken_at FROM photo_exif_overrides WHERE photo_id = photos.id), ?7),
+                        camera_make = COALESCE((SELECT camera_make FROM photo_exif_overrides WHERE photo_id = photos.id), ?8), camera_model = COALESCE((SELECT camera_model FROM photo_exif_overrides WHERE photo_id = photos.id), ?9), exposure_time = COALESCE((SELECT exposure_time FROM photo_exif_overrides WHERE photo_id = photos.id), ?10),
+                        f_number = COALESCE((SELECT f_number FROM photo_exif_overrides WHERE photo_id = photos.id), ?11), iso = COALESCE((SELECT iso FROM photo_exif_overrides WHERE photo_id = photos.id), ?12), latitude = ?13, longitude = ?14,
+                        lens_make = COALESCE((SELECT lens_make FROM photo_exif_overrides WHERE photo_id = photos.id), ?17),
+                        lens_model = COALESCE((SELECT lens_model FROM photo_exif_overrides WHERE photo_id = photos.id), ?18),
+                        focal_length = COALESCE((SELECT focal_length FROM photo_exif_overrides WHERE photo_id = photos.id), ?19),
                         orientation = ?15, thumbnail_status = 0, ai_status = 0,
                         face_status = 0, classification_status = 0, deleted = 0
                      WHERE id = ?16",
@@ -241,6 +257,9 @@ pub fn incremental_scan_with_conn(project: &Project, conn: &Connection) -> AppRe
                         exif.longitude,
                         exif.orientation,
                         id,
+                        exif.lens_make,
+                        exif.lens_model,
+                        exif.focal_length,
                     ],
                 )?;
                 for directory in [
@@ -275,10 +294,11 @@ pub fn incremental_scan_with_conn(project: &Project, conn: &Connection) -> AppRe
         let _ = std::fs::remove_dir_all(directory);
     }
 
-    let mut project = project.clone();
-    project.last_scan = Some(chrono::Utc::now().to_rfc3339());
-    project.total_photos = photo_dao::get_photo_count(conn)?;
-    save_project_json(&project)?;
+    let total_photos = photo_dao::get_photo_count(conn)?;
+    update_project_json(project, |latest| {
+        latest.last_scan = Some(chrono::Utc::now().to_rfc3339());
+        latest.total_photos = total_photos;
+    })?;
 
     Ok(result)
 }
@@ -386,10 +406,11 @@ pub async fn cmd_update_extensions(
         .as_mut()
         .ok_or_else(|| crate::error::AppError::Project("No project open".into()))?;
 
-    project.enabled_extensions = extensions;
-    project.total_photos = photo_dao::get_photo_count(&conn)?;
-    crate::save_project_json(project)?;
-
+    let total_photos = photo_dao::get_photo_count(&conn)?;
+    *project = update_project_json(project, |latest| {
+        latest.enabled_extensions = extensions;
+        latest.total_photos = total_photos;
+    })?;
     Ok(project.clone())
 }
 
@@ -604,7 +625,11 @@ mod incremental_scan_tests {
         )
         .unwrap();
 
+        update_project_json(&project, |latest| latest.name = "胶片资料库".into()).unwrap();
         let second = incremental_scan_with_conn(&project, &conn).unwrap();
+        let reopened = load_project(&project.root_path).unwrap();
+        assert_eq!(reopened.name, "胶片资料库");
+        assert_eq!(reopened.total_photos, 1);
         assert_eq!(second.unchanged, 1);
         assert_eq!(second.added, 0);
         let statuses: (i32, i32) = conn

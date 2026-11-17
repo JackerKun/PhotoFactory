@@ -10,6 +10,9 @@ export interface Photo {
   taken_at: number | null;
   camera_make: string | null;
   camera_model: string | null;
+  lens_make?: string | null;
+  lens_model?: string | null;
+  focal_length?: number | null;
   exposure_time: string | null;
   f_number: string | null;
   iso: number | null;

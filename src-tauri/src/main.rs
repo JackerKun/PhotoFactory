@@ -1,16 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::sync::{atomic::AtomicBool, Arc, Mutex};
-use std::time::Duration;
 
 use photofactory::commands::ai::AiWorkerState;
 use photofactory::commands::project::{self, try_load_last_project, AppState};
 use photofactory::commands::{
-    ai, diagnostics, faces, geo_tags, library, map, memory_video, photos, shell, smart_albums, tag_rules, tags,
+    ai, diagnostics, faces, geo_tags, library, map, memory_video, metadata, photos, shell, smart_albums, tag_rules, tags,
     time_tags, updates,
 };
 use photofactory::thumbnail::processor::ThumbnailProcessor;
-use tauri::{Listener, Manager};
+use tauri::{Manager, RunEvent};
 
 fn main() {
     let initial_project = try_load_last_project();
@@ -36,18 +35,15 @@ fn main() {
         })
         .manage(memory_video::MemoryVideoState::default())
         .setup(|app| {
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                photofactory::scanner::exif_writer::set_exiftool_resource_dir(&resource_dir);
+            }
             tauri::async_runtime::spawn(ai::monitor_ai_worker(app.handle().clone()));
             if let Some(project) = app.state::<AppState>().project.lock().unwrap().as_ref() {
                 if let Err(error) = project::allow_project_assets(app.handle(), project) {
                     eprintln!("Could not restore photo directory access: {error}");
                 }
             }
-            let handle = app.handle().clone();
-            app.listen("tauri://close-requested", move |_event| {
-                if let Some(state) = handle.try_state::<AiWorkerState>() {
-                    shutdown_ai_worker(&state);
-                }
-            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -56,11 +52,14 @@ fn main() {
             project::cmd_open_project,
             project::cmd_scan_project,
             project::cmd_get_project,
+            project::cmd_rename_project,
             project::cmd_incremental_scan,
             photos::cmd_get_photos,
             photos::cmd_get_photo_timeline,
             photos::cmd_get_photo_filter_options,
             photos::cmd_update_photos_rating,
+            metadata::cmd_update_batch_exif,
+            metadata::cmd_update_batch_tags,
             photos::cmd_get_photo,
             photos::cmd_get_lightbox_photos,
             photos::cmd_get_photo_classifications,
@@ -82,6 +81,7 @@ fn main() {
             faces::cmd_get_cluster_page,
             faces::cmd_rename_cluster,
             faces::cmd_confirm_face_cluster,
+            faces::cmd_confirm_face_clusters,
             faces::cmd_reassign_photo_face,
             faces::cmd_create_named_person_for_face,
             faces::cmd_delete_photo_face,
@@ -224,50 +224,13 @@ fn main() {
             library::cmd_get_ignored_faces,
             library::cmd_restore_ignored_faces,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running PhotoFactory");
-}
-
-/// Gracefully shut down the AI worker Python process.
-/// Called by commands that need to stop the worker, or on app teardown.
-pub fn shutdown_ai_worker(state: &AiWorkerState) {
-    state.shutting_down.store(true, std::sync::atomic::Ordering::Release);
-    let mut guard = state.process.lock().unwrap();
-    if let Some(mut child) = guard.take() {
-        let pid = child.id();
-        eprintln!("Shutting down AI worker (PID: {})...", pid);
-
-        #[cfg(unix)]
-        {
-            // Send SIGTERM for graceful shutdown
-            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-
-            // Wait up to 5 seconds for the process to exit
-            let start = std::time::Instant::now();
-            while start.elapsed() < Duration::from_secs(5) {
-                match child.try_wait() {
-                    Ok(Some(_)) => {
-                        eprintln!("AI worker exited gracefully");
-                        return;
-                    }
-                    Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                    Err(_) => break,
+        .build(tauri::generate_context!())
+        .expect("error while building PhotoFactory")
+        .run(|handle, event| {
+            if matches!(event, RunEvent::Exit) {
+                if let Some(state) = handle.try_state::<AiWorkerState>() {
+                    ai::shutdown_ai_worker(&state);
                 }
             }
-
-            // Force kill if it didn't exit
-            eprintln!("AI worker did not exit within 5s, force killing");
-            let _ = child.kill();
-        }
-
-        #[cfg(not(unix))]
-        {
-            // Windows: try taskkill /T /FI for graceful, then /F for force
-            let _ = photofactory::process::background_command("taskkill")
-                .args(["/PID", &pid.to_string()])
-                .output();
-            std::thread::sleep(Duration::from_secs(5));
-            let _ = child.kill();
-        }
-    }
+        });
 }

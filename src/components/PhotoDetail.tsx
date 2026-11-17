@@ -832,6 +832,7 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
   const [faceSaving, setFaceSaving] = useState(false);
   const [faceError, setFaceError] = useState<string | null>(null);
   const [attributes, setAttributes] = useState<CustomAttribute[]>([]);
+  const metadataRevision = useStore((state) => state.photoMetadataRevision);
   const [allManualTags, setAllManualTags] = useState<ManualTag[]>([]);
   const [manualTags, setManualTags] = useState<ManualTag[]>([]);
   const [showTagPicker, setShowTagPicker] = useState(false);
@@ -887,17 +888,9 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
     setFaceTargetId(null);
     setFacePersonName("");
     setMenuPos(null);
-    Promise.all([
-      api.getPhoto(photoId),
-      api.getPhotoAttributes(photoId),
-      api.getManualTags().catch(() => []),
-      api.getPhotoManualTags(photoId).catch(() => []),
-    ]).then(([nextPhoto, nextAttributes, nextAllManualTags, nextManualTags]) => {
+    api.getPhotoAttributes(photoId).then((nextAttributes) => {
       if (cancelled) return;
-      setPhoto(nextPhoto);
       setAttributes(nextAttributes);
-      setAllManualTags(nextAllManualTags);
-      setManualTags(nextManualTags);
     }).catch(console.error);
     return () => {
       cancelled = true;
@@ -907,6 +900,21 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
       }
     };
   }, [photoId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      api.getPhoto(photoId),
+      api.getManualTags().catch(() => []),
+      api.getPhotoManualTags(photoId).catch(() => []),
+    ]).then(([nextPhoto, nextAllManualTags, nextManualTags]) => {
+      if (cancelled) return;
+      setPhoto(nextPhoto);
+      setAllManualTags(nextAllManualTags);
+      setManualTags(nextManualTags);
+    }).catch(console.error);
+    return () => { cancelled = true; };
+  }, [photoId, metadataRevision]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1207,11 +1215,17 @@ export default React.memo(function PhotoDetail({ photoId, onClose, width = 384, 
         <details className="rounded-xl border border-surface-secondary p-3">
           <summary className="cursor-pointer text-sm font-medium">相机与 EXIF</summary>
           <div className="mt-3 space-y-2 text-sm">
-          {photo.camera_make && (
-            <p className="text-text-secondary"><span className="text-text-primary font-medium">相机：</span> {photo.camera_make} {photo.camera_model}</p>
+          {(photo.camera_make || photo.camera_model) && (
+            <p className="text-text-secondary"><span className="text-text-primary font-medium">相机：</span> {[photo.camera_make, photo.camera_model].filter(Boolean).join(" ")}</p>
           )}
           {photo.width && photo.height && (
             <p className="text-text-secondary"><span className="text-text-primary font-medium">尺寸：</span> {photo.width} × {photo.height}</p>
+          )}
+          {(photo.lens_make || photo.lens_model) && (
+            <p className="text-text-secondary"><span className="text-text-primary font-medium">镜头：</span> {[photo.lens_make, photo.lens_model].filter(Boolean).join(" ")}</p>
+          )}
+          {photo.focal_length != null && (
+            <p className="text-text-secondary"><span className="text-text-primary font-medium">焦距：</span> {photo.focal_length} mm</p>
           )}
           {photo.exposure_time && (
             <p className="text-text-secondary"><span className="text-text-primary font-medium">快门：</span> {photo.exposure_time}s</p>

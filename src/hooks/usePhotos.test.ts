@@ -52,6 +52,26 @@ describe("photo pagination store", () => {
     useStore.getState().reset();
   });
 
+  it("extends the selection in photo sort order and selects all pages of the current filter", async () => {
+    const filter = { keyword: "胶片" };
+    const first = page([photo(40), photo(8), photo(21), photo(3)], 6, true);
+    useStore.setState({
+      photos: first.photos, cursor: first.next_cursor, totalPhotos: 6, hasNext: true,
+      filter, ratingSelectionMode: true,
+    });
+    const { toggleRatingSelection, selectAllRatingPhotos } = useStore.getState();
+    toggleRatingSelection(21);
+    toggleRatingSelection(40, true);
+    expect(useStore.getState().ratingSelection).toEqual([21, 40, 8]);
+    expect(useStore.getState().ratingSelectionAnchor).toBe(21);
+
+    vi.mocked(api.getPhotos).mockResolvedValueOnce(page([photo(71), photo(10)], 6, false));
+    await selectAllRatingPhotos();
+    expect(api.getPhotos).toHaveBeenCalledWith(first.next_cursor, 500, filter);
+    expect(useStore.getState().ratingSelection).toEqual([40, 8, 21, 3, 71, 10]);
+    expect(useStore.getState().hasNext).toBe(false);
+  });
+
   it("always refreshes from the first page and records the filtered total", async () => {
     useStore.setState({
       photos: [photo(99)],

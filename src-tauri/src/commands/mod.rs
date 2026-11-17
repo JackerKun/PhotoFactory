@@ -5,6 +5,7 @@ pub mod geo_tags;
 pub mod library;
 pub mod map;
 pub mod memory_video;
+pub mod metadata;
 pub mod photos;
 pub mod project;
 pub mod shell;

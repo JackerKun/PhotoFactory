@@ -24,6 +24,7 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
   const { setLightboxPhotoId, selectedPhotoId, setSelectedPhotoId, updatePhotoInList } = useStore();
   const faceDataRevision = useStore((state) => state.faceDataRevision);
   const source = useStore((state) => state.lightboxSource);
+  const candidatePersonId = source?.candidatePersonId;
   const [folderPhotos, setFolderPhotos] = useState<Photo[]>([]);
   const [extraPhotos, setExtraPhotos] = useState<readonly LightboxItem[]>([]);
   const [hasNext, setHasNext] = useState(true);
@@ -145,7 +146,8 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
   const [panOffset, setPanOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
   const [showShortcuts, setShowShortcuts] = useState(false);
-  const [faces, setFaces] = useState<FaceDetection[]>([]);
+  const [faceFrame, setFaceFrame] = useState<{ photoId: number; items: FaceDetection[] }>();
+  const faces = faceFrame?.photoId === photoId ? faceFrame.items : [];
   const [faceClusters, setFaceClusters] = useState<FaceCluster[]>([]);
   const [editingFaceId, setEditingFaceId] = useState<number | null>(null);
   const [showFaceBoxes, setShowFaceBoxes] = useState(() => localStorage.getItem("photofactory.lightboxFaceBoxes") !== "false");
@@ -164,7 +166,6 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
   }, [showFaceBoxes]);
 
   useEffect(() => {
-    setFaces([]);
     setEditingFaceId(null);
   }, [photoId]);
 
@@ -173,7 +174,7 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
     Promise.all([api.getPhotoFaces(photoId), api.getClusters()])
       .then(([photoFaces, clusters]) => {
         if (cancelled) return;
-        setFaces(photoFaces);
+        setFaceFrame({ photoId, items: photoFaces });
         setFaceClusters(clusters);
       })
       .catch((error) => {
@@ -416,8 +417,13 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
 
   const detailsOpen = selectedPhotoId === photoId;
   const clusterNames = useMemo(() => new Map(
-    faceClusters.filter((cluster) => cluster.id != null).map((cluster) => [cluster.id!, cluster.name?.trim() || "未命名人物"]),
+    faceClusters.flatMap((cluster) => {
+      const name = cluster.name?.trim();
+      return cluster.id != null && name ? [[cluster.id, name] as const] : [];
+    }),
   ), [faceClusters]);
+  const otherFaceCount = faces.filter((face) => candidatePersonId == null || face.person_id !== candidatePersonId).length;
+  const faceToggleLabel = `${showFaceBoxes ? "隐藏" : "显示"}${candidatePersonId != null ? "其他" : ""}人脸框`;
   const sourceOrientation = preview?.original ? (currentPhoto?.orientation || 1) : 1;
   const swapsDimensions = sourceOrientation >= 5 && sourceOrientation <= 8;
   const faceCanvasWidth = currentPhoto?.width
@@ -430,6 +436,12 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
       <div className="pointer-events-none absolute left-4 top-4 z-10 rounded-xl bg-black/45 px-3 py-2 text-xs text-white/85 backdrop-blur-sm">
         <div className="max-w-[45vw] truncate font-medium">{currentPhoto?.filename}</div>
         <div className="mt-1 text-amber-400">{currentPhoto?.rating ? "★".repeat(currentPhoto.rating) : "未评星"}{currentPhoto?.is_favorite ? <span className="ml-2 text-red-400">♥ 收藏</span> : null}</div>
+        {candidatePersonId != null && (
+          <div className="mt-2 flex items-center gap-1.5 font-semibold text-sky-200">
+            <span aria-hidden="true" className="h-2.5 w-2.5 rounded-sm border-2 border-sky-400" />
+            当前候选人 · 人物 {candidatePersonId}
+          </div>
+        )}
       </div>
       <button
         type="button"
@@ -481,20 +493,20 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
           </button>
         )}
 
-        {faces.length > 0 && (
+        {otherFaceCount > 0 && (
           <button
             type="button"
             data-lightbox-control
             onPointerDown={(event) => event.stopPropagation()}
             onClick={() => setShowFaceBoxes((value) => !value)}
-            className={`absolute left-4 top-20 z-10 flex h-9 w-9 items-center justify-center rounded-full border backdrop-blur-sm transition-colors ${
+            className={`absolute left-4 ${candidatePersonId != null ? "top-28" : "top-20"} z-10 flex h-9 w-9 items-center justify-center rounded-full border backdrop-blur-sm transition-colors ${
               showFaceBoxes
                 ? "border-accent-primary bg-accent-primary/85 text-white"
                 : "border-white/20 bg-black/45 text-white/75 hover:bg-text-primary/65"
             }`}
             aria-pressed={showFaceBoxes}
-            aria-label={showFaceBoxes ? "隐藏人脸框" : "显示人脸框"}
-            title={showFaceBoxes ? "隐藏人脸框" : `显示人脸框（${faces.length}）`}
+            aria-label={faceToggleLabel}
+            title={`${faceToggleLabel}（${otherFaceCount}）`}
           >
             <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5 fill-none stroke-current" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
               <path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3" />
@@ -531,20 +543,26 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
                   : undefined,
               }}
             />
-            {showFaceBoxes && faceCanvasWidth > 0 && faceCanvasHeight > 0 && (
+            {(showFaceBoxes || candidatePersonId != null) && faceCanvasWidth > 0 && faceCanvasHeight > 0 && (
               <div className="pointer-events-none absolute inset-0 overflow-hidden">
                 {faces.map((face) => {
-                  const label = face.person_id == null ? "待整理" : (clusterNames.get(face.person_id) || "未命名人物");
+                  const isCandidate = candidatePersonId != null && face.person_id === candidatePersonId;
+                  if (!showFaceBoxes && !isCandidate) return null;
+                  const name = face.person_id == null ? undefined : clusterNames.get(face.person_id);
+                  const label = isCandidate ? `当前候选人 · 人物 ${candidatePersonId}`
+                    : name ?? (face.person_id == null ? "未命名 · 待整理" : `未命名 · 人物 ${face.person_id}`);
                   const box = faceBoxForDisplay(face, faceCanvasWidth, faceCanvasHeight, sourceOrientation);
-                  const isEditing = face.id != null && face.id === editingFaceId;
                   if (!box) return null;
+                  const isEditing = face.id != null && face.id === editingFaceId;
+                  const frameClass = isCandidate ? "border-[3px] border-sky-400"
+                    : name ? "border-2 border-emerald-400" : "border-2 border-dashed border-amber-400";
+                  const labelClass = isCandidate ? "bg-sky-800 font-semibold text-white"
+                    : name ? "bg-emerald-800 text-white" : "bg-amber-400 text-black";
                   return (
                     <div
                       key={face.id ?? `${face.bbox_x}-${face.bbox_y}`}
-                      className={`absolute ${
-                        isEditing
-                          ? "z-10 border-4 border-emerald-400 shadow-[0_0_0_2px_rgba(255,255,255,0.95),0_0_18px_rgba(52,211,153,0.95)]"
-                          : "border-2 border-red-500 shadow-[0_0_0_1px_rgba(255,255,255,0.7)]"
+                      className={`absolute ${frameClass} ${isCandidate ? "z-20" : isEditing ? "z-10" : ""} ${
+                        isEditing ? "ring-2 ring-white" : "shadow-[0_0_0_1px_rgba(0,0,0,0.75)]"
                       }`}
                       style={{
                         left: `${box.left}%`,
@@ -553,9 +571,9 @@ export default React.memo(function Lightbox({ photoId, onClose }: Props) {
                         height: `${box.height}%`,
                       }}
                     >
-                      <span className={`absolute left-[-2px] max-w-40 truncate rounded-t px-1.5 py-1 text-xs leading-none text-white shadow ${
-                        isEditing ? "-top-7 bg-emerald-500 font-semibold" : "-top-6 bg-red-500"
-                      }`}>
+                      <span className={`absolute w-max max-w-48 truncate rounded px-1.5 py-1 text-xs leading-none shadow ${labelClass} ${
+                        box.top < 6 ? "top-0" : "bottom-full mb-0.5"
+                      } ${box.left > 72 ? "right-0" : "left-0"}`}>
                         {label}
                       </span>
                     </div>

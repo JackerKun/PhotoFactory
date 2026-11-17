@@ -9,8 +9,12 @@ import StarRating from "./StarRating";
 import * as api from "../api/tauri";
 import KeyboardShortcutsDialog from "./KeyboardShortcutsDialog";
 import Icon from "./Icon";
+import BatchMetadataDialog, { type BatchMetadataMode } from "./BatchMetadataDialog";
 
 export default React.memo(function ThumbnailToolbar() {
+  const [metadataBatch, setMetadataBatch] = useState<{ mode: BatchMetadataMode; photoIds: number[] } | null>(null);
+  const [selectingAll, setSelectingAll] = useState(false);
+  const [selectionError, setSelectionError] = useState("");
   const [showShortcuts, setShowShortcuts] = useState(false);
   const {
     thumbnailShape,
@@ -25,8 +29,23 @@ export default React.memo(function ThumbnailToolbar() {
     ratingSelection,
     setRatingSelectionMode,
     clearRatingSelection,
+    selectAllRatingPhotos,
     updatePhotosInList,
   } = useStore();
+
+  async function selectAll() {
+    setSelectionError("");
+    setSelectingAll(true);
+    try {
+      await selectAllRatingPhotos();
+    } catch (error) {
+      setSelectionError(String(error));
+    } finally {
+      setSelectingAll(false);
+    }
+  }
+
+  const openMetadataBatch = (mode: BatchMetadataMode) => setMetadataBatch({ mode, photoIds: [...ratingSelection] });
 
   const applyRating = async (rating: number) => {
     if (ratingSelection.length === 0) return;
@@ -76,8 +95,8 @@ export default React.memo(function ThumbnailToolbar() {
         <div className="ui-toolbar">
           <PhotoFilterPanel />
           <PhotoSortMenu />
-          <button type="button" onClick={() => setRatingSelectionMode(!ratingSelectionMode)} className="ui-button"
-            aria-pressed={ratingSelectionMode} title="选择多张照片并批量设置星级">★ 批量</button>
+          <button type="button" disabled={selectingAll} onClick={() => { setSelectionError(""); setRatingSelectionMode(!ratingSelectionMode); }} className="ui-button"
+            aria-pressed={ratingSelectionMode} title="选择多张照片并批量设置星级、EXIF 和标签">★ 批量</button>
           <button type="button" onClick={openCoordinateManager} disabled={photos.length === 0}
             title="管理当前已加载照片的坐标，已勾选的照片会带入" className="ui-button">
             <Icon name="location" size={14} />坐标批量管理
@@ -93,17 +112,25 @@ export default React.memo(function ThumbnailToolbar() {
         </div>
       </div>
 
-      <div className="mt-1.5 flex min-h-5 items-center justify-center gap-3 text-xs text-text-muted" aria-live="polite">
+      <div className="mt-1.5 flex min-h-5 flex-wrap items-center justify-center gap-3 text-xs text-text-muted" aria-live="polite">
         <span>{totalPhotos > 0 ? `已加载 ${photos.length.toLocaleString()} / 共 ${totalPhotos.toLocaleString()} 张` : loading ? "正在加载照片…" : photoLoadError ? "照片读取失败" : "共 0 张"}</span>
         {ratingSelectionMode && (
-          <div className="flex items-center gap-2 rounded-full bg-surface-primary px-3 py-1">
+          <div className="flex flex-wrap items-center gap-2 rounded-xl bg-surface-primary px-3 py-1">
             <span>已选 {ratingSelection.length} 张</span>
-            <StarRating value={0} onChange={applyRating} size="sm" disabled={ratingSelection.length === 0} />
-            <button type="button" onClick={clearRatingSelection} className="text-accent-link">清除选择</button>
+            <button type="button" className="ui-button" onClick={() => void selectAll()} disabled={loading || selectingAll || !photos.length}>
+              {selectingAll ? "正在选择…" : totalPhotos <= 5000 ? "全选" : photos.length <= 5000 ? "全选已加载" : "选择前 5000 张"}
+            </button>
+            <span className="leading-tight" title="按住 Shift 点击可连续选择">Shift 连选</span>
+            <StarRating value={0} onChange={applyRating} size="sm" disabled={selectingAll || ratingSelection.length === 0} />
+            <button type="button" className="ui-button" disabled={selectingAll || !ratingSelection.length} onClick={() => openMetadataBatch("exif")}>编辑 EXIF</button>
+            <button type="button" className="ui-button" disabled={selectingAll || !ratingSelection.length} onClick={() => openMetadataBatch("tags")}>管理标签</button>
+            <button type="button" disabled={selectingAll} onClick={clearRatingSelection} className="text-accent-link">清除选择</button>
           </div>
         )}
       </div>
+      {ratingSelectionMode && selectionError && <p role="alert" className="mt-1 text-center text-sm text-red-600">{selectionError}</p>}
       <ActiveFilters />
+      {metadataBatch && <BatchMetadataDialog {...metadataBatch} onClose={() => setMetadataBatch(null)} />}
       <KeyboardShortcutsDialog open={showShortcuts} onClose={() => setShowShortcuts(false)} />
     </div>
   );

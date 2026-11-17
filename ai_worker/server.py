@@ -1,13 +1,15 @@
 """PhotoFactory AI Worker - HTTP server for face detection and scene classification."""
 
+import errno
 import os
+import socket
 import time
 import sys
 import faulthandler
 import logging
 import subprocess
 import tempfile
-from threading import Lock
+from threading import Lock, Thread
 from concurrent.futures import ThreadPoolExecutor
 
 if __name__ == "__main__" and sys.stderr is not None:
@@ -157,6 +159,7 @@ class ClusterFacesV2Request(BaseModel):
 class AutomaticMergeRequest(BaseModel):
     embeddings_dir: str
     unnamed_clusters: Dict[str, int]
+    named_cluster_ids: Optional[List[int]] = None
     threshold: float = 0.72
     cannot_links: Optional[List[Tuple[int, int]]] = None
 
@@ -504,7 +507,7 @@ def cluster_faces_v2(req: ClusterFacesV2Request):
 
 @app.post("/plan_automatic_face_merges")
 def plan_automatic_face_merges(req: AutomaticMergeRequest):
-    """Suggest merges only among the unnamed assignments supplied by the app."""
+    """Suggest merges with an optional named destination."""
     from face_clusterer import plan_automatic_cluster_merges
 
     if not os.path.exists(req.embeddings_dir):
@@ -515,6 +518,7 @@ def plan_automatic_face_merges(req: AutomaticMergeRequest):
         threshold=req.threshold,
         cannot_links=req.cannot_links or [],
         return_details=True,
+        named_cluster_ids=req.named_cluster_ids,
     )
     return {"candidates": candidates}
 
@@ -536,33 +540,53 @@ async def compute_face_quality_endpoint(req: FaceQualityRequest):
 
 # --- Entry point ---
 
-import signal
-_shutdown_requested = False
+def _exit_on_parent_disconnect():
+    # The desktop app keeps this pipe open for the lifetime of its child.
+    # EOF also arrives if the desktop process is terminated without cleanup.
+    try:
+        sys.stdin.buffer.read()
+    finally:
+        os._exit(0)
 
-def _handle_shutdown(signum, frame):
-    global _shutdown_requested
-    _shutdown_requested = True
-    print(f"Received signal {signum}, shutting down gracefully...", flush=True)
-    sys.exit(0)
+
+def _bind_managed_listener(port: int) -> socket.socket:
+    for candidate in (port, 0):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if sys.platform == "win32":
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", candidate))
+            listener.listen()
+            return listener
+        except OSError as error:
+            listener.close()
+            in_use = error.errno == errno.EADDRINUSE or getattr(error, "winerror", None) == 10048
+            if not candidate or not in_use:
+                raise
 
 
 def main():
-    # The desktop process reads these pipes as UTF-8. Frozen Python builds
-    # may ignore PYTHONIOENCODING, so set it on the actual streams.
+    # Frozen Python builds may ignore PYTHONIOENCODING.
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     port = int(os.environ.get("AI_WORKER_PORT", "9876"))
-    # Register signal handlers for graceful shutdown
-    signal.signal(signal.SIGTERM, _handle_shutdown)
-    signal.signal(signal.SIGINT, _handle_shutdown)
-
-    print(f"Starting PhotoFactory AI Worker on port {port}", flush=True)
     print(
         f"Models directory: {os.environ.get('AI_MODELS_DIR', os.path.join(os.path.dirname(__file__), 'models'))}",
         flush=True,
     )
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
+    if os.environ.get("PHOTOFACTORY_AI_MANAGED") != "1":
+        uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
+        return
+
+    Thread(target=_exit_on_parent_disconnect, daemon=True).start()
+    with _bind_managed_listener(port) as listener:
+        actual_port = listener.getsockname()[1]
+        print(f"PHOTOFACTORY_AI_LISTEN_PORT={actual_port}", flush=True)
+        config = uvicorn.Config(app, host="127.0.0.1", port=actual_port, log_level="info")
+        uvicorn.Server(config).run(sockets=[listener])
 
 
 def thumbnail_stream():

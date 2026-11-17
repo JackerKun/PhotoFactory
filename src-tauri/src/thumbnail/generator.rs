@@ -120,18 +120,29 @@ fn path_hash(path: &str) -> String {
     hex::encode(&hasher.finalize()[..8])
 }
 
-fn decode_scaled_jpeg(source: &Path, size: u32) -> Option<DynamicImage> {
+fn decode_scaled_jpeg(
+    source: &Path,
+    target_size: impl FnOnce(u32, u32) -> (u32, u32),
+) -> Option<(DynamicImage, u32, u32)> {
     use jpeg_decoder::{Decoder, PixelFormat};
     let file = std::fs::File::open(source).ok()?;
     let mut decoder = Decoder::new(std::io::BufReader::new(file));
     decoder.set_max_decoding_buffer_size(512 * 1024 * 1024);
-    let target = u16::try_from(size).ok()?;
-    decoder.scale(target, target).ok()?;
+    decoder.read_info().ok()?;
+    let original = decoder.info()?;
+    let (original_width, original_height) = (u32::from(original.width), u32::from(original.height));
+    let (target_width, target_height) = target_size(original_width, original_height);
+    decoder
+        .scale(
+            u16::try_from(target_width).ok()?,
+            u16::try_from(target_height).ok()?,
+        )
+        .ok()?;
     let info = decoder.info()?;
     let width = u32::from(info.width);
     let height = u32::from(info.height);
     let pixels = decoder.decode().ok()?;
-    match info.pixel_format {
+    let decoded = match info.pixel_format {
         PixelFormat::RGB24 => {
             image::RgbImage::from_raw(width, height, pixels).map(DynamicImage::ImageRgb8)
         }
@@ -139,7 +150,8 @@ fn decode_scaled_jpeg(source: &Path, size: u32) -> Option<DynamicImage> {
             image::GrayImage::from_raw(width, height, pixels).map(DynamicImage::ImageLuma8)
         }
         _ => None,
-    }
+    }?;
+    Some((decoded, original_width, original_height))
 }
 
 fn decode_thumbnail_source(source: &Path, size: u32) -> AppResult<DynamicImage> {
@@ -148,7 +160,7 @@ fn decode_thumbnail_source(source: &Path, size: u32) -> AppResult<DynamicImage> 
         .and_then(|extension| extension.to_str())
         .unwrap_or_default();
     if extension.eq_ignore_ascii_case("jpeg") || extension.eq_ignore_ascii_case("jpg") {
-        if let Some(image) = decode_scaled_jpeg(source, size) {
+        if let Some((image, _, _)) = decode_scaled_jpeg(source, |_, _| (size, size)) {
             return Ok(image);
         }
     }
@@ -324,18 +336,55 @@ pub fn generate_face_thumbnail(
     bbox_h: u32,
     size: u32,
 ) -> AppResult<Vec<u8>> {
-    let mut img = if is_raw_format(source_path) || needs_conversion(source_path) {
-        let jpeg_path = raw_to_jpeg(source_path)?;
-        let result = image::open(&jpeg_path).map_err(|e| AppError::Image(e));
-        let _ = std::fs::remove_file(&jpeg_path);
-        result?
+    let extension = source_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default();
+    let scaled_jpeg = if extension.eq_ignore_ascii_case("jpg")
+        || extension.eq_ignore_ascii_case("jpeg")
+    {
+        decode_scaled_jpeg(source_path, |width, height| {
+            let (_, _, side, _) = expanded_face_crop(width, height, bbox_x, bbox_y, bbox_w, bbox_h);
+            // Keep at least one decoded pixel per output pixel inside the crop.
+            let ratio = (f64::from(size) / f64::from(side)).min(1.0);
+            (
+                (f64::from(width) * ratio).ceil() as u32,
+                (f64::from(height) * ratio).ceil() as u32,
+            )
+        })
     } else {
-        image::open(source_path).map_err(|e| AppError::Image(e))?
+        None
+    };
+    let (mut img, original_width, original_height) = if let Some(decoded) = scaled_jpeg {
+        decoded
+    } else {
+        let img = if is_raw_format(source_path) || needs_conversion(source_path) {
+            let jpeg_path = raw_to_jpeg(source_path)?;
+            let result = image::open(&jpeg_path);
+            let _ = std::fs::remove_file(&jpeg_path);
+            result?
+        } else {
+            image::open(source_path)?
+        };
+        let (width, height) = (img.width(), img.height());
+        (img, width, height)
     };
 
-    let (img_w, img_h) = (img.width(), img.height());
-    let (x, y, w, h) = expanded_face_crop(img_w, img_h, bbox_x, bbox_y, bbox_w, bbox_h);
-    let crop = img.crop(x, y, w, h);
+    let (x, y, w, h) = expanded_face_crop(
+        original_width,
+        original_height,
+        bbox_x,
+        bbox_y,
+        bbox_w,
+        bbox_h,
+    );
+    let (scaled_w, scaled_h) = (u64::from(img.width()), u64::from(img.height()));
+    let (original_width, original_height) = (u64::from(original_width), u64::from(original_height));
+    let x1 = u64::from(x) * scaled_w / original_width;
+    let y1 = u64::from(y) * scaled_h / original_height;
+    let x2 = (u64::from(x + w) * scaled_w).div_ceil(original_width);
+    let y2 = (u64::from(y + h) * scaled_h).div_ceil(original_height);
+    let crop = img.crop(x1 as u32, y1 as u32, (x2 - x1) as u32, (y2 - y1) as u32);
     let thumb = crop.thumbnail(size, size);
     // Encode as JPEG
     let mut buf = Vec::new();
@@ -377,13 +426,33 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn scaled_jpeg_face_crop_keeps_original_coordinates() {
+        let folder = tempfile::tempdir().unwrap();
+        let source = folder.path().join("portrait.jpg");
+        let pixels = image::RgbImage::from_fn(1401, 1001, |x, y| {
+            if x >= 900 && y >= 500 {
+                image::Rgb([30, 190, 40])
+            } else {
+                image::Rgb([190, 30, 40])
+            }
+        });
+        pixels.save(&source).unwrap();
+
+        let bytes = generate_face_thumbnail(&source, 950, 580, 410, 390, 160).unwrap();
+        let avatar = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        let center = avatar.get_pixel(avatar.width() / 2, avatar.height() / 2);
+        assert!(center[1] > center[0] + 100);
+        assert_eq!(avatar.width().max(avatar.height()), 160);
+    }
+
+    #[test]
     fn jpeg_thumbnail_decodes_at_reduced_resolution() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.jpg");
         image::RgbImage::from_pixel(2000, 1000, image::Rgb([30, 60, 90]))
             .save(&source)
             .unwrap();
-        let decoded = decode_scaled_jpeg(&source, 256).unwrap();
+        let (decoded, _, _) = decode_scaled_jpeg(&source, |_, _| (256, 256)).unwrap();
         assert!(decoded.width() >= 256 && decoded.width() < 2000);
         let thumbnail = generate_small_thumbnail(&source, dir.path()).unwrap();
         assert_eq!(image::image_dimensions(thumbnail).unwrap(), (256, 128));

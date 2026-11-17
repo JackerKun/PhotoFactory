@@ -13,6 +13,7 @@ interface GpsBatchSession {
 export type LightboxItem = Pick<Photo, "id" | "filename"> & Partial<Pick<Photo, "path" | "file_size">>;
 export interface LightboxSource {
   items: readonly LightboxItem[];
+  candidatePersonId?: number;
   loadNext?: (items: readonly LightboxItem[]) => Promise<readonly LightboxItem[]>;
 }
 
@@ -34,12 +35,16 @@ interface AppState {
   lightboxSource: LightboxSource | null;
   selectedPhotoId: number | null;
   selectedLightboxSource: LightboxSource | null;
+  photoMetadataRevision: number;
+  refreshPhotoMetadata: () => Promise<void>;
   faceDataRevision: number;
   markFaceDataChanged: () => void;
   ratingSelectionMode: boolean;
   ratingSelection: number[];
+  ratingSelectionAnchor: number | null;
+  selectAllRatingPhotos: () => Promise<void>;
   setRatingSelectionMode: (enabled: boolean) => void;
-  toggleRatingSelection: (photoId: number) => void;
+  toggleRatingSelection: (photoId: number, extend?: boolean) => void;
   clearRatingSelection: () => void;
   gpsBatchSession: GpsBatchSession | null;
   openGpsBatchEditor: (session: GpsBatchSession) => void;
@@ -86,6 +91,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (p?.root_path === state.project?.root_path) return { project: p };
     photoLists.clear();
     return {
+      ratingSelectionMode: false, ratingSelection: [], ratingSelectionAnchor: null,
       project: p, photos: [], totalPhotos: 0, cursor: null, hasNext: false,
       loading: false, photoLoadError: null, photoGridScrollOffsets: { square: 0, proportional: 0 },
       lightboxPhotoId: null, lightboxSource: null, selectedPhotoId: null, selectedLightboxSource: null,
@@ -108,6 +114,12 @@ export const useStore = create<AppState>((set, get) => ({
   lightboxSource: null,
   selectedPhotoId: null,
   selectedLightboxSource: null,
+  photoMetadataRevision: 0,
+  refreshPhotoMetadata: async () => {
+    photoLists.clear();
+    set((state) => ({ photoMetadataRevision: state.photoMetadataRevision + 1 }));
+    await get().loadPhotos();
+  },
   faceDataRevision: 0,
   markFaceDataChanged: () => {
     photoLists.clear();
@@ -115,13 +127,62 @@ export const useStore = create<AppState>((set, get) => ({
   },
   ratingSelectionMode: false,
   ratingSelection: [],
-  setRatingSelectionMode: (enabled) => set({ ratingSelectionMode: enabled, ratingSelection: [] }),
-  toggleRatingSelection: (photoId) => set((state) => ({
-    ratingSelection: state.ratingSelection.includes(photoId)
-      ? state.ratingSelection.filter((id) => id !== photoId)
-      : [...state.ratingSelection, photoId],
-  })),
-  clearRatingSelection: () => set({ ratingSelection: [] }),
+  ratingSelectionAnchor: null,
+  setRatingSelectionMode: (enabled) => set({ ratingSelectionMode: enabled, ratingSelection: [], ratingSelectionAnchor: null }),
+  toggleRatingSelection: (photoId, extend = false) => set((state) => {
+    if (extend && state.ratingSelectionAnchor != null) {
+      const start = state.photos.findIndex((photo) => photo.id === state.ratingSelectionAnchor);
+      const end = state.photos.findIndex((photo) => photo.id === photoId);
+      if (start >= 0 && end >= 0) {
+        const selected = new Set(state.ratingSelection);
+        for (const photo of state.photos.slice(Math.min(start, end), Math.max(start, end) + 1)) {
+          if (photo.id != null) selected.add(photo.id);
+        }
+        return { ratingSelection: [...selected] };
+      }
+    }
+    return {
+      ratingSelection: state.ratingSelection.includes(photoId)
+        ? state.ratingSelection.filter((id) => id !== photoId)
+        : [...state.ratingSelection, photoId],
+      ratingSelectionAnchor: photoId,
+    };
+  }),
+  selectAllRatingPhotos: async () => {
+    const { photos, filter, totalPhotos, loading, cursor, hasNext, _photoRequestGeneration } = get();
+    if (loading || !photos.length) return;
+    if (totalPhotos > 5000) {
+      set({ ratingSelection: photos.map(({ id }) => id).filter((id): id is number => id != null).slice(0, 5000), ratingSelectionAnchor: null });
+      return;
+    }
+    const isCurrent = () => get()._photoRequestGeneration === _photoRequestGeneration;
+    const all = new Map(photos.map((photo) => [photo.id, photo]));
+    let next = cursor;
+    let more = hasNext;
+    let total = totalPhotos;
+    set({ loading: true });
+    try {
+      while (more && next && isCurrent()) {
+        const page = await readPhotoData(() => api.getPhotos(next, 500, filter), isCurrent);
+        if (page.total_count > 5000) throw new Error("批量操作上限为 5000 张，请缩小筛选范围。");
+        for (const photo of page.photos) all.set(photo.id, photo);
+        if (page.has_more && page.next_cursor?.id === next.id) throw new Error("照片分页未前进，请重试。");
+        next = page.next_cursor;
+        more = page.has_more;
+        total = page.total_count;
+      }
+      if (!isCurrent()) return;
+      if (more) throw new Error("未能读取全部照片，请重试。");
+      set({
+        photos: [...all.values()], cursor: next, hasNext: false, totalPhotos: total,
+        ratingSelection: [...all.keys()].filter((id): id is number => id != null),
+        ratingSelectionAnchor: null,
+      });
+    } finally {
+      if (isCurrent()) set({ loading: false });
+    }
+  },
+  clearRatingSelection: () => set({ ratingSelection: [], ratingSelectionAnchor: null }),
   gpsBatchSession: null,
   openGpsBatchEditor: (gpsBatchSession) => set({ gpsBatchSession, selectedPhotoId: null }),
   closeGpsBatchEditor: () => set({ gpsBatchSession: null, batchGpsPending: new Map() }),
@@ -157,7 +218,7 @@ export const useStore = create<AppState>((set, get) => ({
       loading: false,
       photoLoadError: null,
       preloadQueue: [],
-      ratingSelection: [],
+      ratingSelection: [], ratingSelectionAnchor: null,
       photoGridScrollOffsets: { square: 0, proportional: 0 },
       ...snapshot,
       _photoRequestGeneration: state._photoRequestGeneration + 1,
@@ -283,7 +344,7 @@ export const useStore = create<AppState>((set, get) => ({
       photos: [], totalPhotos: 0, cursor: null, hasNext: false, filter: {},
       selectedPhotoId: null, lightboxPhotoId: null,
       selectedLightboxSource: null, lightboxSource: null,
-      ratingSelectionMode: false, ratingSelection: [],
+      ratingSelectionMode: false, ratingSelection: [], ratingSelectionAnchor: null,
       gpsBatchSession: null, batchGpsPending: new Map(),
       mapFocusRequest: null,
       photoRoute: "/", photoGridScrollOffsets: { square: 0, proportional: 0 },

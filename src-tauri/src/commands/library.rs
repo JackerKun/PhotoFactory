@@ -752,12 +752,37 @@ pub fn cmd_get_duplicate_group_photos(
 #[tauri::command]
 pub fn cmd_trash_duplicate_group(
     group_id: String,
+    photo_ids: Option<Vec<i64>>,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> AppResult<usize> {
     let conn = get_conn(state)?;
     let ts = now();
-    let changed=conn.execute("INSERT INTO photo_trash(photo_id,reason,trashed_at) SELECT photo_id,'相似照片清理',?1 FROM photo_intelligence WHERE duplicate_group=?2 AND best_in_group=0 ON CONFLICT(photo_id) DO UPDATE SET reason=excluded.reason,trashed_at=excluded.trashed_at",params![ts,group_id])?;
+    let changed = if let Some(ids) = photo_ids {
+        let tx = conn.unchecked_transaction()?;
+        let mut count = 0;
+        {
+            let mut statement = tx.prepare(
+                "INSERT OR IGNORE INTO photo_trash(photo_id, reason, trashed_at)
+                 SELECT p.id, '相似照片清理', ?1 FROM photos p
+                 JOIN photo_intelligence i ON i.photo_id = p.id
+                 WHERE p.id = ?2 AND p.deleted = 0 AND i.duplicate_group = ?3",
+            )?;
+            for id in ids {
+                count += statement.execute(params![ts, id, group_id])?;
+            }
+        }
+        tx.commit()?;
+        count
+    } else {
+        conn.execute(
+            "INSERT OR IGNORE INTO photo_trash(photo_id, reason, trashed_at)
+             SELECT p.id, '相似照片清理', ?1 FROM photo_intelligence i
+             JOIN photos p ON p.id = i.photo_id
+             WHERE i.duplicate_group = ?2 AND i.best_in_group = 0 AND p.deleted = 0",
+            params![ts, group_id],
+        )?
+    };
     if changed > 0 {
         let _ = app.emit("photo_memory_visibility_changed", ());
     }
@@ -1135,7 +1160,29 @@ pub fn cmd_scan_storage_source(
             }
             Some((id, _, _, _)) => {
                 let exif = exif_reader::read_exif(Path::new(&file.path)).unwrap_or_default();
-                conn.execute("UPDATE photos SET filename=?1,file_size=?2,file_mtime=?3,width=?4,height=?5,format=?6,taken_at=?7,camera_make=?8,camera_model=?9,exposure_time=?10,f_number=?11,iso=?12,latitude=?13,longitude=?14,orientation=?15,thumbnail_status=0,face_status=0,classification_status=0,deleted=0,storage_source_id=?16 WHERE id=?17",params![file.filename,file.file_size,file.file_mtime,exif.width,exif.height,Path::new(&file.path).extension().and_then(|v|v.to_str()).map(str::to_lowercase),exif.taken_at,exif.camera_make,exif.camera_model,exif.exposure_time,exif.f_number,exif.iso,exif.latitude,exif.longitude,exif.orientation,source_id,id])?;
+                conn.execute(
+                    "UPDATE photos SET filename = ?1, file_size = ?2, file_mtime = ?3,
+                        width = ?4, height = ?5, format = ?6,
+                        taken_at = COALESCE((SELECT taken_at FROM photo_exif_overrides WHERE photo_id = photos.id), ?7),
+                        camera_make = COALESCE((SELECT camera_make FROM photo_exif_overrides WHERE photo_id = photos.id), ?8),
+                        camera_model = COALESCE((SELECT camera_model FROM photo_exif_overrides WHERE photo_id = photos.id), ?9),
+                        exposure_time = COALESCE((SELECT exposure_time FROM photo_exif_overrides WHERE photo_id = photos.id), ?10),
+                        f_number = COALESCE((SELECT f_number FROM photo_exif_overrides WHERE photo_id = photos.id), ?11),
+                        iso = COALESCE((SELECT iso FROM photo_exif_overrides WHERE photo_id = photos.id), ?12),
+                        latitude = ?13, longitude = ?14, orientation = ?15,
+                        lens_make = COALESCE((SELECT lens_make FROM photo_exif_overrides WHERE photo_id = photos.id), ?18),
+                        lens_model = COALESCE((SELECT lens_model FROM photo_exif_overrides WHERE photo_id = photos.id), ?19),
+                        focal_length = COALESCE((SELECT focal_length FROM photo_exif_overrides WHERE photo_id = photos.id), ?20),
+                        thumbnail_status = 0, face_status = 0, classification_status = 0,
+                        deleted = 0, storage_source_id = ?16 WHERE id = ?17",
+                    params![
+                        file.filename, file.file_size, file.file_mtime, exif.width, exif.height,
+                        Path::new(&file.path).extension().and_then(|value| value.to_str()).map(str::to_lowercase),
+                        exif.taken_at, exif.camera_make, exif.camera_model, exif.exposure_time,
+                        exif.f_number, exif.iso, exif.latitude, exif.longitude, exif.orientation,
+                        source_id, id, exif.lens_make, exif.lens_model, exif.focal_length,
+                    ],
+                )?;
                 result.updated += 1
             }
             None => {

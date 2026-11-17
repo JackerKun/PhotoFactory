@@ -23,6 +23,7 @@ function withoutTimeFilter(filter: PhotoFilter): PhotoFilter {
 }
 
 export default React.memo(function PhotoTimeline() {
+  const metadataRevision = useStore((state) => state.photoMetadataRevision);
   const filter = useStore((state) => state.filter);
   const setFilter = useStore((state) => state.setFilter);
   const [open, setOpen] = useState(false);
@@ -71,7 +72,7 @@ export default React.memo(function PhotoTimeline() {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [open, timelineFilter]);
+  }, [open, timelineFilter, metadataRevision]);
 
   useEffect(() => {
     if (!open) return;

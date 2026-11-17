@@ -168,6 +168,7 @@ pub fn prepare_face_reanalysis(conn: &rusqlite::Connection) -> AppResult<usize> 
         [],
     )?;
     tx.execute("DELETE FROM face_merge_history", [])?;
+    tx.execute("DELETE FROM face_merge_named_targets", [])?;
     tx.execute("DELETE FROM face_merge_operations", [])?;
     tx.execute("UPDATE photos SET face_status = 0 WHERE deleted = 0", [])?;
     tx.execute(
@@ -309,6 +310,7 @@ pub fn get_cluster_page(
     tab: &str,
     offset: i64,
     limit: i64,
+    cluster_id: Option<i64>,
 ) -> AppResult<crate::models::FaceClusterPage> {
     let condition = match tab {
         "named" => "TRIM(COALESCE(fc.name, '')) != ''",
@@ -343,13 +345,13 @@ pub fn get_cluster_page(
                 fc.created_at
          FROM face_clusters fc
          LEFT JOIN person_metadata pm ON pm.person_id = fc.id
-         WHERE fc.face_count > 0 AND {condition}
+         WHERE fc.face_count > 0 AND {condition} AND (?3 IS NULL OR fc.id = ?3)
          ORDER BY fc.face_count DESC, fc.id
          LIMIT ?1 OFFSET ?2"
     );
     let mut statement = conn.prepare(&sql)?;
     let items = statement
-        .query_map(params![limit.clamp(1, 200), offset.max(0)], |row| {
+        .query_map(params![limit.clamp(1, 200), offset.max(0), cluster_id], |row| {
             Ok(FaceCluster {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -360,10 +362,19 @@ pub fn get_cluster_page(
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let total = match tab {
-        "named" => counts.0,
-        "unnamed" => counts.1,
-        _ => counts.2,
+    let total = match cluster_id {
+        Some(id) => conn.query_row(
+            &format!("SELECT COUNT(*) FROM face_clusters fc
+                      LEFT JOIN person_metadata pm ON pm.person_id = fc.id
+                      WHERE fc.face_count > 0 AND {condition} AND fc.id = ?1"),
+            [id],
+            |row| row.get(0),
+        )?,
+        None => match tab {
+            "named" => counts.0,
+            "unnamed" => counts.1,
+            _ => counts.2,
+        },
     };
     Ok(crate::models::FaceClusterPage {
         items,
@@ -755,6 +766,7 @@ pub fn apply_automatic_merge_groups(
     conn: &rusqlite::Connection,
     groups: &[Vec<i64>],
     threshold: f64,
+    named_target_ids: &[i64],
 ) -> AppResult<(i64, usize, usize)> {
     let tx = conn.unchecked_transaction()?;
     let now = Utc::now().timestamp();
@@ -774,10 +786,11 @@ pub fn apply_automatic_merge_groups(
             continue;
         }
         let mut counts = Vec::new();
+        let mut named_target = None;
         let mut valid = true;
         for id in &ids {
             let result = tx.query_row(
-                "SELECT COUNT(fd.id), TRIM(COALESCE(fc.name, pm.user_name, ''))
+                "SELECT COUNT(fd.id), COALESCE(NULLIF(TRIM(fc.name), ''), NULLIF(TRIM(pm.user_name), ''), '')
                  FROM face_clusters fc
                  LEFT JOIN face_detections fd ON fd.person_id = fc.id
                  LEFT JOIN person_metadata pm ON pm.person_id = fc.id
@@ -786,11 +799,24 @@ pub fn apply_automatic_merge_groups(
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             );
             match result {
-                Ok((count, name)) if name.is_empty() => counts.push((*id, count)),
-                _ => {
+                Ok((count, name))
+                    if count > 0 && name.is_empty() && !named_target_ids.contains(id) =>
+                {
+                    counts.push((*id, count))
+                }
+                Ok((count, name))
+                    if count > 0
+                        && !name.is_empty()
+                        && named_target.is_none()
+                        && named_target_ids.contains(id) =>
+                {
+                    named_target = Some(*id);
+                }
+                Err(rusqlite::Error::QueryReturnedNoRows) | Ok(_) => {
                     valid = false;
                     break;
                 }
+                Err(error) => return Err(error.into()),
             }
         }
         if !valid {
@@ -802,24 +828,31 @@ pub fn apply_automatic_merge_groups(
              faces AS (SELECT fd.* FROM face_detections fd JOIN photos p ON p.id=fd.photo_id
                        WHERE fd.person_id IN selected AND p.deleted=0)
              SELECT EXISTS (SELECT 1 FROM faces WHERE review_status='identity_review')
-                 OR EXISTS (SELECT 1 FROM person_metadata WHERE person_id IN selected AND confidence='high')
+                 OR EXISTS (SELECT 1 FROM person_metadata WHERE person_id IN selected AND confidence='high'
+                            AND person_id IS NOT ?2)
                  OR EXISTS (SELECT 1 FROM faces GROUP BY photo_id HAVING COUNT(DISTINCT person_id)>1)
                  OR EXISTS (SELECT 1 FROM face_constraints c
                     JOIN faces a ON a.embedding_path=printf('%08x.npy',(c.photo_id_1<<8)|c.face_index_1)
                     JOIN faces b ON b.embedding_path=printf('%08x.npy',(c.photo_id_2<<8)|c.face_index_2)
                     WHERE c.constraint_type='cannot_link' AND a.person_id<>b.person_id)",
-            [&ids_json], |row| row.get(0),
+            params![ids_json, named_target], |row| row.get(0),
         )?;
         if conflicts {
             continue;
         }
-        let target = counts
-            .iter()
-            .max_by_key(|(_, count)| *count)
-            .map(|(id, _)| *id)
-            .unwrap();
+        let target = named_target
+            .unwrap_or_else(|| counts.iter().max_by_key(|(_, count)| *count).unwrap().0);
+        if named_target.is_some() {
+            tx.execute(
+                "INSERT OR IGNORE INTO face_merge_named_targets (operation_id, person_id) VALUES (?1, ?2)",
+                params![operation_id, target],
+            )?;
+        }
 
         for id in &ids {
+            if named_target == Some(*id) {
+                continue;
+            }
             let faces: Vec<i64> = {
                 let mut stmt = tx.prepare("SELECT id FROM face_detections WHERE person_id = ?1")?;
                 let rows = stmt
@@ -870,7 +903,8 @@ pub fn apply_automatic_merge_groups(
 }
 
 pub fn undo_last_automatic_merge(conn: &rusqlite::Connection) -> AppResult<Option<(usize, usize)>> {
-    let operation_id = match conn.query_row(
+    let tx = conn.unchecked_transaction()?;
+    let operation_id = match tx.query_row(
         "SELECT id FROM face_merge_operations WHERE status = 'applied' ORDER BY id DESC LIMIT 1",
         [],
         |row| row.get::<_, i64>(0),
@@ -879,13 +913,29 @@ pub fn undo_last_automatic_merge(conn: &rusqlite::Connection) -> AppResult<Optio
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let named_targets: i64 = conn.query_row(
+    let destination_missing: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM face_merge_named_targets t
+                      LEFT JOIN face_clusters fc ON fc.id = t.person_id
+                      WHERE t.operation_id = ?1 AND fc.id IS NULL)",
+        [operation_id],
+        |row| row.get(0),
+    )?;
+    if destination_missing {
+        return Err(crate::error::AppError::Project(
+            "上次合并的已命名人物已移除，无法自动撤销。".into(),
+        ));
+    }
+    let named_targets: i64 = tx.query_row(
         "SELECT COUNT(DISTINCT fc.id)
          FROM face_merge_history h
          JOIN face_clusters fc ON fc.id = h.merged_person_id
          LEFT JOIN person_metadata pm ON pm.person_id = fc.id
          WHERE h.operation_id = ?1
-           AND TRIM(COALESCE(fc.name, pm.user_name, '')) != ''",
+           AND COALESCE(NULLIF(TRIM(fc.name), ''), NULLIF(TRIM(pm.user_name), '')) IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM face_merge_named_targets t
+               WHERE t.operation_id = h.operation_id AND t.person_id = h.merged_person_id
+           )",
         [operation_id],
         |row| row.get(0),
     )?;
@@ -895,7 +945,6 @@ pub fn undo_last_automatic_merge(conn: &rusqlite::Connection) -> AppResult<Optio
                 .into(),
         ));
     }
-    let tx = conn.unchecked_transaction()?;
     let history: Vec<(i64, i64, i64)> = {
         let mut stmt = tx.prepare(
             "SELECT face_id, original_person_id, merged_person_id
@@ -1118,26 +1167,27 @@ pub fn get_embedding_cluster_prototypes(
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
-/// Automatic merge candidates deliberately exclude every user-owned person.
-/// A name in either legacy face_clusters or person_metadata is authoritative.
-pub fn get_unnamed_embedding_cluster_assignments(
+/// Include named people as destinations, and unconfirmed automatic people as sources.
+pub fn get_automatic_merge_assignments(
     conn: &rusqlite::Connection,
-) -> AppResult<Vec<(String, i64)>> {
+) -> AppResult<Vec<(String, i64, Option<String>)>> {
     let mut stmt = conn.prepare(
-        "SELECT fd.embedding_path, fd.person_id
+        "WITH people AS (
+            SELECT fc.id, COALESCE(NULLIF(TRIM(fc.name), ''), NULLIF(TRIM(pm.user_name), '')) AS name,
+                   COALESCE(pm.confidence, '') AS confidence
+            FROM face_clusters fc LEFT JOIN person_metadata pm ON pm.person_id = fc.id
+         )
+         SELECT fd.embedding_path, fd.person_id, person.name
          FROM face_detections fd
-         JOIN face_clusters fc ON fc.id = fd.person_id
+         JOIN people person ON person.id = fd.person_id
          JOIN photos p ON p.id = fd.photo_id
-         LEFT JOIN person_metadata pm ON pm.person_id = fc.id
          WHERE fd.embedding_path IS NOT NULL
-           AND fd.person_id IS NOT NULL
            AND p.deleted = 0
            AND COALESCE(fd.review_status, 'active') = 'active'
-           AND TRIM(COALESCE(fc.name, pm.user_name, '')) = ''
-           AND COALESCE(pm.confidence,'') <> 'high'",
+           AND (person.name IS NOT NULL OR person.confidence <> 'high')",
     )?;
-    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    Ok(rows.filter_map(Result::ok).collect())
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
 pub fn clusters_are_unnamed(conn: &rusqlite::Connection, ids: &[i64]) -> AppResult<bool> {
@@ -1305,7 +1355,7 @@ mod merge_tests {
 
         rename_cluster(&conn, 41, "张三").unwrap();
 
-        let named = get_cluster_page(&conn, "named", 0, 10).unwrap();
+        let named = get_cluster_page(&conn, "named", 0, 10, None).unwrap();
         assert_eq!(named.items.len(), 1);
         let person = &named.items[0];
         assert_eq!(person.id, Some(41));
@@ -1446,7 +1496,7 @@ mod merge_tests {
         )
         .unwrap();
 
-        let unnamed = get_cluster_page(&conn, "unnamed", 0, 2).unwrap();
+        let unnamed = get_cluster_page(&conn, "unnamed", 0, 2, None).unwrap();
         assert_eq!(unnamed.total, 3);
         assert_eq!(unnamed.items.len(), 2);
         assert_eq!(unnamed.named_count, 1);
@@ -1454,7 +1504,16 @@ mod merge_tests {
         assert_eq!(unnamed.review_count, 2);
         assert_eq!(unnamed.items[0].id, Some(2));
 
-        let second_page = get_cluster_page(&conn, "unnamed", 2, 2).unwrap();
+        let second_page = get_cluster_page(&conn, "unnamed", 2, 2, None).unwrap();
+        let target = second_page.items[0].id.unwrap();
+        let found = get_cluster_page(&conn, "unnamed", 0, 2, Some(target)).unwrap();
+        assert_eq!(found.items[0].id, Some(target));
+        assert_eq!(found.total, 1);
+        assert_eq!(found.unnamed_count, unnamed.unnamed_count);
+        let missing = get_cluster_page(&conn, "unnamed", 0, 2, Some(99999)).unwrap();
+        assert!(missing.items.is_empty());
+        assert_eq!(missing.total, 0);
+
         assert_eq!(second_page.items.len(), 1);
         assert_eq!(second_page.items[0].id, Some(4));
     }
@@ -1757,7 +1816,7 @@ mod merge_tests {
     }
 
     #[test]
-    fn automatic_merge_candidates_exclude_all_named_people() {
+    fn automatic_merge_assignments_include_both_sources_and_named_targets() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(crate::db::schema::CREATE_TABLES)
             .unwrap();
@@ -1781,11 +1840,73 @@ mod merge_tests {
         )
         .unwrap();
 
-        let candidates = get_unnamed_embedding_cluster_assignments(&conn).unwrap();
-        assert_eq!(candidates, vec![("00000001.npy".to_string(), 1)]);
+        let mut candidates = get_automatic_merge_assignments(&conn).unwrap();
+        candidates.sort_by_key(|(_, id, _)| *id);
+        assert_eq!(
+            candidates,
+            vec![
+                ("00000001.npy".to_string(), 1, None),
+                ("00000002.npy".to_string(), 2, Some("数据库姓名".into())),
+                ("00000003.npy".to_string(), 3, Some("元数据姓名".into())),
+            ]
+        );
         assert!(clusters_are_unnamed(&conn, &[1]).unwrap());
         assert!(!clusters_are_unnamed(&conn, &[1, 2]).unwrap());
         assert!(!clusters_are_unnamed(&conn, &[3]).unwrap());
+    }
+
+    #[test]
+    fn automatic_merge_into_named_target_preserves_identity_and_undo() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::db::schema::CREATE_TABLES)
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO photos (id,path,filename,file_size,file_mtime,imported_at)
+             VALUES (1,'/a.jpg','a.jpg',1,1,1),(2,'/b.jpg','b.jpg',1,1,1),(3,'/c.jpg','c.jpg',1,1,1);
+             INSERT INTO face_clusters (id, name, face_count, created_at)
+             VALUES (1,'',1,1),(2,'张三',1,1),(3,'李四',1,1);
+             INSERT INTO person_metadata (person_id, confidence, user_name)
+             VALUES (2,'high','张三'),(3,'high','李四');
+             INSERT INTO face_detections (id, photo_id, person_id, created_at)
+             VALUES (1,1,1,1),(2,2,2,1),(3,3,3,1);",
+        ).unwrap();
+
+        assert_eq!(
+            apply_automatic_merge_groups(&conn, &[vec![1, 2, 3]], 0.72, &[2, 3]).unwrap(),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            apply_automatic_merge_groups(&conn, &[vec![1, 2]], 0.72, &[]).unwrap(),
+            (0, 0, 0)
+        );
+        let (_, merged, removed) =
+            apply_automatic_merge_groups(&conn, &[vec![1, 2]], 0.72, &[2]).unwrap();
+        assert_eq!((merged, removed), (1, 1));
+        let assigned: i64 = conn
+            .query_row(
+                "SELECT person_id FROM face_detections WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(assigned, 2);
+        let metadata: (String, String) = conn
+            .query_row(
+                "SELECT user_name, confidence FROM person_metadata WHERE person_id = 2",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(metadata, ("张三".into(), "high".into()));
+        assert_eq!(undo_last_automatic_merge(&conn).unwrap(), Some((1, 1)));
+        let assigned: i64 = conn
+            .query_row(
+                "SELECT person_id FROM face_detections WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(assigned, 1);
     }
 
     #[test]
@@ -1810,7 +1931,7 @@ mod merge_tests {
         }
 
         let (_, merged, removed) =
-            apply_automatic_merge_groups(&conn, &[vec![1, 2, 3]], 0.72).unwrap();
+            apply_automatic_merge_groups(&conn, &[vec![1, 2, 3]], 0.72, &[]).unwrap();
         assert_eq!((merged, removed), (1, 2));
         assert!(has_automatic_merge_to_undo(&conn).unwrap());
         let people_after_merge: i64 = conn
@@ -1928,9 +2049,12 @@ pub fn get_person_details(
             MIN(p.taken_at) as first_seen,
             MAX(p.taken_at) as last_seen,
             (SELECT fd2.photo_id FROM face_detections fd2
-             WHERE fd2.person_id = fc.id AND fd2.quality_score = (
-                 SELECT MAX(quality_score) FROM face_detections WHERE person_id = fc.id
-             )
+             JOIN photos p2 ON p2.id = fd2.photo_id
+             WHERE fd2.person_id = fc.id AND p2.deleted = 0
+               AND NOT EXISTS (SELECT 1 FROM photo_trash WHERE photo_id = p2.id)
+               AND NOT EXISTS (SELECT 1 FROM photo_intelligence WHERE photo_id = p2.id AND is_private = 1)
+             ORDER BY COALESCE(fd2.quality_score, 0) DESC, COALESCE(fd2.detection_confidence, 0) DESC,
+                      (COALESCE(fd2.bbox_w, 0) * COALESCE(fd2.bbox_h, 0)) DESC, fd2.id
              LIMIT 1) as cover_photo_id
          FROM face_clusters fc
          LEFT JOIN person_metadata pm ON pm.person_id = fc.id

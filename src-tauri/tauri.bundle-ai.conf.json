@@ -4,6 +4,7 @@
       "signingIdentity": "-"
     },
     "resources": {
+      "../build/exiftool/": "exiftool/",
       "../ai_worker/dist/photofactory-ai/": "ai_worker/",
       "../ai_worker/models/retinaface.onnx": "ai_worker/models/retinaface.onnx",
       "../ai_worker/models/arcface.onnx": "ai_worker/models/arcface.onnx",

@@ -10,84 +10,69 @@ interface Props { active?: boolean }
 
 const FACE_PAGE_SIZE = 96;
 
-/** In-memory cache for face thumbnail base64 data URLs with LRU eviction. */
-const faceThumbCache = new Map<number, string>();
-const FACE_THUMB_CACHE_MAX = 200; // Cap at 200 entries (~20MB max for 160x160 JPEGs)
-
-/** Evict the oldest entry when the cache exceeds its maximum size. */
-function cacheSet(clusterId: number, dataUrl: string) {
-  if (faceThumbCache.size >= FACE_THUMB_CACHE_MAX) {
-    const firstKey = faceThumbCache.keys().next().value;
-    if (firstKey !== undefined) faceThumbCache.delete(firstKey);
-  }
-  faceThumbCache.set(clusterId, dataUrl);
+function selectableMergeMembers(candidate: api.AutomaticFaceMergeCandidate) {
+  return candidate.cluster_ids.filter((id) => id !== candidate.named_target_id);
 }
 
-/** Lazy-loaded face thumbnail with base64 data URL and IntersectionObserver. */
-const FaceThumb: React.FC<{ clusterId: number }> = React.memo(function FaceThumb({ clusterId }) {
-  const [thumb, setThumb] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const ref = useRef<HTMLDivElement>(null);
+const faceThumbCache = new Map<string, string>();
+const FACE_THUMB_CACHE_MAX = 512;
+
+const FaceThumb = React.memo(function FaceThumb({ clusterId, scope, active }: {
+  clusterId: number;
+  scope: string;
+  active: boolean;
+}) {
+  const cacheKey = JSON.stringify([scope, clusterId]);
+  const [result, setResult] = useState<{ key: string; src?: string; error?: string }>();
+  const ref = useRef<HTMLSpanElement>(null);
+  const current = result?.key === cacheKey ? result : undefined;
+  const thumb = current?.src ?? (!current?.error ? faceThumbCache.get(cacheKey) : undefined);
 
   useEffect(() => {
-    // Check cache synchronously
-    const cached = faceThumbCache.get(clusterId);
-    if (cached) {
-      setThumb(cached);
+    const node = ref.current;
+    if (!node || !active || current) return;
+    if (thumb) {
+      faceThumbCache.delete(cacheKey);
+      faceThumbCache.set(cacheKey, thumb);
+      setResult({ key: cacheKey, src: thumb });
       return;
     }
 
-    const node = ref.current;
-    if (!node) return;
     const controller = new AbortController();
-
-    const observer = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) {
-          if (entry.isIntersecting && !thumb) {
-            observer.unobserve(entry.target);
-            if (controller.signal.aborted) return;
-            api.getClusterFaceThumbnail(clusterId, controller.signal)
-              .then((dataUrl) => {
-                if (!controller.signal.aborted && dataUrl) {
-                  cacheSet(clusterId, dataUrl);
-                  setThumb(dataUrl);
-                }
-              })
-              .catch((err) => {
-                if (!controller.signal.aborted) {
-                  setError(err instanceof Error ? err.message : String(err));
-                }
-              });
-            return;
+    const observer = new IntersectionObserver(([entry]) => {
+      if (!entry?.isIntersecting || controller.signal.aborted) return;
+      observer.disconnect();
+      api.getClusterFaceThumbnail(clusterId, controller.signal)
+        .then((src) => {
+          if (controller.signal.aborted) return;
+          if (!src) throw new Error("缩略图为空");
+          faceThumbCache.set(cacheKey, src);
+          if (faceThumbCache.size > FACE_THUMB_CACHE_MAX) {
+            const oldest = faceThumbCache.keys().next().value;
+            if (oldest !== undefined) faceThumbCache.delete(oldest);
           }
-        }
-      },
-      { rootMargin: "200px" },
-    );
-
+          setResult({ key: cacheKey, src });
+        })
+        .catch((error) => {
+          if (!controller.signal.aborted) setResult({ key: cacheKey, error: String(error) });
+        });
+    }, { rootMargin: "120px" });
     observer.observe(node);
     return () => { controller.abort(); observer.disconnect(); };
-  }, [clusterId, thumb]);
+  }, [active, cacheKey, clusterId, current, thumb]);
 
-  if (thumb) {
-    return (
-      <img
-        src={thumb}
-        alt=""
-        className="w-full h-full object-cover rounded"
-        style={{ objectPosition: "center 25%" }}
-        onError={() => {
-          console.warn(`FaceThumb ${clusterId} image load error`);
-          setThumb(null);
-        }}
-      />
-    );
-  }
   return (
-    <div ref={ref} className="w-full h-full flex items-center justify-center text-text-muted text-xs">
-      {error ? `Error: ${error.slice(0, 30)}` : "No face"}
-    </div>
+    <span ref={ref} className="flex h-full w-full items-center justify-center">
+      {thumb ? <img src={thumb} alt="" decoding="async"
+        className="h-full w-full rounded object-cover object-[center_25%]"
+        onError={() => {
+          faceThumbCache.delete(cacheKey);
+          setResult({ key: cacheKey, error: "头像文件无法显示" });
+        }} />
+        : current?.error
+          ? <span title={current.error} className="px-1 text-center text-xs text-text-muted">头像不可用</span>
+          : <span className="h-full w-full rounded bg-bg-secondary/30 motion-safe:animate-pulse" aria-label="正在加载头像" />}
+    </span>
   );
 });
 
@@ -120,8 +105,15 @@ export default React.memo(function FaceView({ active = true }: Props) {
   const loadedClusters = useRef({ tab: initialTab, count: 0 });
   const faceDataRevision = useStore((state) => state.faceDataRevision);
   const projectRoot = useStore((state) => state.project?.root_path);
+  const [avatarRevision, setAvatarRevision] = useState(0);
+  const avatarScope = JSON.stringify([projectRoot, faceDataRevision, avatarRevision]);
   const [pageTotal, setPageTotal] = useState(0);
   const [pageLoading, setPageLoading] = useState(false);
+  const [unnamedQuery, setUnnamedQuery] = useState("");
+  const [unnamedId, setUnnamedId] = useState<number>();
+  const [unnamedQueryError, setUnnamedQueryError] = useState("");
+  const clusterIdFilter = activeTab === "unnamed" ? unnamedId : undefined;
+  const peopleResults = useRef<HTMLDivElement>(null);
   const [tabCounts, setTabCounts] = useState({ named: 0, unnamed: 0, review: 0 });
   const [mergeTargetClusters, setMergeTargetClusters] = useState<FaceCluster[]>([]);
 
@@ -153,15 +145,21 @@ export default React.memo(function FaceView({ active = true }: Props) {
   // Merge mode state
   const [mergeMode, setMergeMode] = useState(false);
   const [mergeSelected, setMergeSelected] = useState<Set<number>>(new Set());
+  const reviewSelectionAnchor = useRef<number>();
+  const [confirmingReview, setConfirmingReview] = useState(false);
   const [mergeConfirmOpen, setMergeConfirmOpen] = useState(false);
   const [mergeName, setMergeName] = useState("");
   const [mergeTargetId, setMergeTargetId] = useState<number | null>(null);
   const [mergeSaving, setMergeSaving] = useState(false);
   const [autoMergeOpen, setAutoMergeOpen] = useState(false);
+  const [previewClusterId, setPreviewClusterId] = useState<number>();
+  const [previewError, setPreviewError] = useState("");
+  const lightboxPhotoId = useStore((state) => state.lightboxPhotoId);
   const [autoMergeThreshold, setAutoMergeThreshold] = useState(0.72);
   const [autoMergeRunning, setAutoMergeRunning] = useState(false);
   const [autoMergeCandidates, setAutoMergeCandidates] = useState<api.AutomaticFaceMergeCandidate[]>([]);
-  const [autoMergeSelected, setAutoMergeSelected] = useState<Set<string>>(new Set());
+  const [autoMergeSelected, setAutoMergeSelected] = useState<Map<string, number[]>>(new Map());
+  const [expandedMergeGroups, setExpandedMergeGroups] = useState<Set<string>>(new Set());
   const [autoMergePreviewed, setAutoMergePreviewed] = useState(false);
   const [hasMergeUndo, setHasMergeUndo] = useState(false);
   const [suspectedFaceCount, setSuspectedFaceCount] = useState(0);
@@ -182,13 +180,13 @@ export default React.memo(function FaceView({ active = true }: Props) {
         ? Math.max(FACE_PAGE_SIZE, loadedClusters.current.count)
         : FACE_PAGE_SIZE;
       const [page, nextFaceCount, nextUnassignedCount] = await Promise.all([
-        api.getClusterPage(requestedTab, 0, FACE_PAGE_SIZE),
+        api.getClusterPage(requestedTab, 0, FACE_PAGE_SIZE, clusterIdFilter),
         api.getFaceDetectionCount().catch(() => 0),
         api.getUnassignedFaceCount().catch(() => 0),
       ]);
       const items = page.items;
       for (let offset = items.length; isCurrent() && offset < Math.min(count, page.total); offset = items.length) {
-        const next = await api.getClusterPage(requestedTab, offset, FACE_PAGE_SIZE);
+        const next = await api.getClusterPage(requestedTab, offset, FACE_PAGE_SIZE, clusterIdFilter);
         if (!next.items.length) break;
         items.push(...next.items);
       }
@@ -211,7 +209,7 @@ export default React.memo(function FaceView({ active = true }: Props) {
     api.getSuspectedFaceCount().then(setSuspectedFaceCount).catch(() => setSuspectedFaceCount(0));
     api.getFaceAiVersionStatus().then((status) => setCanReanalyzeFaces(status.upgrade_available)).catch(() => {});
     api.getIgnoredFaceCount().then(setIgnoredFaceCount).catch(() => setIgnoredFaceCount(0));
-  }, [activeTab]);
+  }, [activeTab, clusterIdFilter]);
 
   const loadMoreClusters = useCallback(async () => {
     if (pageLoading || clusters.length >= pageTotal) return;
@@ -220,7 +218,7 @@ export default React.memo(function FaceView({ active = true }: Props) {
     const isCurrent = () => pageRequest.current === requestId && activeTabRef.current === requestedTab;
     setPageLoading(true);
     try {
-      const page = await api.getClusterPage(requestedTab, clusters.length, FACE_PAGE_SIZE);
+      const page = await api.getClusterPage(requestedTab, clusters.length, FACE_PAGE_SIZE, clusterIdFilter);
       if (!isCurrent()) return;
       loadedClusters.current = { tab: requestedTab, count: clusters.length + page.items.length };
       setClusters((current) => {
@@ -232,7 +230,7 @@ export default React.memo(function FaceView({ active = true }: Props) {
     } finally {
       if (isCurrent()) setPageLoading(false);
     }
-  }, [activeTab, clusters.length, pageLoading, pageTotal]);
+  }, [activeTab, clusterIdFilter, clusters.length, pageLoading, pageTotal]);
 
   useEffect(() => {
     void refreshData();
@@ -331,7 +329,7 @@ export default React.memo(function FaceView({ active = true }: Props) {
         await new Promise(r => setTimeout(r, 2000));
       }
       const result = await api.rebuildFaceClusters();
-      faceThumbCache.clear();
+      setAvatarRevision((revision) => revision + 1);
       setOperationMessage(result || "人物分组已完整重建。");
       await refreshData();
     } catch (error) {
@@ -345,14 +343,17 @@ export default React.memo(function FaceView({ active = true }: Props) {
 
   const openAutoMerge = () => {
     setAutoMergeCandidates([]);
-    setAutoMergeSelected(new Set());
+    setAutoMergeSelected(new Map());
+    setExpandedMergeGroups(new Set());
     setAutoMergePreviewed(false);
+    setPreviewClusterId(undefined);
+    setPreviewError("");
     setAutoMergeOpen(true);
   };
 
   const handlePreviewAutoMerge = async () => {
     setAutoMergeRunning(true);
-    setOperationMessage("正在查找可能是同一个人的未命名分组…");
+    setOperationMessage("正在查找相似的未命名分组及可合入的已命名人物…");
     try {
       const healthy = await api.workerHealth();
       if (!healthy) {
@@ -361,7 +362,8 @@ export default React.memo(function FaceView({ active = true }: Props) {
       }
       const candidates = await api.previewAutoMergeUnnamedFaces(autoMergeThreshold);
       setAutoMergeCandidates(candidates);
-      setAutoMergeSelected(new Set(candidates.map(candidateKey)));
+      setAutoMergeSelected(new Map());
+      setExpandedMergeGroups(new Set());
       setAutoMergePreviewed(true);
       setOperationMessage(candidates.length > 0
         ? `找到 ${candidates.length} 组可能是同一人的候选，请预览后确认。`
@@ -373,15 +375,64 @@ export default React.memo(function FaceView({ active = true }: Props) {
     }
   };
 
+  const selectedMergeGroups = autoMergeCandidates.flatMap<{ ids: number[]; target: number | null }>((candidate) => {
+    const selected = autoMergeSelected.get(candidateKey(candidate)) ?? [];
+    const target = candidate.named_target_id;
+    if (target != null && selected.length) return [{ ids: [target, ...selected], target }];
+    return selected.length >= 2 ? [{ ids: selected, target: null }] : [];
+  });
+  const allMergeCandidatesSelected = autoMergeCandidates.every((candidate) =>
+    autoMergeSelected.get(candidateKey(candidate))?.length === selectableMergeMembers(candidate).length,
+  );
+
+  useEffect(() => {
+    if (!active || !autoMergeOpen || previewClusterId == null) return;
+    let live = true;
+    const filter = { person_id: previewClusterId };
+    Promise.all([
+      api.getPhotos(null, 80, filter),
+      api.getPersonDetail(previewClusterId).catch(() => null),
+    ]).then(async ([page, person]) => {
+      if (!live) return;
+      const first = page.photos[0]?.id;
+      if (first == null) throw new Error("此人物没有可查看的照片");
+      const cover = person?.cover_photo_id;
+      const extraCover = cover != null && !page.photos.some((photo) => photo.id === cover)
+        ? await api.getPhoto(cover).catch(() => null) : null;
+      if (!live) return;
+      const start = cover != null && (extraCover || page.photos.some((photo) => photo.id === cover)) ? cover : first;
+      let cursor = page.next_cursor;
+      let hasNext = page.has_more;
+      useStore.getState().openLightbox(start, {
+        candidatePersonId: previewClusterId,
+        items: extraCover ? [extraCover, ...page.photos] : page.photos,
+        loadNext: async () => {
+          if (!hasNext || !cursor) return [];
+          const next = await api.getPhotos(cursor, 80, filter);
+          cursor = next.next_cursor;
+          hasNext = next.has_more;
+          return extraCover ? next.photos.filter((photo) => photo.id !== extraCover.id) : next.photos;
+        },
+      });
+    }).catch((error) => {
+      if (live) setPreviewError(String(error));
+    }).finally(() => {
+      if (live) setPreviewClusterId(undefined);
+    });
+    return () => { live = false; };
+  }, [active, autoMergeOpen, previewClusterId]);
+
   const handleAutoMerge = async () => {
-    const groups = autoMergeCandidates
-      .filter((candidate) => autoMergeSelected.has(candidateKey(candidate)))
-      .map((candidate) => candidate.cluster_ids);
+    const groups = selectedMergeGroups;
     if (groups.length === 0) return;
     setAutoMergeRunning(true);
     try {
-      const result = await api.applyAutoMergeUnnamedFaces(groups, autoMergeThreshold);
-      faceThumbCache.clear();
+      const result = await api.applyAutoMergeUnnamedFaces(
+        groups.map(({ ids }) => ids),
+        autoMergeThreshold,
+        groups.flatMap(({ target }) => target == null ? [] : [target]),
+      );
+      setAvatarRevision((revision) => revision + 1);
       await refreshData();
       setOperationMessage(result);
       setAutoMergeOpen(false);
@@ -397,7 +448,7 @@ export default React.memo(function FaceView({ active = true }: Props) {
       await api.rejectAutoMergeCandidate(candidate.cluster_ids);
       const key = candidateKey(candidate);
       setAutoMergeCandidates((items) => items.filter((item) => candidateKey(item) !== key));
-      setAutoMergeSelected((selected) => { const next = new Set(selected); next.delete(key); return next; });
+      setAutoMergeSelected((selected) => { const next = new Map(selected); next.delete(key); return next; });
       setOperationMessage("已记住这些不是同一个人，今后不会再次自动推荐。");
     } catch (error) {
       setOperationMessage(`保存排除关系失败：${String(error)}`);
@@ -407,7 +458,7 @@ export default React.memo(function FaceView({ active = true }: Props) {
   const handleUndoAutomaticMerge = async () => {
     try {
       const result = await api.undoLastAutomaticFaceMerge();
-      faceThumbCache.clear();
+      setAvatarRevision((revision) => revision + 1);
       await refreshData();
       setOperationMessage(result);
     } catch (error) {
@@ -468,7 +519,7 @@ export default React.memo(function FaceView({ active = true }: Props) {
     setMergeSaving(true);
     try {
       const result = await api.ignoreFaceClusters(ids);
-      faceThumbCache.clear();
+      setAvatarRevision((revision) => revision + 1);
       setMergeSelected(new Set());
       setMergeMode(false);
       await refreshData();
@@ -511,20 +562,46 @@ export default React.memo(function FaceView({ active = true }: Props) {
     try {
       await api.confirmFaceCluster(clusterId);
       await refreshData();
-      setOperationMessage("已确认这是一个独立人物；它已从待审核中移出。");
+      const tabName = clusters.find((cluster) => cluster.id === clusterId)?.name?.trim() ? "已命名" : "未命名";
+      setOperationMessage(`已确认这是一个独立人物，可在「${tabName}」中查看。`);
     } catch (error) {
       setOperationMessage(`确认人物失败：${String(error)}`);
     }
   };
 
-  const toggleMergeSelection = (clusterId: number) => {
-    setMergeSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(clusterId)) {
-        next.delete(clusterId);
-      } else {
-        next.add(clusterId);
+  const handleConfirmSelected = async () => {
+    if (!mergeSelected.size || confirmingReview || mergeSaving) return;
+    setConfirmingReview(true);
+    try {
+      const count = await api.confirmFaceClusters([...mergeSelected]);
+      reviewSelectionAnchor.current = undefined;
+      setMergeSelected(new Set());
+      setMergeMode(false);
+      await refreshData();
+      setOperationMessage(`已确认 ${count} 个独立人物。可按命名状态在「未命名」或「已命名」中查看。`);
+    } catch (error) {
+      setOperationMessage(`批量确认失败：${String(error)}`);
+    } finally {
+      setConfirmingReview(false);
+    }
+  };
+
+  const toggleMergeSelection = (clusterId: number, extend = false) => {
+    if (confirmingReview || mergeSaving) return;
+    const anchor = reviewSelectionAnchor.current;
+    if (activeTab === "review" && extend && anchor != null) {
+      const start = clusters.findIndex((cluster) => cluster.id === anchor);
+      const end = clusters.findIndex((cluster) => cluster.id === clusterId);
+      if (start >= 0 && end >= 0) {
+        const range = clusters.slice(Math.min(start, end), Math.max(start, end) + 1);
+        setMergeSelected((current) => new Set([...current, ...range.flatMap(({ id }) => id == null ? [] : [id])]));
+        return;
       }
+    }
+    reviewSelectionAnchor.current = clusterId;
+    setMergeSelected((current) => {
+      const next = new Set(current);
+      if (next.has(clusterId)) next.delete(clusterId); else next.add(clusterId);
       return next;
     });
   };
@@ -572,6 +649,7 @@ export default React.memo(function FaceView({ active = true }: Props) {
     }
     setActiveTab(tab);
     setMergeMode(true);
+    reviewSelectionAnchor.current = firstClusterId;
     setMergeSelected(firstClusterId == null ? new Set() : new Set([firstClusterId]));
     setMergeConfirmOpen(false);
     setMergeTargetId(null);
@@ -691,6 +769,41 @@ export default React.memo(function FaceView({ active = true }: Props) {
               选择已命名人物合并
             </button>
           )}
+          {activeTab === "unnamed" && <form className="flex flex-wrap items-center gap-2" onSubmit={(event) => {
+            event.preventDefault();
+            const value = unnamedQuery.trim().replace(/^(?:人物\s*)?#?\s*/, "");
+            const id = Number(value);
+            if (unnamedQuery.trim() && (!/^\d+$/.test(value) || !Number.isSafeInteger(id) || id < 1)) {
+              setUnnamedQueryError("请输入人物编号，例如 491 或 人物 491");
+              return;
+            }
+            setUnnamedQueryError("");
+            const next = value ? id : undefined;
+            if (next === unnamedId) return;
+            pageRequest.current++;
+            loadedClusters.current.count = 0;
+            setClusters([]);
+            setPageTotal(0);
+            setUnnamedId(next);
+            peopleResults.current?.scrollTo({ top: 0 });
+          }}>
+            <input type="search" aria-label="检索未命名人物" placeholder="人物编号，如 491"
+              value={unnamedQuery} maxLength={32}
+              onChange={(event) => { setUnnamedQuery(event.target.value); setUnnamedQueryError(""); }}
+              className="ui-input w-40" />
+            <button type="submit" className="ui-button">检索</button>
+            {unnamedId != null && <button type="button" className="ui-button" onClick={() => {
+              pageRequest.current++;
+              loadedClusters.current.count = 0;
+              setClusters([]);
+              setPageTotal(0);
+              setUnnamedQueryError("");
+              setUnnamedQuery("");
+              setUnnamedId(undefined);
+              peopleResults.current?.scrollTo({ top: 0 });
+            }}>清除检索</button>}
+            {unnamedQueryError && <span role="alert" className="text-xs text-red-600">{unnamedQueryError}</span>}
+          </form>}
           {activeTab === "unnamed" && !mergeMode && (
             <>
               <button
@@ -711,15 +824,21 @@ export default React.memo(function FaceView({ active = true }: Props) {
             <>
               <button
                 onClick={() => { void openMergeConfirmation(); }}
-                disabled={mergeSelected.size < 1}
+                disabled={mergeSelected.size < 1 || confirmingReview}
                 className="bg-accent-primary text-white px-4 py-1.5 rounded-lg text-sm disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
               >
                 合并为一个人物 ({mergeSelected.size})
               </button>
+              {activeTab === "review" && (
+                <button type="button" className="ui-button-primary" onClick={() => void handleConfirmSelected()}
+                  disabled={!mergeSelected.size || confirmingReview || mergeSaving}>
+                  {confirmingReview ? "正在确认…" : `批量确认（${mergeSelected.size}）`}
+                </button>
+              )}
               {(activeTab === "unnamed" || activeTab === "review") && (
                 <button
                   onClick={handleIgnoreSelectedPeople}
-                  disabled={mergeSelected.size < 1 || mergeSaving}
+                  disabled={mergeSelected.size < 1 || mergeSaving || confirmingReview}
                   className="bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300 px-4 py-1.5 rounded-lg text-sm disabled:opacity-50 disabled:cursor-not-allowed border border-red-100"
                 >
                   删除所选人物标记 ({mergeSelected.size})
@@ -729,8 +848,8 @@ export default React.memo(function FaceView({ active = true }: Props) {
           )}
           {activeTab === "review" && !mergeMode && (
             <>
-              <button onClick={() => startMergeMode("review")} className="ui-button">选择并合并</button>
-              <span className="text-xs text-text-muted">确认、命名或合并身份不明确的人脸。</span>
+              <button onClick={() => startMergeMode("review")} className="ui-button">批量选择</button>
+              <span className="text-xs text-text-muted">可批量确认独立人物，或把同一人的分组合并。</span>
             </>
           )}
           {mergeMode && mergeSelected.size > 0 && (
@@ -738,13 +857,16 @@ export default React.memo(function FaceView({ active = true }: Props) {
               {mergeSelected.size} {"\u4e2a\u65cf\u7fa4\u5df2\u9009\u4e2d"}
             </span>
           )}
+          {mergeMode && activeTab === "review" && <span className="text-xs text-text-muted">按住 Shift 点击可连续选择</span>}
           {mergeMode && (
-            <button onClick={() => { setMergeMode(false); setMergeSelected(new Set()); }} className="px-3 py-1.5 rounded-lg text-sm text-text-secondary hover:bg-text-primary/5">
+            <button disabled={confirmingReview} onClick={() => { setMergeMode(false); setMergeSelected(new Set()); }} className="px-3 py-1.5 rounded-lg text-sm text-text-secondary hover:bg-text-primary/5">
               取消
             </button>
           )}
         </div>
-      <div className="people-results">
+      <div className="people-results" ref={peopleResults}>
+        {clusterIdFilter != null && !pageLoading && !visibleClusters.length &&
+          <p className="px-4 py-6 text-sm text-text-muted">未找到未命名人物 {clusterIdFilter}。</p>}
         <div className="people-grid">
           {visibleClusters.map((cluster) => (
             <div
@@ -754,9 +876,9 @@ export default React.memo(function FaceView({ active = true }: Props) {
                   ? "border-accent-primary bg-accent-primary/15"
                   : "border-surface-secondary/70 bg-bg-secondary hover:border-accent-primary/40"
               }`}
-              onClick={() => {
+              onClick={(event) => {
                 if (mergeMode) {
-                  toggleMergeSelection(cluster.id!);
+                  toggleMergeSelection(cluster.id!, event.shiftKey);
                 } else {
                   navigate(`/?tab=${activeTab}&person=${cluster.id}`, { state: { returnTo: "faces" } });
                 }
@@ -770,8 +892,15 @@ export default React.memo(function FaceView({ active = true }: Props) {
               }}
             >
               <div className="w-full aspect-square overflow-hidden rounded-lg bg-surface-secondary relative">
-                <FaceThumb clusterId={cluster.id!} />
-                {mergeMode && (
+                <FaceThumb clusterId={cluster.id!} scope={avatarScope} active={active && !groupPhotosOpen && !autoMergeOpen && !suspectedOpen} />
+                {mergeMode && activeTab === "review" && (
+                  <input type="checkbox" className="absolute top-2 right-2 h-5 w-5 accent-accent-primary"
+                    aria-label={`选择${cluster.name || `人物 ${cluster.id}`}`}
+                    checked={mergeSelected.has(cluster.id!)} disabled={confirmingReview || mergeSaving}
+                    onClick={(event) => event.stopPropagation()}
+                    onChange={(event) => toggleMergeSelection(cluster.id!, (event.nativeEvent as MouseEvent).shiftKey)} />
+                )}
+                {mergeMode && activeTab !== "review" && (
                   <span className={`absolute top-2 right-2 w-6 h-6 rounded-full border-2 flex items-center justify-center text-xs font-bold shadow-sm ${
                     mergeSelected.has(cluster.id!) ? "bg-accent-primary border-white text-white" : "bg-bg-secondary/90 border-white text-transparent"
                   }`}>
@@ -914,11 +1043,14 @@ export default React.memo(function FaceView({ active = true }: Props) {
       )}
 
       {autoMergeOpen && (
-        <div className="fixed inset-0 z-[1200] bg-black/30 backdrop-blur-sm flex items-center justify-center" onMouseDown={() => !autoMergeRunning && setAutoMergeOpen(false)}>
+        <div className={`fixed inset-0 z-[1200] bg-black/30 backdrop-blur-sm flex items-center justify-center ${lightboxPhotoId ? "invisible pointer-events-none" : ""}`}
+          aria-hidden={lightboxPhotoId != null || undefined}
+          onMouseDown={() => !autoMergeRunning && setAutoMergeOpen(false)}>
           <div className="w-[680px] max-h-[86vh] overflow-y-auto rounded-2xl bg-bg-secondary p-6 shadow-2xl border border-text-primary/10" onMouseDown={(event) => event.stopPropagation()}>
             <h3 className="text-lg font-semibold text-text-primary">自动合并相似人物</h3>
+            {previewError && <p role="alert" className="mt-2 text-sm text-red-600">打开大图失败：{previewError}</p>}
             <p className="text-sm text-text-muted mt-2 leading-6">
-              只比较未命名人物。已经命名的人物不会参与，也不会被改动；同一张照片中同时出现的人物不会自动合并。
+              查找相似的未命名分组，也可将它们合入已命名人物。同一张照片中同时出现的人物会被排除。
             </p>
             <div className="mt-5 rounded-xl bg-black/[0.035] p-4">
               <div className="flex items-center justify-between text-sm">
@@ -927,23 +1059,28 @@ export default React.memo(function FaceView({ active = true }: Props) {
               </div>
               <input
                 type="range"
-                min="0.60"
+                min="0.35"
                 max="0.90"
+                aria-label="相似度阈值"
+                disabled={autoMergeRunning}
                 step="0.01"
                 value={autoMergeThreshold}
                 onChange={(event) => {
                   setAutoMergeThreshold(Number(event.target.value));
                   setAutoMergeCandidates([]);
-                  setAutoMergeSelected(new Set());
+                  setAutoMergeSelected(new Map());
+                  setExpandedMergeGroups(new Set());
                   setAutoMergePreviewed(false);
                 }}
                 className="mt-3 w-full accent-blue-600"
               />
               <div className="mt-1 flex justify-between text-xs text-text-muted">
-                <span>0.60 合并更多</span><span>0.72 平衡</span><span>0.90 更谨慎</span>
+                <span>0.35 查找更多</span><span>0.72 平衡</span><span>0.90 更谨慎</span>
               </div>
               <p className="mt-3 text-xs text-text-secondary">
-                {autoMergeThreshold < 0.68
+                {autoMergeThreshold < 0.60
+                  ? "较低阈值可能找到更多侧脸，也会增加误匹配。请逐个勾选要合并的分组。"
+                  : autoMergeThreshold < 0.68
                   ? "当前设置较宽松，适合人物较少、拍摄跨度较大的相册。建议合并后抽查。"
                   : autoMergeThreshold < 0.80
                     ? "平衡模式：允许表情和角度变化，同时要求多张脸互相支持。"
@@ -957,13 +1094,12 @@ export default React.memo(function FaceView({ active = true }: Props) {
                   {autoMergeCandidates.length > 0 && (
                     <button
                       className="text-xs text-accent-link"
-                      onClick={() => setAutoMergeSelected(
-                        autoMergeSelected.size === autoMergeCandidates.length
-                          ? new Set()
-                          : new Set(autoMergeCandidates.map(candidateKey))
-                      )}
+                      disabled={autoMergeRunning}
+                      onClick={() => setAutoMergeSelected(allMergeCandidatesSelected
+                        ? new Map()
+                        : new Map(autoMergeCandidates.map((candidate) => [candidateKey(candidate), selectableMergeMembers(candidate)])))}
                     >
-                      {autoMergeSelected.size === autoMergeCandidates.length ? "全部取消" : "全部选择"}
+                      {allMergeCandidatesSelected ? "全部取消" : "全部选择"}
                     </button>
                   )}
                 </div>
@@ -973,35 +1109,73 @@ export default React.memo(function FaceView({ active = true }: Props) {
                   </div>
                 ) : (
                   <div className="space-y-2 max-h-[330px] overflow-y-auto pr-1">
-                    {autoMergeCandidates.map((candidate) => {
+                    {autoMergeCandidates.map((candidate, index) => {
                       const key = candidateKey(candidate);
-                      const selected = autoMergeSelected.has(key);
+                      const expanded = expandedMergeGroups.has(key);
+                      const ids = autoMergeSelected.get(key) ?? [];
+                      const members = selectableMergeMembers(candidate);
+                      const targetId = candidate.named_target_id;
+                      const targetName = candidate.named_target_name;
+                      const allSelected = ids.length === members.length;
+                      const ready = ids.length >= (targetId != null ? 1 : 2);
                       return (
-                        <div key={key} className={`rounded-xl border p-3 ${selected ? "border-accent-primary bg-accent-primary/5" : "border-text-primary/10 bg-bg-secondary"}`}>
-                          <div className="flex items-center gap-3">
+                        <div key={key} className={`rounded-xl border p-3 ${ready ? "border-accent-primary bg-accent-primary/5" : "border-text-primary/10 bg-bg-secondary"}`}>
+                          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
                             <button
-                              className={`w-5 h-5 shrink-0 rounded border text-xs ${selected ? "bg-accent-primary border-accent-primary text-white" : "border-text-primary/20"}`}
-                              onClick={() => setAutoMergeSelected((current) => {
+                              type="button"
+                              className="ui-button inline-flex items-center gap-2 text-sm"
+                              aria-expanded={expanded}
+                              aria-controls={`merge-candidate-${key}`}
+                              aria-label={`${expanded ? "收起" : "展开"}候选组 ${index + 1}`}
+                              onClick={() => setExpandedMergeGroups((current) => {
                                 const next = new Set(current);
                                 if (next.has(key)) next.delete(key); else next.add(key);
                                 return next;
                               })}
-                            >✓</button>
-                            <div className="flex -space-x-2">
-                              {candidate.cluster_ids.slice(0, 5).map((clusterId) => (
-                                <div key={clusterId} className="w-12 h-12 overflow-hidden rounded-full border-2 border-white bg-surface-secondary">
-                                  <FaceThumb clusterId={clusterId} />
-                                </div>
-                              ))}
-                            </div>
-                            <div className="min-w-0 flex-1">
-                              <div className="text-sm font-medium">{candidate.cluster_ids.length} 个人物分组 · {candidate.face_count} 张人脸</div>
-                              <div className="text-xs text-text-muted">综合相似度 {(candidate.similarity * 100).toFixed(1)}%</div>
-                            </div>
-                            <button
-                              onClick={() => handleRejectAutoMergeCandidate(candidate)}
-                              className="shrink-0 rounded-lg px-2.5 py-1.5 text-xs text-orange-700 dark:text-orange-300 hover:bg-orange-50"
-                            >不是同一人</button>
+                            >
+                              <span aria-hidden="true">{expanded ? "▾" : "▸"}</span>
+                              候选组 {index + 1} · {candidate.cluster_ids.length} 人
+                            </button>
+                            <span className="text-xs tabular-nums text-text-muted">相似度 {(candidate.similarity * 100).toFixed(1)}%</span>
+                            <label className="ml-auto flex items-center gap-2 text-sm">
+                              <input type="checkbox" checked={allSelected} disabled={autoMergeRunning}
+                                aria-label={`整组选中候选组 ${index + 1}`}
+                                ref={(input) => { if (input) input.indeterminate = ids.length > 0 && !allSelected; }}
+                                onChange={(event) => {
+                                  const checked = event.target.checked;
+                                  setAutoMergeSelected((current) => new Map(current).set(key, checked ? members : []));
+                                }} />
+                              整组选择
+                              <span className="text-xs tabular-nums text-text-muted">（{ids.length}/{members.length}）</span>
+                            </label>
+                            <button disabled={autoMergeRunning} onClick={() => handleRejectAutoMergeCandidate(candidate)}
+                              className="shrink-0 rounded-lg px-2.5 py-1.5 text-xs text-orange-700 dark:text-orange-300 hover:bg-orange-50">不是同一人</button>
+                          </div>
+                          {targetId != null && <p className="mt-2 text-sm font-medium text-accent-link">合入已命名人物：{targetName ?? `人物 ${targetId}`}</p>}
+                          <div id={`merge-candidate-${key}`} className={expanded ? "mt-3 flex flex-wrap gap-2 border-t border-surface-secondary pt-3" : "hidden"}>
+                            {expanded && (targetId == null ? members : [targetId, ...members]).map((id) => (
+                              <div key={id} className="flex w-24 flex-col items-center gap-1 rounded-lg border border-surface-secondary p-1 text-xs">
+                                <button type="button" className="relative h-16 w-16 overflow-hidden rounded-lg bg-surface-secondary"
+                                  aria-label={`查看人物 ${id} 的大图`} title="查看大图" disabled={previewClusterId != null}
+                                  onClick={() => { setPreviewError(""); setPreviewClusterId(id); }}>
+                                  <FaceThumb clusterId={id} scope={avatarScope} active={active && lightboxPhotoId == null} />
+                                  <span className="absolute inset-x-0 bottom-0 bg-black/65 py-0.5 text-white">{previewClusterId === id ? "加载中…" : "看大图"}</span>
+                                </button>
+                                {id === targetId
+                                  ? <span className="max-w-full truncate text-accent-link" title={targetName ?? undefined}>{targetName ?? `人物 ${id}`}</span>
+                                  : <label className="flex cursor-pointer items-center gap-1">
+                                  <input type="checkbox" checked={ids.includes(id)} disabled={autoMergeRunning}
+                                    onChange={(event) => {
+                                      const checked = event.target.checked;
+                                      setAutoMergeSelected((current) => {
+                                        const selected = current.get(key) ?? [];
+                                        return new Map(current).set(key, checked ? [...selected, id] : selected.filter((value) => value !== id));
+                                      });
+                                    }} />
+                                  人物 {id}
+                                </label>}
+                              </div>
+                            ))}
                           </div>
                         </div>
                       );
@@ -1019,8 +1193,8 @@ export default React.memo(function FaceView({ active = true }: Props) {
               ) : (
                 <>
                   <button disabled={autoMergeRunning} onClick={handlePreviewAutoMerge} className="px-3 py-2 rounded-lg text-sm text-text-secondary hover:bg-text-primary/5 disabled:opacity-50">重新分析</button>
-                  <button disabled={autoMergeRunning || autoMergeSelected.size === 0} onClick={handleAutoMerge} className="px-4 py-2 rounded-lg bg-accent-primary text-white text-sm font-medium disabled:opacity-50">
-                    {autoMergeRunning ? "正在合并…" : `确认合并 ${autoMergeSelected.size} 组`}
+                  <button disabled={autoMergeRunning || selectedMergeGroups.length === 0} onClick={handleAutoMerge} className="px-4 py-2 rounded-lg bg-accent-primary text-white text-sm font-medium disabled:opacity-50">
+                    {autoMergeRunning ? "正在合并…" : `确认合并 ${selectedMergeGroups.length} 组`}
                   </button>
                 </>
               )}

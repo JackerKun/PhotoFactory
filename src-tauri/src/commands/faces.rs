@@ -39,10 +39,11 @@ pub async fn cmd_get_cluster_page(
     tab: String,
     offset: i64,
     limit: i64,
+    cluster_id: Option<i64>,
     state: State<'_, AppState>,
 ) -> AppResult<FaceClusterPage> {
     let conn = get_conn(state)?;
-    face_dao::get_cluster_page(&conn, &tab, offset, limit)
+    face_dao::get_cluster_page(&conn, &tab, offset, limit, cluster_id)
 }
 
 #[tauri::command]
@@ -62,6 +63,25 @@ pub async fn cmd_confirm_face_cluster(
 ) -> AppResult<()> {
     let conn = get_conn(state)?;
     face_dao::set_cluster_confidence(&conn, cluster_id, "high")
+}
+
+#[tauri::command]
+pub async fn cmd_confirm_face_clusters(
+    mut cluster_ids: Vec<i64>,
+    state: State<'_, AppState>,
+) -> AppResult<usize> {
+    if cluster_ids.len() > 5000 {
+        return Err(AppError::Project("单次最多确认 5000 个人物".into()));
+    }
+    cluster_ids.sort_unstable();
+    cluster_ids.dedup();
+    let mut conn = get_conn(state)?;
+    let tx = conn.transaction()?;
+    for id in &cluster_ids {
+        face_dao::set_cluster_confidence(&tx, *id, "high")?;
+    }
+    tx.commit()?;
+    Ok(cluster_ids.len())
 }
 
 #[tauri::command]
@@ -358,9 +378,9 @@ async fn preview_automatic_merges(
     state: State<'_, AppState>,
     worker_state: State<'_, AiWorkerState>,
 ) -> AppResult<Vec<crate::models::AutomaticFaceMergeCandidate>> {
-    if !threshold.is_finite() || !(0.60..=0.90).contains(&threshold) {
+    if !threshold.is_finite() || !(0.35..=0.90).contains(&threshold) {
         return Err(AppError::Project(
-            "Automatic merge threshold must be between 0.60 and 0.90".into(),
+            "Automatic merge threshold must be between 0.35 and 0.90".into(),
         ));
     }
 
@@ -371,13 +391,20 @@ async fn preview_automatic_merges(
             .ok_or_else(|| AppError::Project("No project open".into()))?
             .clone()
     };
-    let unnamed: HashMap<String, i64> = {
+    let (assignments, named, cannot_links) = {
         let conn = get_conn(state.clone())?;
-        face_dao::get_unnamed_embedding_cluster_assignments(&conn)?
-            .into_iter()
-            .collect()
+        let mut assignments = HashMap::new();
+        let mut named = HashMap::new();
+        for (embedding, id, name) in face_dao::get_automatic_merge_assignments(&conn)? {
+            assignments.insert(embedding, id);
+            if let Some(name) = name {
+                named.entry(id).or_insert(name);
+            }
+        }
+        let cannot_links = crate::db::constraint_dao::get_cannot_links(&conn)?;
+        (assignments, named, cannot_links)
     };
-    if unnamed.len() < 2 {
+    if assignments.len() < 2 || !assignments.values().any(|id| !named.contains_key(id)) {
         return Ok(Vec::new());
     }
 
@@ -391,15 +418,31 @@ async fn preview_automatic_merges(
     let response = client
         .plan_automatic_face_merges(&crate::models::AutomaticFaceMergeRequest {
             embeddings_dir: project.faces_cache_path().to_string_lossy().to_string(),
-            unnamed_clusters: unnamed,
+            unnamed_clusters: assignments,
+            named_cluster_ids: named.keys().copied().collect(),
             threshold,
-            cannot_links: {
-                let conn = get_conn(state.clone())?;
-                crate::db::constraint_dao::get_cannot_links(&conn)?
-            },
+            cannot_links,
         })
         .await?;
-    Ok(response.candidates)
+    Ok(response
+        .candidates
+        .into_iter()
+        .filter_map(|mut candidate| {
+            let mut targets = candidate
+                .cluster_ids
+                .iter()
+                .filter_map(|id| named.get(id).map(|name| (*id, name)));
+            let target = targets.next();
+            if targets.next().is_some() {
+                return None;
+            }
+            if let Some((id, name)) = target {
+                candidate.named_target_id = Some(id);
+                candidate.named_target_name = Some(name.clone());
+            }
+            Some(candidate)
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -415,9 +458,10 @@ pub async fn cmd_preview_auto_merge_unnamed_faces(
 pub fn cmd_apply_auto_merge_unnamed_faces(
     merge_groups: Vec<Vec<i64>>,
     threshold: f64,
+    named_target_ids: Option<Vec<i64>>,
     state: State<'_, AppState>,
 ) -> AppResult<String> {
-    if !threshold.is_finite() || !(0.60..=0.90).contains(&threshold) {
+    if !threshold.is_finite() || !(0.35..=0.90).contains(&threshold) {
         return Err(AppError::Project(
             "Invalid automatic merge threshold".into(),
         ));
@@ -430,8 +474,15 @@ pub fn cmd_apply_auto_merge_unnamed_faces(
             .clone()
     };
     let conn = get_conn(state)?;
-    let (_operation_id, merged_groups, removed_groups) =
-        face_dao::apply_automatic_merge_groups(&conn, &merge_groups, threshold)?;
+    let (_operation_id, merged_groups, removed_groups) = face_dao::apply_automatic_merge_groups(
+        &conn,
+        &merge_groups,
+        threshold,
+        &named_target_ids.unwrap_or_default(),
+    )?;
+    if merged_groups == 0 {
+        return Ok("选中的候选已变化或存在冲突，没有合并。".into());
+    }
 
     if merged_groups > 0 {
         let cache_dir = project
@@ -445,9 +496,14 @@ pub fn cmd_apply_auto_merge_unnamed_faces(
             Err(error) => return Err(error.into()),
         }
     }
+    let skipped = merge_groups.len().saturating_sub(merged_groups);
+    let skipped_message = if skipped > 0 {
+        format!("另有 {skipped} 组因候选变化或冲突未合并。")
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "自动合并了 {} 组相似人物，减少 {} 个未命名分组。可从菜单撤销本次操作。",
-        merged_groups, removed_groups
+        "自动合并了 {merged_groups} 组相似人物，减少 {removed_groups} 个未命名分组。{skipped_message}可从菜单撤销本次操作。"
     ))
 }
 
@@ -461,9 +517,10 @@ pub async fn cmd_auto_merge_unnamed_faces(
     let candidates = preview_automatic_merges(threshold, state.clone(), worker_state).await?;
     let groups = candidates
         .into_iter()
+        .filter(|candidate| candidate.named_target_id.is_none())
         .map(|candidate| candidate.cluster_ids)
         .collect();
-    cmd_apply_auto_merge_unnamed_faces(groups, threshold, state)
+    cmd_apply_auto_merge_unnamed_faces(groups, threshold, None, state)
 }
 
 #[tauri::command]
@@ -542,10 +599,7 @@ pub async fn cmd_get_cluster_face_thumbnail(
             "cluster_{cluster_id}_{FACE_THUMBNAIL_CACHE_VERSION}.jpg"
         ));
     cached_face_thumbnail(project, cache_path, 160, move |conn| {
-        face_dao::get_faces_for_person(conn, cluster_id, 1)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| AppError::NotFound("No faces in this cluster".into()))
+        face_dao::get_faces_for_person(conn, cluster_id, 3)
     })
     .await
 }
@@ -554,10 +608,22 @@ async fn cached_face_thumbnail(
     project: crate::models::Project,
     cache_path: std::path::PathBuf,
     size: u32,
-    face: impl FnOnce(&rusqlite::Connection) -> AppResult<FaceDetection> + Send + 'static,
+    faces: impl FnOnce(&rusqlite::Connection) -> AppResult<Vec<FaceDetection>> + Send + 'static,
 ) -> AppResult<String> {
     use base64::Engine;
     use std::io::Write;
+
+    let data_url = |bytes: &[u8]| {
+        format!(
+            "data:image/jpeg;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    };
+    if let Ok(bytes) = tokio::fs::read(&cache_path).await {
+        if !bytes.is_empty() {
+            return Ok(data_url(&bytes));
+        }
+    }
 
     static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
     let permit = SLOTS
@@ -566,38 +632,43 @@ async fn cached_face_thumbnail(
         .map_err(|error| AppError::Internal(error.to_string()))?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let bytes = match std::fs::read(&cache_path) {
-            Ok(bytes) if !bytes.is_empty() => bytes,
-            _ => {
-                let (face, photo) = {
-                    let conn = crate::db::connection::open_read_db(&project.db_path())?;
-                    let face = face(&conn)?;
-                    let photo =
-                        photo_dao::get_photo_by_id(&conn, face.photo_id)?.ok_or_else(|| {
-                            AppError::NotFound(format!("Photo {} not found", face.photo_id))
-                        })?;
-                    (face, photo)
-                };
-                let bytes = generator::generate_face_thumbnail(
-                    std::path::Path::new(&photo.path),
-                    face.bbox_x.max(0) as u32,
-                    face.bbox_y.max(0) as u32,
-                    face.bbox_w.max(1) as u32,
-                    face.bbox_h.max(1) as u32,
-                    size,
-                )?;
-                let directory = cache_path.parent().unwrap();
-                std::fs::create_dir_all(directory)?;
-                let mut temp = tempfile::NamedTempFile::new_in(directory)?;
-                temp.write_all(&bytes)?;
-                temp.persist(cache_path).map_err(|error| error.error)?;
-                bytes
+        if let Ok(bytes) = std::fs::read(&cache_path) {
+            if !bytes.is_empty() {
+                return Ok(data_url(&bytes));
             }
+        }
+        let candidates = {
+            let conn = crate::db::connection::open_read_db(&project.db_path())?;
+            faces(&conn)?
+                .into_iter()
+                .map(|face| {
+                    let photo = photo_dao::get_photo_by_id(&conn, face.photo_id)?;
+                    Ok(photo.map(|photo| (face, photo.path)))
+                })
+                .collect::<AppResult<Vec<_>>>()?
         };
-        Ok(format!(
-            "data:image/jpeg;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(bytes)
-        ))
+        let mut last_error = AppError::NotFound("没有可用的人脸照片".into());
+        for (face, path) in candidates.into_iter().flatten() {
+            match generator::generate_face_thumbnail(
+                std::path::Path::new(&path),
+                face.bbox_x.max(0) as u32,
+                face.bbox_y.max(0) as u32,
+                face.bbox_w.max(1) as u32,
+                face.bbox_h.max(1) as u32,
+                size,
+            ) {
+                Ok(bytes) => {
+                    let directory = cache_path.parent().unwrap();
+                    std::fs::create_dir_all(directory)?;
+                    let mut temp = tempfile::NamedTempFile::new_in(directory)?;
+                    temp.write_all(&bytes)?;
+                    temp.persist(cache_path).map_err(|error| error.error)?;
+                    return Ok(data_url(&bytes));
+                }
+                Err(error) => last_error = error,
+            }
+        }
+        Err(last_error)
     })
     .await
     .map_err(|error| AppError::Internal(format!("人脸缩略图任务中断：{error}")))?
@@ -763,7 +834,7 @@ pub async fn cmd_get_face_thumbnail(face_id: i64, state: State<'_, AppState>) ->
         .join("thumbnails")
         .join(format!("face_{face_id}_{FACE_THUMBNAIL_CACHE_VERSION}.jpg"));
     cached_face_thumbnail(project, cache_path, 128, move |conn| {
-        face_dao::get_face_by_id(conn, face_id)
+        face_dao::get_face_by_id(conn, face_id).map(|face| vec![face])
     })
     .await
 }

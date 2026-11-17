@@ -18,7 +18,7 @@ interface Props {
   isSelected?: boolean;
   ratingSelectionMode?: boolean;
   ratingSelected?: boolean;
-  onToggleRatingSelection?: () => void;
+  onToggleRatingSelection?: (extend: boolean) => void;
 }
 
 export default React.memo(function PhotoCard({ photo, onClick, onDoubleClick, size, height, shape = "square", showFilename = true, isSelected = false, ratingSelectionMode = false, ratingSelected = false, onToggleRatingSelection }: Props) {
@@ -133,7 +133,7 @@ export default React.memo(function PhotoCard({ photo, onClick, onDoubleClick, si
   // inspector first.
   const handleCardClick = useCallback((event: React.MouseEvent) => {
     if (ratingSelectionMode) {
-      if (event.detail <= 1) onToggleRatingSelection?.();
+      if (event.detail <= 1) onToggleRatingSelection?.(event.shiftKey);
       return;
     }
     if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);

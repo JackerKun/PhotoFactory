@@ -141,20 +141,18 @@ def plan_automatic_cluster_merges(
     threshold: float = 0.72,
     cannot_links: list = None,
     return_details: bool = False,
+    named_cluster_ids: list = None,
 ) -> list:
-    """Find high-confidence merge groups among automatic person clusters.
-
-    ``assignments`` must contain only machine-created/unnamed people.  Callers
-    deliberately exclude named people, and this function never proposes a
-    destination outside that set.
+    """Find merge groups with at most one named person as a destination.
 
     A centroid match alone is not enough: at least 60% of the faces on both
     sides must have a plausible counterpart.  Groups containing faces from the
     same photo are incompatible, which prevents two people standing next to
     each other from being collapsed by a visually similar pair.
     """
-    safe_threshold = float(max(0.60, min(0.90, threshold)))
-    support_threshold = max(0.54, safe_threshold - 0.14)
+    named = set(named_cluster_ids or [])
+    safe_threshold = float(max(0.35, min(0.90, threshold)))
+    support_threshold = max(min(0.54, safe_threshold - 0.06), safe_threshold - 0.14)
 
     members = {}
     photo_ids = {}
@@ -218,11 +216,12 @@ def plan_automatic_cluster_merges(
     _, neighbor_indices = neighbors.kneighbors(centroid_matrix)
     candidate_pairs = set()
     for left_pos, positions in enumerate(neighbor_indices):
-        for right_pos in positions[1:]:
-            candidate_pairs.add(tuple(sorted((cluster_ids[left_pos], cluster_ids[int(right_pos)]))))
+        for right_pos in positions:
+            if right_pos != left_pos:
+                candidate_pairs.add(tuple(sorted((cluster_ids[left_pos], cluster_ids[int(right_pos)]))))
 
     for left_id, right_id in sorted(candidate_pairs):
-        if (left_id, right_id) in blocked_pairs:
+        if (left_id, right_id) in blocked_pairs or (left_id in named and right_id in named):
             compatible[(left_id, right_id)] = False
             continue
         if photo_ids.get(left_id, set()) & photo_ids.get(right_id, set()):
@@ -241,7 +240,7 @@ def plan_automatic_cluster_merges(
             effective_threshold -= 0.015
         if min(compactness[left_id], compactness[right_id]) < 0.72:
             effective_threshold += 0.02
-        effective_threshold = float(np.clip(effective_threshold, 0.60, 0.90))
+        effective_threshold = float(np.clip(effective_threshold, 0.35, 0.90))
         if similarity < effective_threshold:
             compatible[(left_id, right_id)] = False
             continue
@@ -275,7 +274,8 @@ def plan_automatic_cluster_merges(
         # Average-link at the person-seed level tolerates one unusual pose, while
         # the minimum-spread and support checks stop weak similarity chains.
         can_merge_groups = (
-            not any(key in photo_conflicts for key in cross_keys)
+            len((left_group | right_group) & named) <= 1
+            and not any(key in photo_conflicts or key in blocked_pairs for key in cross_keys)
             and float(np.mean(cross_similarities)) >= safe_threshold
             and min(cross_similarities) >= safe_threshold - 0.06
             and supported_fraction >= 0.60

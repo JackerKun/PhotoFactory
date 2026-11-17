@@ -1,7 +1,89 @@
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    process::{Command, Output},
+    sync::{Mutex, OnceLock},
+};
 
-/// Write GPS coordinates to a photo file's EXIF using exiftool.
-/// Returns an error string if exiftool fails.
+static EXIF_FILE_WRITE: Mutex<()> = Mutex::new(());
+static BUNDLED_EXIFTOOL: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn set_exiftool_resource_dir(resource_dir: &Path) {
+    let path = resource_dir.join("exiftool").join(if cfg!(windows) {
+        "exiftool.exe"
+    } else {
+        "exiftool"
+    });
+    if path.is_file() {
+        let _ = BUNDLED_EXIFTOOL.set(path);
+    }
+}
+
+fn exiftool_command() -> Command {
+    if let Some(path) = BUNDLED_EXIFTOOL.get() {
+        #[cfg(target_os = "macos")]
+        {
+            let mut command = crate::process::background_command("/usr/bin/perl");
+            command.arg(path);
+            return command;
+        }
+        #[cfg(not(target_os = "macos"))]
+        return crate::process::background_command(path);
+    }
+    crate::process::background_command("exiftool")
+}
+
+fn run_exiftool(path: &Path, fields: &[String]) -> std::io::Result<Output> {
+    let mut command = exiftool_command();
+    command.args(["-overwrite_original", "-P"]);
+    #[cfg(windows)]
+    {
+        use std::io::{Error, ErrorKind, Write};
+        use std::process::Stdio;
+
+        // ExifTool's Windows launcher converts command-line arguments through a
+        // code page. UTF-8 stdin preserves Unicode paths and metadata values.
+        let path = path
+            .to_str()
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "EXIF 路径无法转换为 UTF-8"))?;
+        let mut child = command
+            .args(["-charset", "filename=UTF8", "-@", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let written = {
+            let mut stdin = child.stdin.take().expect("piped ExifTool stdin");
+            (|| {
+                for field in fields {
+                    writeln!(stdin, "{field}")?;
+                }
+                writeln!(stdin, "{path}")
+            })()
+        };
+        let output = child.wait_with_output()?;
+        if output.status.success() {
+            written?;
+        }
+        Ok(output)
+    }
+    #[cfg(not(windows))]
+    command.args(fields).arg(path).output()
+}
+
+pub fn write_capture_exif(path: &Path, fields: &[String]) -> Result<(), String> {
+    let _write = EXIF_FILE_WRITE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let output = run_exiftool(path, fields).map_err(|e| format!("无法运行 ExifTool：{e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let error = String::from_utf8_lossy(&output.stderr);
+        Err(format!("ExifTool 写入失败：{}", error.trim()))
+    }
+}
+
+/// Write GPS coordinates to a photo file's EXIF using ExifTool.
 pub fn write_gps_exif(
     file_path: &str,
     latitude: Option<f64>,
@@ -9,47 +91,29 @@ pub fn write_gps_exif(
 ) -> Result<(), String> {
     let path = Path::new(file_path);
     if !path.exists() {
-        return Err(format!("File not found: {}", file_path));
+        return Err(format!("File not found: {file_path}"));
     }
 
-    let output = if let (Some(lat), Some(lng)) = (latitude, longitude) {
+    let fields = if let (Some(lat), Some(lng)) = (latitude, longitude) {
         let lat_ref = if lat >= 0.0 { "N" } else { "S" };
         let lng_ref = if lng >= 0.0 { "E" } else { "W" };
-        let lat_abs = lat.abs();
-        let lng_abs = lng.abs();
-
-        crate::process::background_command("exiftool")
-            .args([
-                "-overwrite_original",
-                &format!("-GPSLatitude={:.8}", lat_abs),
-                &format!("-GPSLatitudeRef={}", lat_ref),
-                &format!("-GPSLongitude={:.8}", lng_abs),
-                &format!("-GPSLongitudeRef={}", lng_ref),
-                file_path,
-            ])
-            .output()
-            .map_err(|e| format!("Failed to run exiftool: {}", e))?
+        vec![
+            format!("-GPSLatitude={:.8}", lat.abs()),
+            format!("-GPSLatitudeRef={lat_ref}"),
+            format!("-GPSLongitude={:.8}", lng.abs()),
+            format!("-GPSLongitudeRef={lng_ref}"),
+        ]
     } else {
-        // Clear GPS data
-        crate::process::background_command("exiftool")
-            .args([
-                "-overwrite_original",
-                "-GPSLatitude=",
-                "-GPSLongitude=",
-                "-GPSLatitudeRef=",
-                "-GPSLongitudeRef=",
-                file_path,
-            ])
-            .output()
-            .map_err(|e| format!("Failed to run exiftool: {}", e))?
+        [
+            "-GPSLatitude=",
+            "-GPSLongitude=",
+            "-GPSLatitudeRef=",
+            "-GPSLongitudeRef=",
+        ]
+        .map(str::to_owned)
+        .to_vec()
     };
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("exiftool failed: {}", stderr.trim()))
-    }
+    write_capture_exif(path, &fields)
 }
 
 #[cfg(test)]
@@ -86,6 +150,24 @@ mod tests {
             0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0xFB, 0xD5, 0xDB, 0x20, 0xBC, 0xAF, 0xFF, 0xD9,
         ];
         fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn writes_capture_exif_to_unicode_path() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("胶片扫描.jpg");
+        minimal_jpeg(&path);
+        write_capture_exif(
+            &path.canonicalize().unwrap(),
+            &[
+                "-ExifIFD:LensModel=Nikkor 50mm".into(),
+                "-ExifIFD:FocalLength=50".into(),
+            ],
+        )
+        .unwrap();
+        let result = crate::scanner::exif_reader::read_exif(&path).unwrap();
+        assert_eq!(result.lens_model.as_deref(), Some("Nikkor 50mm"));
+        assert_eq!(result.focal_length, Some(50.0));
     }
 
     #[test]

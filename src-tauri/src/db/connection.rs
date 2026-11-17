@@ -69,6 +69,19 @@ pub fn init_db(db_path: &Path) -> AppResult<Connection> {
         )
         .ok();
     }
+    for table in ["photos", "photo_exif_overrides"] {
+        for (column, kind) in [
+            ("lens_make", "TEXT"),
+            ("lens_model", "TEXT"),
+            ("focal_length", "REAL"),
+        ] {
+            conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"),
+                [],
+            )
+            .ok();
+        }
+    }
     // Migration: add EXIF capture columns to existing databases
     conn.execute_batch(
         "ALTER TABLE photos ADD COLUMN exposure_time TEXT;

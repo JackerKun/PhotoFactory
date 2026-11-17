@@ -102,7 +102,7 @@ Windows ARM64 uses a native ARM64 app with an x64 AI Worker under Windows 11 emu
 32-bit Windows is not supported by this AI dependency stack.
 Verify downloads with SHA256SUMS.txt; build-manifest.json records targets and Worker architectures.
 macOS builds are ad-hoc signed (not notarized); Windows builds have no publisher certificate.
-OCR and writing GPS to original files still require optional Tesseract / ExifTool.
+The installers include ExifTool for writing EXIF and GPS to original files. OCR requires optional Tesseract.
 See the repository README and docs/BUILDING.md for usage and limitations.
 ''', encoding='utf-8')
 

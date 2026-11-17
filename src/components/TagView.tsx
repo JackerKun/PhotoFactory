@@ -37,6 +37,7 @@ export default React.memo(function TagView({ onSelectTag }: Props) {
   const [saving, setSaving] = useState(false);
   const [aiStarting, setAiStarting] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const metadataRevision = useStore((state) => state.photoMetadataRevision);
   const aiStage = useStore((state) => state.aiProcessingStatus?.stage);
 
   const refresh = useCallback(async () => {
@@ -44,7 +45,7 @@ export default React.memo(function TagView({ onSelectTag }: Props) {
     setTags(nextTags);
     setAiGroups(nextGroups);
   }, []);
-  useEffect(() => { refresh().catch((error) => setMessage(String(error))); }, [refresh]);
+  useEffect(() => { refresh().catch((error) => setMessage(String(error))); }, [refresh, metadataRevision]);
   useEffect(() => {
     if (aiStage === "done") refresh().catch((error) => setMessage(String(error)));
   }, [aiStage, refresh]);

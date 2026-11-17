@@ -11,6 +11,9 @@ CREATE TABLE IF NOT EXISTS photos (
     taken_at INTEGER,
     camera_make TEXT,
     camera_model TEXT,
+    lens_make TEXT,
+    lens_model TEXT,
+    focal_length REAL,
     latitude REAL,
     longitude REAL,
     orientation INTEGER DEFAULT 1,
@@ -26,6 +29,19 @@ CREATE TABLE IF NOT EXISTS photos (
     iso INTEGER,
     storage_source_id INTEGER REFERENCES storage_sources(id),
     imported_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS photo_exif_overrides (
+    photo_id INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+    camera_make TEXT,
+    camera_model TEXT,
+    lens_make TEXT,
+    lens_model TEXT,
+    focal_length REAL,
+    exposure_time TEXT,
+    f_number TEXT,
+    iso INTEGER,
+    taken_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS ai_classifications (
@@ -109,6 +125,12 @@ CREATE TABLE IF NOT EXISTS face_merge_operations (
     status TEXT NOT NULL DEFAULT 'applied',
     created_at INTEGER NOT NULL,
     undone_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS face_merge_named_targets (
+    operation_id INTEGER NOT NULL REFERENCES face_merge_operations(id) ON DELETE CASCADE,
+    person_id INTEGER NOT NULL,
+    PRIMARY KEY (operation_id, person_id)
 );
 
 CREATE TABLE IF NOT EXISTS face_merge_history (

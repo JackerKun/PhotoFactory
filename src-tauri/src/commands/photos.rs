@@ -426,6 +426,10 @@ pub async fn cmd_toggle_photo_favorite(
     Ok(is_now_favorite != 0)
 }
 
+const GPS_PHOTO_FILE: &str = "SELECT p.path, COALESCE(s.read_only, 0)
+     FROM photos p LEFT JOIN storage_sources s ON s.id = p.storage_source_id
+     WHERE p.id = ?1 AND p.deleted = 0";
+
 #[tauri::command]
 pub async fn cmd_update_photo_gps(
     photo_id: i64,
@@ -436,26 +440,20 @@ pub async fn cmd_update_photo_gps(
     let conn = get_conn(state.clone())?;
 
     // Get the photo's file path before updating DB
-    let file_path: String = conn
-        .query_row("SELECT path FROM photos WHERE id = ?", [photo_id], |r| {
-            r.get(0)
-        })
+    let (file_path, read_only): (String, bool) = conn
+        .query_row(GPS_PHOTO_FILE, [photo_id], |r| Ok((r.get(0)?, r.get(1)?)))
         .map_err(|_| crate::error::AppError::NotFound(format!("Photo {} not found", photo_id)))?;
 
-    // The project database is PhotoFactory's source of truth. A packaged app
-    // cannot assume the optional system `exiftool` executable is installed, so
-    // metadata synchronization must never prevent the user from saving a pin.
+    // A file write failure must not prevent the user from saving a pin in the project.
     conn.execute(
         "UPDATE photos SET latitude = ?, longitude = ? WHERE id = ?",
         rusqlite::params![latitude, longitude, photo_id],
     )?;
 
-    if let Err(error) = crate::scanner::exif_writer::write_gps_exif(&file_path, latitude, longitude)
-    {
-        eprintln!(
-            "GPS saved to project database; EXIF synchronization skipped: {}",
-            error
-        );
+    if !read_only {
+        if let Err(error) = crate::scanner::exif_writer::write_gps_exif(&file_path, latitude, longitude) {
+            eprintln!("GPS saved to project database; EXIF synchronization skipped: {error}");
+        }
     }
     Ok(())
 }
@@ -485,16 +483,18 @@ pub async fn cmd_update_photos_gps(
     let tx = conn.transaction()?;
     let mut paths = Vec::with_capacity(photo_ids.len());
     {
-        let mut path_stmt = tx.prepare("SELECT path FROM photos WHERE id = ?1 AND deleted = 0")?;
+        let mut path_stmt = tx.prepare(GPS_PHOTO_FILE)?;
         let mut update_stmt = tx.prepare(
             "UPDATE photos SET latitude = ?1, longitude = ?2 WHERE id = ?3 AND deleted = 0",
         )?;
         for photo_id in &photo_ids {
-            let path: String = path_stmt
-                .query_row([photo_id], |row| row.get(0))
+            let (path, read_only): (String, bool) = path_stmt
+                .query_row([photo_id], |row| Ok((row.get(0)?, row.get(1)?)))
                 .map_err(|_| AppError::NotFound(format!("Photo {} not found", photo_id)))?;
             update_stmt.execute(rusqlite::params![latitude, longitude, photo_id])?;
-            paths.push(path);
+            if !read_only {
+                paths.push(path);
+            }
         }
     }
     tx.commit()?;
@@ -546,20 +546,22 @@ pub async fn cmd_update_photos_gps_individual(
     let tx = conn.transaction()?;
     let mut exif_updates = Vec::with_capacity(updates.len());
     {
-        let mut path_stmt = tx.prepare("SELECT path FROM photos WHERE id = ?1 AND deleted = 0")?;
+        let mut path_stmt = tx.prepare(GPS_PHOTO_FILE)?;
         let mut update_stmt = tx.prepare(
             "UPDATE photos SET latitude = ?1, longitude = ?2 WHERE id = ?3 AND deleted = 0",
         )?;
         for item in &updates {
-            let path: String = path_stmt
-                .query_row([item.photo_id], |row| row.get(0))
+            let (path, read_only): (String, bool) = path_stmt
+                .query_row([item.photo_id], |row| Ok((row.get(0)?, row.get(1)?)))
                 .map_err(|_| AppError::NotFound(format!("Photo {} not found", item.photo_id)))?;
             update_stmt.execute(rusqlite::params![
                 item.latitude,
                 item.longitude,
                 item.photo_id
             ])?;
-            exif_updates.push((path, item.latitude, item.longitude));
+            if !read_only {
+                exif_updates.push((path, item.latitude, item.longitude));
+            }
         }
     }
     tx.commit()?;

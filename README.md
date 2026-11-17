@@ -21,7 +21,7 @@ PhotoFactory 是使用 Tauri 2、Rust、React 和 SQLite 构建的本地照片�
 
 _截图为真实 React 组件的浏览器演示，使用独立模拟命令接口和 36 张本地生成图片。人物、标签、GPS、相册及器材信息均为预置示例，不是实际 AI 推理结果，也不是 Tauri / Rust 端到端测试。完整说明见[截图来源](docs/screenshots/README.md)。_
 
-当前版本为 **0.1.9**。项目仍在开发中，建议先用照片副本评估格式、目录权限和 AI 效果，再接入正式资料库。分页和增量机制用于控制大资料库开销，不等于已经完成真实十万张照片的性能验收。
+当前版本为 **0.1.10**。项目仍在开发中，建议先用照片副本评估格式、目录权限和 AI 效果，再接入正式资料库。分页和增量机制用于控制大资料库开销，不等于已经完成真实十万张照片的性能验收。
 
 ## 可以做什么
 
@@ -131,7 +131,7 @@ npm run tauri dev
 ./start.sh --check
 ```
 
-Windows 请使用 **Git Bash**，并安装原生 Windows Node.js、Rust/MSVC、Python 3.11 x64、WebView2（详见 [构建指南](docs/BUILDING.md)）；不要在 WSL 中启动 Windows 桌面验证。脚本会安装前端/Python 依赖、下载或校验 AI 模型，并启动 Tauri 桌面程序；人脸和场景分析由应用按需启动 AI Worker，退出应用时关闭。首次运行需要联网下载依赖和模型。OCR 需要 Tesseract 及 `eng`、`chi_sim` 语言包，EXIF/GPS 回写需要 ExifTool；缺少时脚本会提示，相应功能需补齐依赖后验证。
+Windows 请使用 **Git Bash**，并安装原生 Windows Node.js、Rust/MSVC、Python 3.11 x64、WebView2（详见 [构建指南](docs/BUILDING.md)）；不要在 WSL 中启动 Windows 桌面验证。脚本会安装前端/Python 依赖、下载或校验 AI 模型，并启动 Tauri 桌面程序；人脸和场景分析由应用按需启动 AI Worker，退出应用时关闭。首次运行需要联网下载依赖和模型。OCR 需要 Tesseract 及 `eng`、`chi_sim` 语言包。源代码开发模式下，原文件 EXIF/GPS 回写可使用系统 ExifTool；macOS 和 Windows 安装包已附带 ExifTool。
 
 Windows 图片显示修复涵盖 `http://asset.localhost`、项目目录/额外存储源授权及 `.pf` 隐藏缓存；HEIC/RAW 使用 Worker 内置的跨平台解码器生成预览。验证时请打开位于 D:/E: 或网络盘的照片库，查看缩略图、双击大图并运行人脸识别。已经安装的旧版本需重新运行 `build-windows.ps1` 构建并安装，`start.sh` 则直接验证当前源码。
 
@@ -178,7 +178,7 @@ Windows 虚拟环境使用 `ai_worker\.venv\Scripts\python.exe`，其余步骤�
 | 本地 AI | 照片在本机处理；首次准备模型和依赖需要下载。识别准确性取决于照片、模型与阈值，结果可人工整理。 |
 | 地图与地址 | 使用 OpenStreetMap、Esri World Imagery、Nominatim 等服务，对应区域 / 查询会发给服务商；已缓存瓦片可离线复用。 |
 | OCR | 可选依赖系统 Tesseract；中文语言包缺失时可能降为英文，未安装时不应期待文字识别结果。 |
-| GPS 写回 | 编辑坐标可保存到项目数据库；同步回原片依赖 ExifTool，并且属于显式文件写入。只读来源应继续保持只读。 |
+| GPS 写回 | 编辑坐标可保存到项目数据库；同步回原片会写入文件，macOS 和 Windows 安装包已附带所需的 ExifTool。只读来源应继续保持只读。 |
 | 格式 | 常见 JPEG、PNG、WebP 等可扫描；HEIC / HEIF、RAW、PSD、XCF、EXR 的解码和预览依平台及依赖，不保证全部编码可用。 |
 | 相似与最佳照片 | 候选分组和评分辅助人工选择，不应未经检查直接清理唯一原片。 |
 | 性能 | 分页、虚拟网格、候选分桶和增量管线减少无谓开销；首次扫描、模型加载及预览仍消耗 CPU、内存和磁盘。 |

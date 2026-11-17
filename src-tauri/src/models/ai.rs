@@ -185,6 +185,7 @@ pub struct ClusterFaceV2Response {
 pub struct AutomaticFaceMergeRequest {
     pub embeddings_dir: String,
     pub unnamed_clusters: std::collections::HashMap<String, i64>,
+    pub named_cluster_ids: Vec<i64>,
     pub threshold: f64,
     pub cannot_links: Vec<(i64, i64)>,
 }
@@ -194,6 +195,8 @@ pub struct AutomaticFaceMergeCandidate {
     pub cluster_ids: Vec<i64>,
     pub similarity: f64,
     pub face_count: usize,
+    pub named_target_id: Option<i64>,
+    pub named_target_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

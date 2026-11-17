@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from "react";
+import React, { useState, useCallback, useEffect, useRef } from "react";
 import DirectoryTree from "./DirectoryTree";
 import Icon, { type IconName } from "./Icon";
 import TaskCenter from "./TaskCenter";
@@ -26,6 +26,43 @@ export default React.memo(function Sidebar({ viewMode, onViewModeChange, project
   const { setProject, reset } = useStore();
   const [showFormatPanel, setShowFormatPanel] = useState(false);
   const [showDropdown, setShowDropdown] = useState(false);
+  const [renameRoot, setRenameRoot] = useState<string>();
+  const [projectName, setProjectName] = useState("");
+  const [renameError, setRenameError] = useState("");
+  const [renaming, setRenaming] = useState(false);
+  const renameDialog = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    const dialog = renameDialog.current;
+    if (!renameRoot || !dialog) return;
+    dialog.showModal();
+    return () => dialog.close();
+  }, [renameRoot]);
+
+  const openProjectRename = () => {
+    if (!project) return;
+    setProjectName(project.name);
+    setRenameError("");
+    setShowDropdown(false);
+    setRenameRoot(project.root_path);
+  };
+
+  const handleRename = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const name = projectName.trim();
+    if (!renameRoot || !name || renaming) return;
+    setRenaming(true);
+    setRenameError("");
+    try {
+      const updated = await api.renameProject(renameRoot, name);
+      if (useStore.getState().project?.root_path === renameRoot) setProject(updated);
+      setRenameRoot(undefined);
+    } catch (error) {
+      setRenameError(`项目改名失败：${String(error)}`);
+    } finally {
+      setRenaming(false);
+    }
+  };
 
   const handleRefresh = useCallback(() => {
     if (!project) return;
@@ -97,9 +134,11 @@ export default React.memo(function Sidebar({ viewMode, onViewModeChange, project
       {project && (
         <div className="border-b border-surface-secondary px-4 py-3">
           <div className="flex items-center justify-between">
-            <p className="mr-2 flex-1 truncate text-sm font-medium text-text-primary" title={project.name}>
+            <button type="button" onClick={openProjectRename}
+              className="mr-2 min-w-0 truncate rounded text-left text-sm font-medium text-text-primary hover:text-accent-link focus-visible:outline focus-visible:outline-accent-primary"
+              title={`重命名项目 · ${project.name}`} aria-label={`重命名项目：${project.name}`}>
               {project.name}
-            </p>
+            </button>
             <div className="relative">
               <button type="button" onClick={() => setShowDropdown(!showDropdown)}
                 className="flex h-8 w-8 items-center justify-center rounded-lg text-text-muted hover:bg-surface-primary hover:text-text-primary"
@@ -110,8 +149,12 @@ export default React.memo(function Sidebar({ viewMode, onViewModeChange, project
                 <>
                   <div className="fixed inset-0 z-10" onClick={() => setShowDropdown(false)} />
                   <div className="absolute right-0 top-full mt-1 bg-bg-secondary border border-surface-secondary rounded-lg shadow-lg z-20 min-w-[160px]">
-                    <button onClick={handleImportNew}
+                    <button type="button" onClick={openProjectRename}
                       className="w-full text-left px-3 py-2 text-sm text-text-primary hover:bg-surface-primary first:rounded-t-lg">
+                      重命名项目
+                    </button>
+                    <button onClick={handleImportNew}
+                      className="w-full text-left px-3 py-2 text-sm text-text-primary hover:bg-surface-primary">
                       导入新文件夹
                     </button>
                     <button onClick={handleRefresh}
@@ -156,6 +199,33 @@ export default React.memo(function Sidebar({ viewMode, onViewModeChange, project
         <AppUpdateActions />
         <ThemeSwitcher />
       </div>
+
+      {renameRoot && <dialog ref={renameDialog} aria-labelledby="rename-project-title"
+        className="w-[calc(100%-2rem)] max-w-md rounded-xl border border-surface-secondary bg-bg-secondary p-0 text-text-primary shadow-xl backdrop:bg-black/50"
+        onCancel={(event) => {
+          event.preventDefault();
+          if (!renaming) setRenameRoot(undefined);
+        }}>
+        <form onSubmit={(event) => void handleRename(event)}>
+          <header className="border-b border-surface-secondary px-5 py-4">
+            <h2 id="rename-project-title" className="text-base font-semibold">重命名项目</h2>
+          </header>
+          <div className="space-y-2 px-5 py-4">
+            <label className="flex flex-col gap-1 text-sm">
+              项目名称
+              <input className="ui-input w-full" autoFocus required maxLength={120} value={projectName} disabled={renaming}
+                onChange={(event) => setProjectName(event.target.value)} onFocus={(event) => event.currentTarget.select()} />
+            </label>
+            {renameError && <p role="alert" className="break-words text-sm text-red-600 dark:text-red-400">{renameError}</p>}
+          </div>
+          <footer className="flex justify-end gap-2 border-t border-surface-secondary px-5 py-3">
+            <button type="button" className="ui-button" disabled={renaming} onClick={() => setRenameRoot(undefined)}>取消</button>
+            <button type="submit" className="ui-button-primary" disabled={renaming || !projectName.trim()}>
+              {renaming ? "保存中…" : "保存名称"}
+            </button>
+          </footer>
+        </form>
+      </dialog>}
 
       {showFormatPanel && project && (
         <FormatFilterPanel
