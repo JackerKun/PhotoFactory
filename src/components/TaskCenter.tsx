@@ -157,10 +157,13 @@ export default function TaskCenter() {
   });
 
   return <>
-    <button type="button" onClick={() => setOpen(true)} className="flex min-h-11 w-full items-center gap-2 border-y border-surface-secondary px-4 py-2 text-left text-sm hover:bg-surface-primary" aria-label="后台任务">
+    <button type="button" onClick={() => setOpen(true)} className="workspace-task-entry" aria-label="后台任务"
+      aria-describedby="workspace-task-status" title={active || needsAttention ? `后台任务 · ${active} 项进行中${needsAttention ? " · 需要处理" : ""}` : "后台任务"}>
       <Icon name="activity" className={active ? "text-accent-link" : "text-text-secondary"} />
-      <span className="flex-1">后台任务</span>
-      <span className={`text-xs ${needsAttention ? "text-red-500" : "text-text-secondary"}`}>{active ? `${active} 项进行中` : needsAttention ? "需要处理" : "查看"}</span>
+      <span className="workspace-task-label flex-1">后台任务</span>
+      {!!active && <span aria-hidden="true" className="workspace-task-count">{active}</span>}
+      {needsAttention && <span aria-hidden="true" className="workspace-task-alert" />}
+      <span id="workspace-task-status" className="sr-only">{active ? `${active} 项进行中` : "暂无任务进行中"}{needsAttention ? "，有任务需要处理" : ""}</span>
     </button>
     <dialog aria-labelledby="task-center-title" ref={dialog} onClose={() => setOpen(false)} className="task-center m-auto w-[min(1080px,calc(100%-32px))] max-h-[88vh] overflow-y-auto rounded-2xl border border-surface-secondary bg-bg-primary p-0 text-text-primary shadow-2xl backdrop:bg-black/45">
       <header className="ui-toolbar sticky top-0 z-10 justify-between border-b border-surface-secondary bg-bg-secondary px-[var(--workspace-inline)] py-[var(--ui-gap)]">

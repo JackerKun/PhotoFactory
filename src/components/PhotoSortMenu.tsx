@@ -32,8 +32,10 @@ export default React.memo(function PhotoSortMenu() {
 
   return (
     <div ref={ref} className="photo-toolbar-anchor relative">
-      <button type="button" onClick={() => setOpen((value) => !value)} className="ui-button" title="排序" aria-expanded={open}>
-        <Icon name="sort" size={14} />{labels[sortBy]} · {direction === "asc" ? "升序" : "降序"}
+      <button type="button" onClick={() => setOpen((value) => !value)} className="ui-button ui-icon-button"
+        aria-label={`排序：${labels[sortBy]} · ${direction === "asc" ? "升序" : "降序"}`}
+        title={`排序：${labels[sortBy]} · ${direction === "asc" ? "升序" : "降序"}`} aria-expanded={open}>
+        <Icon name="sort" size={16} />
       </button>
       {open && (
         <div className="photo-toolbar-popover absolute right-0 top-full z-50 mt-2 w-48 rounded-xl border border-surface-secondary bg-bg-secondary p-1.5 shadow-2xl">

@@ -40,6 +40,7 @@ vi.mock("../api/tauri", () => ({
   getPersonAvatarChoices: vi.fn(),
   savePersonProfile: vi.fn(async () => undefined),
   ignoreFaceClusters: vi.fn(async () => "已取消识别。"),
+  confirmFaceClusters: vi.fn(async (ids: number[]) => ids.length),
   rebuildFaceClusters: vi.fn(async () => "已整理。"),
   prepareFaceAiReanalysis: vi.fn(async () => "已准备。"),
   triggerAutoAi: vi.fn(async () => "已启动。"),
@@ -52,7 +53,8 @@ it("loads more avatar choices and saves the selected face for a named person", a
     .mockResolvedValueOnce({ items: [{ face_id: 10, filename: "原头像.jpg" }], selected_face_id: 10, next_after: 10 })
     .mockResolvedValueOnce({ items: [{ face_id: 12, filename: "新头像.jpg" }], selected_face_id: 10, next_after: null });
   render(<MemoryRouter><FaceView /></MemoryRouter>);
-  fireEvent.click(await screen.findByRole("button", { name: "编辑" }));
+  fireEvent.click(await screen.findByRole("button", { name: "小张操作" }));
+  fireEvent.click(screen.getByRole("button", { name: "编辑人物" }));
   const dialog = within(screen.getByRole("dialog", { name: "编辑人物" }));
   expect(await dialog.findByRole("button", { name: /原头像.jpg/, pressed: true })).toBeInTheDocument();
   fireEvent.click(dialog.getByRole("button", { name: "加载更多头像" }));
@@ -61,6 +63,26 @@ it("loads more avatar choices and saves the selected face for a named person", a
   fireEvent.click(dialog.getByRole("button", { name: "保存" }));
   expect(await screen.findByText("已更新人物头像。")).toBeInTheDocument();
   expect(api.savePersonProfile).toHaveBeenCalledWith(1, "小张", 12);
+});
+
+it("reveals review actions after a selection and confirms a Shift range from the bottom bar", async () => {
+  const items = [1, 2, 3, 4].map((id) => ({
+    id, face_count: 1, photo_count: 1, confidence: "low" as const, created_at: 0,
+  }));
+  vi.mocked(api.getClusterPage).mockResolvedValueOnce({ items, total: 4, named_count: 0, unnamed_count: 4, review_count: 4 });
+  render(<MemoryRouter initialEntries={["/faces?tab=review"]}><FaceView /></MemoryRouter>);
+  await screen.findByRole("button", { name: "打开人物 1" });
+  const dock = { name: "人物选区操作" };
+  expect(screen.queryByRole("group", dock)).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "选择", exact: true }));
+  expect(screen.queryByRole("group", dock)).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "选择人物 1" }));
+  fireEvent.click(screen.getByRole("button", { name: "选择人物 3" }), { shiftKey: true });
+  const selection = within(screen.getByRole("group", dock));
+  expect(selection.getByRole("status")).toHaveTextContent("已选 3 人");
+  fireEvent.click(selection.getByRole("button", { name: "批量确认" }));
+  expect(await screen.findByText(/已确认 3 个独立人物/)).toBeInTheDocument();
+  expect(api.confirmFaceClusters).toHaveBeenCalledWith([1, 2, 3]);
 });
 
 it("asks for explicit confirmation for both advanced maintenance actions", async () => {
@@ -96,7 +118,7 @@ it("orders and expands candidates, keeps selections across pages, and clamps aft
     ],
   });
   render(<MemoryRouter initialEntries={["/faces?tab=unnamed"]}><FaceView /></MemoryRouter>);
-  fireEvent.click(screen.getByRole("button", { name: "自动合并相似人物…" }));
+  fireEvent.click(screen.getByRole("button", { name: "查找相似" }));
   const dialog = within(screen.getByRole("dialog", { name: "自动合并相似人物" }));
   fireEvent.click(dialog.getByRole("button", { name: "查找合并候选" }));
 

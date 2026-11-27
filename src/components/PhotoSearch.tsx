@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import * as api from "../api/tauri";
 import { useStore } from "../hooks/usePhotos";
 import type { ManualTag, PhotoFilterOptions, PhotoTimelineBucket } from "../types";
+import Icon from "./Icon";
 
 export default React.memo(function PhotoSearch() {
   const filter = useStore((state) => state.filter);
@@ -46,10 +47,11 @@ export default React.memo(function PhotoSearch() {
 
   return (
     <div ref={rootRef} className="relative min-w-[min(100%,13rem)] flex-1">
-      <form onSubmit={submit} className="ui-search">
-        <input value={value} onChange={(event) => { setValue(event.target.value); setOpen(true); }} onFocus={() => setOpen(true)} placeholder="搜索文件名、日期、人物、标签、EXIF…" aria-label="搜索照片" className="ui-input flex-1" />
-        {(value || filter.keyword) && <button type="button" onClick={() => { setValue(""); setFilter({ keyword: undefined }); }} className="ui-button ui-icon-button text-text-muted" aria-label="清除搜索" title="清除搜索">×</button>}
-        <button type="submit" className="ui-button-primary">搜索</button>
+      <form role="search" onSubmit={submit} className="ui-search workspace-search"
+        onKeyDown={(event) => { if (event.key === "Escape") setOpen(false); }}>
+        <button type="submit" className="ui-button ui-icon-button" aria-label="搜索" title="搜索"><Icon name="search" size={16} /></button>
+        <input value={value} onChange={(event) => { setValue(event.target.value); setOpen(true); }} onFocus={() => setOpen(true)} placeholder="文件名、日期、人物、标签、EXIF…" aria-label="搜索照片" className="ui-input flex-1" />
+        {(value || filter.keyword) && <button type="button" onClick={() => { setValue(""); setFilter({ keyword: undefined }); }} className="ui-button ui-icon-button text-text-muted" aria-label="清除搜索" title="清除搜索"><Icon name="close" size={15} /></button>}
       </form>
       {open && (
         <div className="absolute left-0 right-0 top-full z-50 mt-2 max-h-[420px] overflow-y-auto rounded-2xl border border-surface-secondary bg-bg-secondary p-2 shadow-2xl">

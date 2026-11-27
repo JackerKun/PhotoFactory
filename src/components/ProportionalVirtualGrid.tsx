@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { photoFilterKey, useStore } from "../hooks/usePhotos";
+import { calculateColumnCount } from "../hooks/useVirtualGrid";
 import type { Photo } from "../types";
 import PhotoCard from "./PhotoCard";
 import { matchesTimeline, type TimelineJump } from "../utils/photoTimeline";
@@ -11,6 +12,7 @@ interface Props {
   onSelectPhoto: (id: number) => void;
   onDoubleClickPhoto?: (id: number) => void;
   selectedPhotoId?: number | null;
+  onColumnCountChange?: (count: number) => void;
   timelineJump: TimelineJump | null;
   onTimelineJumpComplete: (requestId: number) => void;
   onVisiblePhotoChange: (photo: Photo | null) => void;
@@ -74,6 +76,7 @@ export default React.memo(function ProportionalVirtualGrid({
   onSelectPhoto,
   onDoubleClickPhoto,
   selectedPhotoId,
+  onColumnCountChange,
   timelineJump,
   onTimelineJumpComplete,
   onVisiblePhotoChange,
@@ -110,6 +113,8 @@ export default React.memo(function ProportionalVirtualGrid({
   }, []);
 
   const contentWidth = Math.max(1, width - 16);
+  const keyboardColumns = calculateColumnCount(contentWidth, thumbnailSize, GAP);
+  useEffect(() => onColumnCountChange?.(keyboardColumns), [keyboardColumns, onColumnCountChange]);
   const targetHeight = Math.min(320, Math.max(90, thumbnailSize));
   const rows = useMemo(
     () => buildJustifiedRows(photos, contentWidth, targetHeight),

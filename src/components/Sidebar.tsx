@@ -13,8 +13,8 @@ interface Props { viewMode: ViewMode; onViewModeChange: (mode: ViewMode) => void
 
 const navItems = [
   { mode: "grid" as ViewMode, icon: "photos", label: "照片" },
-  { mode: "map" as ViewMode, icon: "map", label: "地图" },
   { mode: "faces" as ViewMode, icon: "people", label: "人物" },
+  { mode: "map" as ViewMode, icon: "map", label: "地图" },
   { mode: "tags" as ViewMode, icon: "tags", label: "标签" },
   { mode: "albums" as ViewMode, icon: "albums", label: "相册" },
   { mode: "library" as ViewMode, icon: "tools", label: "智能工具" },
@@ -26,6 +26,7 @@ export default React.memo(function Sidebar({ viewMode, onViewModeChange, project
   const { setProject, reset } = useStore();
   const [showFormatPanel, setShowFormatPanel] = useState(false);
   const [showDropdown, setShowDropdown] = useState(false);
+  const [narrowExpanded, setNarrowExpanded] = useState(false);
   const [renameRoot, setRenameRoot] = useState<string>();
   const [projectName, setProjectName] = useState("");
   const [renameError, setRenameError] = useState("");
@@ -130,25 +131,28 @@ export default React.memo(function Sidebar({ viewMode, onViewModeChange, project
   }, []);
 
   return (
-    <aside className="mac-sidebar flex-none bg-bg-secondary border-r border-surface-secondary flex flex-col overflow-hidden" style={{ width }}>
+    <aside className="mac-sidebar workspace-sidebar flex-none border-r flex flex-col"
+      data-narrow-expanded={narrowExpanded} style={{ "--workspace-sidebar-width": `${width}px` } as React.CSSProperties}>
       {project && (
-        <div className="border-b border-surface-secondary px-4 py-3">
-          <div className="flex items-center justify-between">
+        <div className="workspace-project">
+          <div className="flex min-w-0 items-center justify-between gap-1">
             <button type="button" onClick={openProjectRename}
-              className="mr-2 min-w-0 truncate rounded text-left text-sm font-medium text-text-primary hover:text-accent-link focus-visible:outline focus-visible:outline-accent-primary"
+              className="workspace-project-name"
               title={`重命名项目 · ${project.name}`} aria-label={`重命名项目：${project.name}`}>
-              {project.name}
+              <span className="workspace-project-mark"><Icon name="photos" size={18} /></span>
+              <span className="min-w-0 truncate">{project.name}</span>
             </button>
-            <div className="relative">
+            <div>
               <button type="button" onClick={() => setShowDropdown(!showDropdown)}
-                className="flex h-8 w-8 items-center justify-center rounded-lg text-text-muted hover:bg-surface-primary hover:text-text-primary"
+                className="workspace-project-toggle ui-button ui-icon-button"
                 title="照片库操作" aria-label="照片库操作" aria-expanded={showDropdown}>
-                ⋮
+                <Icon name="chevronDown" size={16} className="workspace-project-chevron" />
+                <Icon name="photos" size={18} className="workspace-rail-mark" />
               </button>
               {showDropdown && (
                 <>
                   <div className="fixed inset-0 z-10" onClick={() => setShowDropdown(false)} />
-                  <div className="absolute right-0 top-full mt-1 bg-bg-secondary border border-surface-secondary rounded-lg shadow-lg z-20 min-w-[160px]">
+                  <div className="absolute left-2 top-full mt-1 bg-bg-secondary border border-surface-secondary rounded-lg shadow-lg z-50 min-w-[160px]">
                     <button type="button" onClick={openProjectRename}
                       className="w-full text-left px-3 py-2 text-sm text-text-primary hover:bg-surface-primary first:rounded-t-lg">
                       重命名项目
@@ -176,28 +180,36 @@ export default React.memo(function Sidebar({ viewMode, onViewModeChange, project
           </div>
         </div>
       )}
-      <nav className="p-2">
+      <nav aria-label="工作区" className="workspace-nav">
         {navItems.map((item) => (
           <button key={item.mode} onClick={() => onViewModeChange(item.mode)}
-            className={`sidebar-nav-button w-full flex items-center gap-2 px-3 rounded-lg text-sm transition-colors ${
-              viewMode === item.mode ? "bg-accent-primary text-white" : "text-text-secondary hover:bg-surface-primary"
-            }`}>
+            aria-current={viewMode === item.mode ? "page" : undefined}
+            aria-label={item.label} title={item.label}
+            className="sidebar-nav-button w-full flex items-center gap-2 px-3 rounded-lg text-sm">
             <Icon name={item.icon as IconName} /><span>{item.label}</span>
           </button>
         ))}
       </nav>
-
-      <TaskCenter />
+      <button type="button" className="workspace-rail-toggle sidebar-nav-button"
+        aria-expanded={narrowExpanded} onClick={() => setNarrowExpanded(!narrowExpanded)}
+        title={narrowExpanded ? "收起侧栏" : "展开侧栏查看文件夹和主题"}
+        aria-label={narrowExpanded ? "收起侧栏" : "展开侧栏查看文件夹和主题"}>
+        <Icon name="sidebar" size={18} />
+        <span>收起侧栏</span>
+      </button>
 
       {viewMode === "grid" && project && (
-        <div className="flex-1 overflow-hidden border-t border-surface-secondary">
+        <div className="workspace-folder-tree flex-1 overflow-hidden border-t border-surface-secondary">
           <DirectoryTree key={project.root_path} rootPath={project.root_path} />
         </div>
       )}
 
       <div className="mt-auto">
-        <AppUpdateActions />
-        <ThemeSwitcher />
+        <TaskCenter />
+        <div className="workspace-sidebar-settings">
+          <AppUpdateActions />
+          <ThemeSwitcher />
+        </div>
       </div>
 
       {renameRoot && <dialog ref={renameDialog} aria-labelledby="rename-project-title"

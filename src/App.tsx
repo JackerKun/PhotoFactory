@@ -117,7 +117,7 @@ function AppLayout({ children, viewMode }: { children: React.ReactNode; viewMode
   const [showImport, setShowImport] = useState(!project);
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     const stored = Number(localStorage.getItem("photofactory.sidebarWidth"));
-    return Number.isFinite(stored) && stored >= 220 && stored <= 480 ? stored : 256;
+    return Number.isFinite(stored) && stored >= 212 && stored <= 480 ? stored : 212;
   });
   const [detailWidth, setDetailWidth] = useState(() => {
     const stored = Number(localStorage.getItem("photofactory.detailWidth"));
@@ -128,7 +128,7 @@ function AppLayout({ children, viewMode }: { children: React.ReactNode; viewMode
     event.preventDefault();
     const startX = event.clientX;
     const startWidth = panel === "sidebar" ? sidebarWidth : detailWidth;
-    const min = panel === "sidebar" ? 220 : 320;
+    const min = panel === "sidebar" ? 212 : 320;
     const max = panel === "sidebar" ? 480 : Math.max(320, Math.min(720, window.innerWidth - sidebarWidth - 280));
     const oldCursor = document.body.style.cursor;
     const oldSelection = document.body.style.userSelect;
@@ -350,7 +350,8 @@ function gridLightboxSource(): LightboxSource {
 }
 
 function GridPage({ active }: { active: boolean }) {
-  const { photos, thumbnailSize, lightboxPhotoId, selectedPhotoId, setSelectedPhotoId } = useStore();
+  const { photos, lightboxPhotoId, selectedPhotoId, setSelectedPhotoId } = useStore();
+  const [columnCount, setColumnCount] = useState(1);
   const project = useStore((s) => s.project);
   const gpsEditorOpen = useStore((s) => s.gpsBatchSession !== null);
   const openLightbox = useStore((s) => s.openLightbox);
@@ -361,10 +362,6 @@ function GridPage({ active }: { active: boolean }) {
   }, [setSelectedPhotoId]);
 
   const photoIds = useMemo(() => photos.map((p) => p.id!).filter(Boolean), [photos]);
-  const columnCount = useMemo(() => {
-    const mainWidth = window.innerWidth - 256 - (selectedPhotoId ? 384 : 0);
-    return Math.max(1, Math.floor((mainWidth + 8) / (thumbnailSize + 8)));
-  }, [selectedPhotoId, thumbnailSize]);
 
   const handleOpenPhoto = useCallback((id: number) => {
     setSelectedPhotoId(null);
@@ -398,6 +395,7 @@ function GridPage({ active }: { active: boolean }) {
       onSelectPhoto={handleSelectPhoto}
       onDoubleClickPhoto={handleOpenPhoto}
       selectedPhotoId={selectedPhotoId}
+      onColumnCountChange={setColumnCount}
     />
   );
 }

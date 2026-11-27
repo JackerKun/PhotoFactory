@@ -176,9 +176,9 @@ export default React.memo(function PhotoCard({ photo, onClick, onDoubleClick, si
   return (
     <div
       ref={ref}
-      className={`relative overflow-hidden bg-surface-primary cursor-pointer transition-all ${
+      className={`relative overflow-hidden rounded-lg bg-surface-primary cursor-pointer ${
         ratingSelected
-          ? "ring-4 ring-yellow-400"
+          ? "ring-2 ring-accent-primary"
           : isSelected
           ? "ring-2 ring-accent-primary"
           : "hover:ring-2 hover:ring-accent-primary"
@@ -224,7 +224,7 @@ export default React.memo(function PhotoCard({ photo, onClick, onDoubleClick, si
       )}
       {displayUrl && !imageReady && <span className="absolute left-2 top-2 rounded bg-black/60 px-2 py-1 text-xs text-white" role="status">正在加载图片…</span>}
       {ratingSelectionMode && (
-        <div className={`absolute left-1 top-1 flex h-5 w-5 items-center justify-center rounded-full border-2 text-xs shadow ${ratingSelected ? "border-yellow-400 bg-yellow-400 text-black" : "border-white bg-black/35 text-transparent"}`}>✓</div>
+        <div aria-hidden="true" className={`workspace-check ${ratingSelected ? "workspace-check-selected" : ""}`}>{ratingSelected ? "✓" : ""}</div>
       )}
       {photo.is_favorite && (
         <div className="absolute top-1 right-1 text-red-400 text-sm drop-shadow" style={{ textShadow: "0 1px 2px rgba(0,0,0,0.5)" }} title="收藏">
@@ -236,7 +236,7 @@ export default React.memo(function PhotoCard({ photo, onClick, onDoubleClick, si
           ★ {photo.rating}
         </div>
       )}
-      {showFilename && <div className="absolute bottom-0 left-0 right-0 bg-black/60 px-1 py-0.5">
+      {showFilename && <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent px-2 pb-1 pt-3">
         <p className="text-white text-xs truncate">{photo.filename}</p>
       </div>}
 

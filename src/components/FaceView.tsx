@@ -7,6 +7,7 @@ import { useStore } from "../hooks/usePhotos";
 import GroupPhotosView from "./GroupPhotosView";
 import FaceClusteringStatus, { isGroupingFaces } from "./FaceClusteringStatus";
 import Icon from "./Icon";
+import ContextMenu, { type MenuItem } from "./ContextMenu";
 
 interface Props { active?: boolean }
 
@@ -430,6 +431,7 @@ export default React.memo(function FaceView({ active = true }: Props) {
   const [unnamedQueryError, setUnnamedQueryError] = useState("");
   const clusterIdFilter = activeTab === "unnamed" ? unnamedId : undefined;
   const peopleResults = useRef<HTMLDivElement>(null);
+  const [personMenu, setPersonMenu] = useState<{ cluster: FaceCluster; trigger: HTMLButtonElement }>();
   const [tabCounts, setTabCounts] = useState({ named: 0, unnamed: 0, review: 0 });
   const [mergeTargetClusters, setMergeTargetClusters] = useState<FaceCluster[]>([]);
 
@@ -971,7 +973,7 @@ export default React.memo(function FaceView({ active = true }: Props) {
   const toggleMergeSelection = (clusterId: number, extend = false) => {
     if (confirmingReview || mergeSaving) return;
     const anchor = reviewSelectionAnchor.current;
-    if (activeTab === "review" && extend && anchor != null) {
+    if (extend && anchor != null) {
       const start = clusters.findIndex((cluster) => cluster.id === anchor);
       const end = clusters.findIndex((cluster) => cluster.id === clusterId);
       if (start >= 0 && end >= 0) {
@@ -1045,19 +1047,19 @@ export default React.memo(function FaceView({ active = true }: Props) {
     <div className="h-full flex flex-col">
       {/* Header */}
       <div className="people-header">
-        <div className="mb-3 flex items-start justify-between gap-2">
-          <div>
-            <h2 className="text-xl font-semibold tracking-tight">人物</h2>
-            <p className="text-sm text-text-muted mt-1">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="workspace-title">
+            <h1>人物</h1>
+            <p className="workspace-count">
               {faceCount > 0
-                ? `${faceCount} 张人脸${tabCounts.named + tabCounts.unnamed > 0 ? ` · ${tabCounts.named + tabCounts.unnamed} 个人物` : ""}${unassignedCount > 0 ? ` · ${unassignedCount} 张待整理` : ""}`
+                ? `${tabCounts.named + tabCounts.unnamed > 0 ? `${tabCounts.named + tabCounts.unnamed} 个人物 · ` : ""}${faceCount} 张人脸${unassignedCount > 0 ? ` · ${unassignedCount} 张待整理` : ""}`
                 : "PhotoFactory 会在后台自动发现并整理人物"}
             </p>
           </div>
-          <div className="flex items-center gap-2">
-            <div className="flex items-center gap-1.5 whitespace-nowrap text-xs text-text-secondary">
-              <span className={`h-1.5 w-1.5 rounded-full ${workerHealthy ? "bg-emerald-500" : "bg-text-muted"}`} />
-              {workerHealthy ? "智能分析服务已就绪" : "智能分析准备中"}
+          <div className="ml-auto flex items-center gap-2">
+            <div role="status" className="people-service-status" title={workerHealthy ? "智能分析服务已就绪" : "智能分析准备中"}>
+              <span className={`h-2 w-2 rounded-full ${workerHealthy ? "bg-emerald-600 dark:bg-emerald-400" : "bg-text-muted"}`} />
+              <span className="sr-only">{workerHealthy ? "智能分析服务已就绪" : "智能分析准备中"}</span>
             </div>
             <details ref={faceActions} className="relative" onKeyDown={(event) => {
               if (event.key === "Escape" && event.currentTarget.open) {
@@ -1066,7 +1068,7 @@ export default React.memo(function FaceView({ active = true }: Props) {
               }
             }}>
               <summary ref={faceActionsTrigger} aria-label="人物操作" title="人物操作"
-                className="flex h-8 w-8 cursor-pointer list-none items-center justify-center rounded-md border border-surface-secondary bg-bg-secondary text-base text-text-secondary hover:bg-surface-primary">•••</summary>
+                className="ui-button ui-icon-button list-none"><Icon name="more" size={16} /></summary>
               <div className="absolute right-0 z-20 mt-2 max-h-[70vh] w-72 max-w-[calc(100vw-2rem)] divide-y divide-surface-secondary overflow-y-auto rounded-xl border border-surface-secondary bg-bg-secondary px-1.5 text-sm shadow-xl">
                 <div role="group" aria-label="分析与分组" className="py-1.5">
                   <p className={faceActionHeadingClass}>分析与分组</p>
@@ -1112,12 +1114,15 @@ export default React.memo(function FaceView({ active = true }: Props) {
         {operationMessage && (
           <div className="mb-4 flex items-center justify-between rounded-xl bg-bg-secondary/70 border border-text-primary/5 px-4 py-2.5 text-sm text-text-secondary">
             <span>{operationMessage}</span>
-            <button onClick={() => setOperationMessage(null)} className="text-text-muted hover:text-text-primary">关闭</button>
+            <button type="button" onClick={() => setOperationMessage(null)} aria-label="关闭提示" title="关闭提示"
+              className="ui-button ui-icon-button"><Icon name="close" size={15} /></button>
           </div>
         )}
 
-        {/* Tabs */}
-        <nav aria-label="人物视图" className="ui-segments max-w-full overflow-x-auto">
+      </div>
+
+      <div className="people-toolbar">
+        <nav aria-label="人物视图" className="people-tabs">
           {(["named", "unnamed", "review"] as TabKey[]).map((tab) => (
             <button
               key={tab}
@@ -1145,22 +1150,8 @@ export default React.memo(function FaceView({ active = true }: Props) {
           ))}
           <button type="button" aria-pressed={groupPhotosOpen} onClick={() => setGroupTab("active")} className="ui-segment">合影</button>
         </nav>
-      </div>
-
-      {groupTab !== "unopened" && <div className={groupPhotosOpen ? "flex min-h-0 flex-1 flex-col" : "hidden"}><GroupPhotosView key={projectRoot} /></div>}
-      <div className={groupPhotosOpen ? "hidden" : "flex min-h-0 flex-1 flex-col"}>
-
-        {/* Toolbar */}
-        <div className="people-toolbar flex flex-wrap items-center gap-2">
-          {activeTab === "named" && !mergeMode && (
-            <button
-              onClick={() => startMergeMode("named")}
-              className="ui-button-primary"
-            >
-              选择已命名人物合并
-            </button>
-          )}
-          {activeTab === "unnamed" && <form className="flex flex-wrap items-center gap-2" onSubmit={(event) => {
+        {!groupPhotosOpen && <div className="ui-toolbar people-actions">
+          {activeTab === "unnamed" && <form role="search" className="ui-search workspace-search people-search" onSubmit={(event) => {
             event.preventDefault();
             const value = unnamedQuery.trim().replace(/^(?:人物\s*)?#?\s*/, "");
             const id = Number(value);
@@ -1178,12 +1169,12 @@ export default React.memo(function FaceView({ active = true }: Props) {
             setUnnamedId(next);
             peopleResults.current?.scrollTo({ top: 0 });
           }}>
-            <input type="search" aria-label="检索未命名人物" placeholder="人物编号，如 491"
+            <button type="submit" className="ui-button ui-icon-button" aria-label="检索" title="检索人物编号"><Icon name="search" size={16} /></button>
+            <input type="search" aria-label="检索未命名人物" aria-invalid={!!unnamedQueryError} aria-describedby={unnamedQueryError ? "unnamed-search-error" : undefined} placeholder="搜索人物编号"
               value={unnamedQuery} maxLength={32}
               onChange={(event) => { setUnnamedQuery(event.target.value); setUnnamedQueryError(""); }}
-              className="ui-input w-40" />
-            <button type="submit" className="ui-button">检索</button>
-            {unnamedId != null && <button type="button" className="ui-button" onClick={() => {
+              className="ui-input flex-1" />
+            {unnamedId != null && <button type="button" className="ui-button ui-icon-button" aria-label="清除检索" title="清除检索" onClick={() => {
               pageRequest.current++;
               loadedClusters.current.count = 0;
               setClusters([]);
@@ -1192,81 +1183,39 @@ export default React.memo(function FaceView({ active = true }: Props) {
               setUnnamedQuery("");
               setUnnamedId(undefined);
               peopleResults.current?.scrollTo({ top: 0 });
-            }}>清除检索</button>}
-            {unnamedQueryError && <span role="alert" className="text-xs text-red-600">{unnamedQueryError}</span>}
+            }}><Icon name="close" size={15} /></button>}
           </form>}
+          <button type="button" className="ui-button" aria-pressed={mergeMode}
+            title="按住 Shift 点击可连续选择" disabled={confirmingReview || mergeSaving}
+            onClick={() => {
+              if (mergeMode) {
+                reviewSelectionAnchor.current = undefined;
+                setMergeMode(false);
+                setMergeSelected(new Set());
+              } else startMergeMode(activeTab);
+            }}>
+            <Icon name="select" size={16} />{mergeMode ? "退出选择" : "选择"}
+          </button>
           {activeTab === "unnamed" && !mergeMode && (
-            <>
-              <button
-                onClick={openAutoMerge}
-                className="ui-button-primary"
-              >
-                自动合并相似人物…
-              </button>
-              <button
-                onClick={() => startMergeMode("unnamed")}
-                className="ui-button"
-              >
-                手动选择合并
-              </button>
-            </>
-          )}
-          {mergeMode && (
-            <>
-              <button
-                onClick={() => { void openMergeConfirmation(); }}
-                disabled={mergeSelected.size < 1 || confirmingReview}
-                className="bg-accent-primary text-white px-4 py-1.5 rounded-lg text-sm disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
-              >
-                合并为一个人物 ({mergeSelected.size})
-              </button>
-              {activeTab === "review" && (
-                <button type="button" className="ui-button-primary" onClick={() => void handleConfirmSelected()}
-                  disabled={!mergeSelected.size || confirmingReview || mergeSaving}>
-                  {confirmingReview ? "正在确认…" : `批量确认（${mergeSelected.size}）`}
-                </button>
-              )}
-              {(activeTab === "unnamed" || activeTab === "review") && (
-                <button
-                  onClick={() => void handleCancelRecognition(Array.from(mergeSelected))}
-                  disabled={mergeSelected.size < 1 || mergeSaving || confirmingReview}
-                  className="bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300 px-4 py-1.5 rounded-lg text-sm disabled:opacity-50 disabled:cursor-not-allowed border border-red-100"
-                >
-                  取消识别所选 ({mergeSelected.size})
-                </button>
-              )}
-            </>
-          )}
-          {activeTab === "review" && !mergeMode && (
-            <>
-              <button onClick={() => startMergeMode("review")} className="ui-button">批量选择</button>
-              <span className="text-xs text-text-muted">可批量确认独立人物，或把同一人的分组合并。</span>
-            </>
-          )}
-          {mergeMode && mergeSelected.size > 0 && (
-            <span className="text-xs text-text-muted">
-              {mergeSelected.size} {"\u4e2a\u65cf\u7fa4\u5df2\u9009\u4e2d"}
-            </span>
-          )}
-          {mergeMode && activeTab === "review" && <span className="text-xs text-text-muted">按住 Shift 点击可连续选择</span>}
-          {mergeMode && (
-            <button disabled={confirmingReview} onClick={() => { setMergeMode(false); setMergeSelected(new Set()); }} className="px-3 py-1.5 rounded-lg text-sm text-text-secondary hover:bg-text-primary/5">
-              取消
+            <button type="button" onClick={openAutoMerge} className="ui-button-primary" title="自动合并相似人物">
+              <Icon name="compare" size={16} />查找相似
             </button>
           )}
-        </div>
-      <div className="people-results" ref={peopleResults}>
+        </div>}
+      </div>
+      {!groupPhotosOpen && activeTab === "unnamed" && unnamedQueryError &&
+        <p id="unnamed-search-error" role="alert" className="workspace-selection-error">{unnamedQueryError}</p>}
+
+      {groupTab !== "unopened" && <div className={groupPhotosOpen ? "flex min-h-0 flex-1 flex-col" : "hidden"}><GroupPhotosView key={projectRoot} /></div>}
+      <div className={groupPhotosOpen ? "hidden" : "flex min-h-0 flex-1 flex-col"}>
+      <div className="people-results" ref={peopleResults} onScroll={personMenu ? () => setPersonMenu(undefined) : undefined}>
         {clusterIdFilter != null && !pageLoading && !visibleClusters.length &&
           <p className="px-4 py-6 text-sm text-text-muted">未找到未命名人物 {clusterIdFilter}。</p>}
         <div className="people-grid">
           {visibleClusters.map((cluster) => (
             <div
               key={cluster.id}
-              className={`people-card group cursor-pointer rounded-xl border transition-colors ${
-                mergeMode && mergeSelected.has(cluster.id!)
-                  ? "border-accent-primary bg-accent-primary/15"
-                  : "border-surface-secondary/70 bg-bg-secondary hover:border-accent-primary/40"
-              }`}
+              className="people-card group cursor-pointer"
               onClick={(event) => {
                 if (mergeMode) {
                   toggleMergeSelection(cluster.id!, event.shiftKey);
@@ -1281,73 +1230,42 @@ export default React.memo(function FaceView({ active = true }: Props) {
                 }
               }}
             >
-              <div className="w-full aspect-square overflow-hidden rounded-lg bg-surface-secondary relative">
+              <button type="button" className="people-portrait"
+                aria-label={`${mergeMode ? "选择" : "打开"}${cluster.name || `人物 ${cluster.id}`}`}
+                aria-pressed={mergeMode ? mergeSelected.has(cluster.id!) : undefined}
+                disabled={mergeMode && (confirmingReview || mergeSaving)}>
                 <FaceThumb clusterId={cluster.id!}
                   scope={profileAvatarRevisions.has(cluster.id!) ? `${avatarScope}:${profileAvatarRevisions.get(cluster.id!)}` : avatarScope}
                   scrollRoot={peopleResults}
                   usePersonAvatar={!!cluster.name?.trim()}
                   active={active && !groupPhotosOpen && !autoMergeOpen && !suspectedOpen && !editingPerson} />
-                {mergeMode && activeTab === "review" && (
-                  <input type="checkbox" className="absolute top-2 right-2 h-5 w-5 accent-accent-primary"
-                    aria-label={`选择${cluster.name || `人物 ${cluster.id}`}`}
-                    checked={mergeSelected.has(cluster.id!)} disabled={confirmingReview || mergeSaving}
-                    onClick={(event) => event.stopPropagation()}
-                    onChange={(event) => toggleMergeSelection(cluster.id!, (event.nativeEvent as MouseEvent).shiftKey)} />
-                )}
-                {mergeMode && activeTab !== "review" && (
-                  <span className={`absolute top-2 right-2 w-6 h-6 rounded-full border-2 flex items-center justify-center text-xs font-bold shadow-sm ${
-                    mergeSelected.has(cluster.id!) ? "bg-accent-primary border-white text-white" : "bg-bg-secondary/90 border-white text-transparent"
-                  }`}>
-                    ✓
+                {mergeMode && (
+                  <span aria-hidden="true" className={`workspace-check ${mergeSelected.has(cluster.id!) ? "workspace-check-selected" : ""}`}>
+                    {mergeSelected.has(cluster.id!) ? "✓" : ""}
                   </span>
                 )}
-              </div>
-              <div className="mt-1.5 flex items-center justify-between gap-1 px-1">
-                <span className="min-w-0 truncate text-sm font-medium text-text-primary" title={cluster.name || undefined}>
-                  {cluster.name || `人物 ${cluster.id}`}
-                </span>
+              </button>
+              <div className="people-card-meta">
+                <div className="min-w-0">
+                  <span className="block truncate text-sm font-semibold" title={cluster.name || undefined}>
+                    {cluster.name || `人物 ${cluster.id}`}
+                  </span>
+                  <p className="truncate text-xs text-text-muted" title={`${cluster.photo_count} 张照片 · ${cluster.face_count} 张人脸`}>
+                    {cluster.photo_count} 张照片{cluster.photo_count !== cluster.face_count ? ` · ${cluster.face_count} 张人脸` : ""}
+                  </p>
+                </div>
                 {!mergeMode && (
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setEditingPerson(cluster);
-                    }}
-                    className="shrink-0 whitespace-nowrap text-xs text-text-muted opacity-0 hover:text-text-primary focus-visible:opacity-100 group-hover:opacity-100"
-                  >
-                    编辑
+                  <button type="button" className="ui-button ui-icon-button people-card-menu"
+                    aria-label={`${cluster.name || `人物 ${cluster.id}`}操作`} title="人物分组操作"
+                    aria-expanded={personMenu?.cluster.id === cluster.id}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setPersonMenu({ cluster, trigger: event.currentTarget });
+                    }}>
+                    <Icon name="more" size={16} />
                   </button>
                 )}
               </div>
-              <p className="truncate px-1 text-xs text-text-muted" title={`${cluster.photo_count} 张照片 · ${cluster.face_count} 张人脸`}>
-                照片 {cluster.photo_count} · 人脸 {cluster.face_count}
-              </p>
-              {activeTab === "review" && !mergeMode && (
-                <div className={`mt-2 grid gap-1 px-1 pb-1 ${cluster.name?.trim() ? "grid-cols-3" : "grid-cols-2"}`}>
-                  <button
-                    type="button"
-                    onClick={(event) => { event.stopPropagation(); void handleConfirmCluster(cluster.id!); }}
-                    className="rounded-lg bg-emerald-50 dark:bg-emerald-950/40 px-1 py-1.5 text-xs font-medium text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100"
-                    title="确认这是一个独立人物"
-                  >确认</button>
-                  <button
-                    type="button"
-                    onClick={(event) => { event.stopPropagation(); setEditingPerson(cluster); }}
-                    className="rounded-lg bg-black/[0.045] px-1 py-1.5 text-xs text-text-secondary hover:bg-text-primary/[0.08]"
-                  >命名</button>
-                  <button
-                    type="button"
-                    onClick={(event) => { event.stopPropagation(); startMergeMode("review", cluster.id!); }}
-                    className="rounded-lg bg-orange-50 dark:bg-orange-950/40 px-1 py-1.5 text-xs text-orange-700 dark:text-orange-300 hover:bg-orange-100"
-                  >合并</button>
-                  {!cluster.name?.trim() && <button type="button" disabled={mergeSaving}
-                    className="rounded-lg px-1 py-1.5 text-xs text-red-700 hover:bg-surface-primary dark:text-red-300"
-                    onClick={(event) => { event.stopPropagation(); void handleCancelRecognition([cluster.id!]); }}>取消识别</button>}
-                </div>
-              )}
-              {activeTab === "unnamed" && !mergeMode && <button type="button" disabled={mergeSaving}
-                className="mt-1 rounded px-1 py-1 text-xs text-text-muted hover:bg-surface-primary hover:text-red-700"
-                onClick={(event) => { event.stopPropagation(); void handleCancelRecognition([cluster.id!]); }}>取消识别</button>}
             </div>
           ))}
         </div>
@@ -1386,7 +1304,50 @@ export default React.memo(function FaceView({ active = true }: Props) {
         )}
       </div>
 
+      {mergeMode && mergeSelected.size > 0 && (
+        <div className="workspace-selection-dock">
+          <div className="workspace-selection-bar" role="group" aria-label="人物选区操作">
+            <strong role="status">已选 {mergeSelected.size} 人</strong>
+            {activeTab === "review" && (
+              <button type="button" className="ui-button-primary" onClick={() => void handleConfirmSelected()}
+                disabled={confirmingReview || mergeSaving}>{confirmingReview ? "正在确认…" : "批量确认"}</button>
+            )}
+            <button type="button" className={activeTab === "review" ? "ui-button" : "ui-button-primary"}
+              onClick={() => void openMergeConfirmation()} disabled={confirmingReview || mergeSaving}>合并所选</button>
+            {(activeTab === "unnamed" || activeTab === "review") && (
+              <button type="button" className="ui-button text-red-700 dark:text-red-300"
+                onClick={() => void handleCancelRecognition([...mergeSelected])}
+                disabled={mergeSaving || confirmingReview}>取消识别所选</button>
+            )}
+            <button type="button" className="ui-button ui-icon-button" aria-label="清除选择" title="清除选择"
+              disabled={mergeSaving || confirmingReview}
+              onClick={() => { reviewSelectionAnchor.current = undefined; setMergeSelected(new Set()); }}>
+              <Icon name="close" size={16} />
+            </button>
+          </div>
+        </div>
+      )}
       </div>
+
+      {active && !groupPhotosOpen && !mergeMode && personMenu && (() => {
+        const { cluster, trigger } = personMenu;
+        const id = cluster.id!;
+        const rect = trigger.getBoundingClientRect();
+        const items: MenuItem[] = [
+          { label: activeTab === "review" ? "命名" : "编辑人物", action: () => setEditingPerson(cluster) },
+        ];
+        if (activeTab === "review") {
+          items.push(
+            { label: "确认这是一个独立人物", action: () => void handleConfirmCluster(id) },
+            { label: "选择此人物进行合并", action: () => startMergeMode("review", id) },
+          );
+        }
+        if (activeTab === "unnamed" || (activeTab === "review" && !cluster.name?.trim())) {
+          items.push({ label: "取消识别", action: () => void handleCancelRecognition([id]), danger: true, disabled: mergeSaving });
+        }
+        return <ContextMenu x={Math.max(0, rect.right - 200)} y={rect.bottom + 4} items={items}
+          onClose={() => setPersonMenu(undefined)} returnFocus={trigger} />;
+      })()}
 
       {maintenanceAction && (
         <div className="fixed inset-0 z-[1200] grid place-items-center bg-black/40 p-3"

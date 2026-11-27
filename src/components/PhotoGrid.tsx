@@ -12,7 +12,12 @@ import { matchesTimeline, photoTimelinePosition, type TimelineJump, type Timelin
 
 const GAP = 8;
 
-interface Props { onSelectPhoto: (id: number) => void; onDoubleClickPhoto?: (id: number) => void; selectedPhotoId?: number | null }
+interface Props {
+  onSelectPhoto: (id: number) => void;
+  onDoubleClickPhoto?: (id: number) => void;
+  selectedPhotoId?: number | null;
+  onColumnCountChange?: (count: number) => void;
+}
 
 interface GridSurfaceProps extends Props {
   timelineJump: TimelineJump | null;
@@ -20,7 +25,7 @@ interface GridSurfaceProps extends Props {
   onVisiblePhotoChange: (photo: Photo | null) => void;
 }
 
-function SquareVirtualGrid({ onSelectPhoto, onDoubleClickPhoto, selectedPhotoId, timelineJump, onTimelineJumpComplete, onVisiblePhotoChange }: GridSurfaceProps) {
+function SquareVirtualGrid({ onSelectPhoto, onDoubleClickPhoto, selectedPhotoId, onColumnCountChange, timelineJump, onTimelineJumpComplete, onVisiblePhotoChange }: GridSurfaceProps) {
   const { photos, hasNext, loading, loadMore, thumbnailSize, filter, ratingSelectionMode, ratingSelection, toggleRatingSelection } = useStore();
   const containerRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(800);
@@ -41,6 +46,7 @@ function SquareVirtualGrid({ onSelectPhoto, onDoubleClickPhoto, selectedPhotoId,
 
   const contentWidth = Math.max(1, width - 16);
   const columnCount = calculateColumnCount(contentWidth, thumbnailSize, GAP);
+  useEffect(() => onColumnCountChange?.(columnCount), [columnCount, onColumnCountChange]);
   const cellSize = (contentWidth - GAP * (columnCount - 1)) / columnCount;
   const { parentRef, virtualizer, getItemsForRow } = useVirtualGrid({
     itemCount: photos.length,
@@ -245,7 +251,7 @@ function PersonHeader({ personId, onBack, onClear }: { personId: number; onBack:
   );
 }
 
-export default function PhotoGrid({ onSelectPhoto, onDoubleClickPhoto, selectedPhotoId }: Props) {
+export default function PhotoGrid({ onSelectPhoto, onDoubleClickPhoto, selectedPhotoId, onColumnCountChange }: Props) {
   const { photos, loading, filter, thumbnailShape, photoLoadError, loadPhotos, loadMore } = useStore();
   const hasFilters = Object.entries(filter).some(([key, value]) => !key.startsWith("sort_") && value != null && value !== "");
   const clearPhotoFilters = useStore((state) => state.clearPhotoFilters);
@@ -304,6 +310,7 @@ export default function PhotoGrid({ onSelectPhoto, onDoubleClickPhoto, selectedP
     onSelectPhoto,
     onDoubleClickPhoto,
     selectedPhotoId,
+    onColumnCountChange,
     timelineJump,
     onTimelineJumpComplete: handleTimelineJumpComplete,
     onVisiblePhotoChange: handleVisiblePhotoChange,
@@ -313,30 +320,31 @@ export default function PhotoGrid({ onSelectPhoto, onDoubleClickPhoto, selectedP
     <div className="relative flex h-full min-w-0 flex-col overflow-hidden">
       {showPersonHeader && <PersonHeader personId={displayPersonId!} onBack={handleBack} onClear={handleClearFilters} />}
       {showTagHeader && <TagHeader label={urlTag!} onBack={handleBack} onClear={handleClearFilters} />}
-      <ThumbnailToolbar />
-      <div className="flex min-h-0 flex-1">
-        {thumbnailShape === "proportional" ? (
-          <ProportionalVirtualGrid key={`proportional:${photoFilterKey(filter)}`} {...surfaceProps} />
-        ) : (
-          <SquareVirtualGrid key={`square:${photoFilterKey(filter)}`} {...surfaceProps} />
+      <ThumbnailToolbar showTitle={!showPersonHeader && !showTagHeader}>
+        <div className="flex min-h-0 flex-1">
+          {thumbnailShape === "proportional" ? (
+            <ProportionalVirtualGrid key={`proportional:${photoFilterKey(filter)}`} {...surfaceProps} />
+          ) : (
+            <SquareVirtualGrid key={`square:${photoFilterKey(filter)}`} {...surfaceProps} />
+          )}
+          <PhotoTimelineRail active={activeTimelinePosition} onJump={handleTimelineJump} />
+        </div>
+        {loading && photos.length === 0 && (
+          <div role="status" className="pointer-events-none absolute inset-x-0 top-1/2 text-center text-sm text-text-secondary">正在读取照片库…</div>
         )}
-        <PhotoTimelineRail active={activeTimelinePosition} onJump={handleTimelineJump} />
-      </div>
-      {loading && photos.length === 0 && (
-        <div role="status" className="pointer-events-none absolute inset-x-0 top-1/2 text-center text-sm text-text-secondary">正在读取照片库…</div>
-      )}
-      {photoLoadError && (
-        <div role="alert" className="absolute inset-x-0 bottom-4 z-10 mx-auto w-fit max-w-[90%] rounded-xl border border-surface-secondary bg-bg-secondary p-3 text-sm shadow-lg">
-          <span>读取照片失败。{photoLoadError.message}</span>
-          <button type="button" className="ui-button ml-2" onClick={() => void (photoLoadError.page === "next" ? loadMore() : loadPhotos())}>重试</button>
-        </div>
-      )}
-      {!loading && !photoLoadError && photos.length === 0 && (
-        <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 px-8 text-center text-sm text-text-secondary">
-          <p>{hasFilters ? "没有符合当前条件的照片" : "照片库暂无照片，请导入照片文件夹。"}</p>
-          {hasFilters && <button type="button" className="ui-button mt-3" onClick={handleClearFilters}>清除筛选</button>}
-        </div>
-      )}
+        {photoLoadError && (
+          <div role="alert" className="shrink-0 z-10 mx-auto my-2 w-fit max-w-[90%] rounded-xl border border-surface-secondary bg-bg-secondary p-3 text-sm shadow-lg">
+            <span>读取照片失败。{photoLoadError.message}</span>
+            <button type="button" className="ui-button ml-2" onClick={() => void (photoLoadError.page === "next" ? loadMore() : loadPhotos())}>重试</button>
+          </div>
+        )}
+        {!loading && !photoLoadError && photos.length === 0 && (
+          <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 px-8 text-center text-sm text-text-secondary">
+            <p>{hasFilters ? "没有符合当前条件的照片" : "照片库暂无照片，请导入照片文件夹。"}</p>
+            {hasFilters && <button type="button" className="ui-button mt-3" onClick={handleClearFilters}>清除筛选</button>}
+          </div>
+        )}
+      </ThumbnailToolbar>
     </div>
   );
 }

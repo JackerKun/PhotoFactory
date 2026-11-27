@@ -13,10 +13,19 @@ interface Props {
   y: number;
   items: MenuItem[];
   onClose: () => void;
+  returnFocus?: HTMLElement;
 }
 
-export default React.memo(function ContextMenu({ x, y, items, onClose }: Props) {
+export default React.memo(function ContextMenu({ x, y, items, onClose, returnFocus }: Props) {
   const menuRef = useRef<HTMLDivElement>(null);
+  const close = (restoreFocus: boolean) => {
+    onClose();
+    if (restoreFocus && returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
+  };
+
+  useEffect(() => {
+    if (returnFocus) menuRef.current?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+  }, [returnFocus]);
 
   useEffect(() => {
     const handleClick = (e: MouseEvent) => {
@@ -25,7 +34,10 @@ export default React.memo(function ContextMenu({ x, y, items, onClose }: Props) 
       }
     };
     const handleKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") {
+        onClose();
+        if (returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
+      }
     };
     document.addEventListener("mousedown", handleClick);
     document.addEventListener("keydown", handleKey);
@@ -33,23 +45,28 @@ export default React.memo(function ContextMenu({ x, y, items, onClose }: Props) 
       document.removeEventListener("mousedown", handleClick);
       document.removeEventListener("keydown", handleKey);
     };
-  }, [onClose]);
+  }, [onClose, returnFocus]);
 
   // Adjust position to keep menu within viewport
   const menuWidth = 200;
-  const menuHeight = items.length * 32;
-  const adjustedX = Math.min(x, window.innerWidth - menuWidth);
-  const adjustedY = Math.min(y, window.innerHeight - menuHeight);
+  const menuHeight = items.length * 32 + 10;
+  const adjustedX = Math.max(0, Math.min(x, window.innerWidth - menuWidth));
+  const adjustedY = Math.max(0, Math.min(y, window.innerHeight - menuHeight));
 
   return createPortal(
     <div
       ref={menuRef}
-      className="fixed bg-bg-secondary border border-surface-secondary rounded shadow-xl py-1 z-[9999] min-w-[160px]"
+      onBlur={returnFocus ? (event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) onClose();
+      } : undefined}
+      className="fixed bg-bg-secondary border border-surface-secondary rounded-lg shadow-xl py-1 z-[9999] w-[200px]"
       style={{ left: adjustedX, top: adjustedY }}
     >
       {items.map((item, i) => (
         <button
           key={i}
+          type="button"
+          disabled={item.disabled}
           className={`w-full text-left px-3 py-1.5 text-sm transition-colors ${
             item.disabled
               ? "text-text-muted cursor-not-allowed"
@@ -59,8 +76,8 @@ export default React.memo(function ContextMenu({ x, y, items, onClose }: Props) 
           }`}
           onClick={() => {
             if (!item.disabled) {
+              close(true);
               item.action();
-              onClose();
             }
           }}
         >

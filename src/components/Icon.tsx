@@ -26,11 +26,19 @@ export const iconPaths = {
   folder: "M3 7V4h6l2 3h10v13H3z",
   satellite: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M3 12h18 M12 3c5 5 5 13 0 18-5-5-5-13 0-18",
   download: "M12 3v12 M7 10l5 5 5-5 M4 16v5h16v-5",
+  search: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14z M16 16l4 4",
+  more: "M5 12h.01 M12 12h.01 M19 12h.01",
+  select: "M4 4h16v16H4z M8 12l3 3 5-6",
+  compare: "M4 5h7v14H4z M15 5h5v14h-5z M9 12h6",
+  close: "M6 6l12 12 M18 6L6 18",
+  chevronDown: "M6 9l6 6 6-6",
+  sliders: "M4 6h16 M4 12h16 M4 18h16 M8 4v4 M15 10v4 M10 16v4",
+  sidebar: "M3 4h18v16H3z M9 4v16",
 } as const;
 export type IconName = keyof typeof iconPaths;
 
 export default function Icon({ name, size = 18, className = "", style }: {
   name: IconName; size?: number; className?: string; style?: CSSProperties;
 }) {
-  return <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className={`shrink-0 ${className}`} style={style}><path d={iconPaths[name]} /></svg>;
+  return <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={name === "more" ? 2.6 : 1.7} strokeLinecap="round" strokeLinejoin="round" className={`shrink-0 ${className}`} style={style}><path d={iconPaths[name]} /></svg>;
 }
