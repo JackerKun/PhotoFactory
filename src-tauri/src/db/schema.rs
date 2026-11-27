@@ -117,6 +117,21 @@ CREATE TABLE IF NOT EXISTS person_metadata (
     FOREIGN KEY (person_id) REFERENCES face_clusters(id)
 );
 
+CREATE TABLE IF NOT EXISTS person_avatars (
+    person_id INTEGER PRIMARY KEY REFERENCES face_clusters(id) ON DELETE CASCADE,
+    face_id INTEGER NOT NULL REFERENCES face_detections(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_person_avatars_face ON person_avatars(face_id);
+CREATE TRIGGER IF NOT EXISTS remove_deleted_person_avatar AFTER DELETE ON face_clusters
+BEGIN
+    DELETE FROM person_avatars WHERE person_id = OLD.id;
+END;
+CREATE TRIGGER IF NOT EXISTS remove_deleted_face_avatar AFTER DELETE ON face_detections
+BEGIN
+    DELETE FROM person_avatars WHERE face_id = OLD.id;
+END;
+
 CREATE TABLE IF NOT EXISTS face_merge_operations (
     id INTEGER PRIMARY KEY,
     threshold REAL NOT NULL,

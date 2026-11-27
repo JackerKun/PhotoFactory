@@ -289,14 +289,50 @@ fn worker_exit_status(worker: &AiWorkerState) -> Option<std::process::ExitStatus
     Some(status)
 }
 
-fn ai_service_unavailable(error: &AppError, worker: &AiWorkerState) -> bool {
-    matches!(error, AppError::Http(http) if http.is_connect())
-        || worker_exit_status(worker).is_some()
+fn connection_interrupted(error: &reqwest::Error) -> bool {
+    use std::error::Error;
+    let mut cause = error.source();
+    while let Some(source) = cause {
+        if source.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(io.kind(), std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof)
+        }) {
+            return true;
+        }
+        cause = source.source();
+    }
+    false
 }
 
-async fn request_ai_batch<T, F, Fut>(
+async fn ai_service_unavailable(
+    error: &AppError,
     worker: &AiWorkerState,
+    client: &AiWorkerClient,
+    restart_on_timeout: bool,
+) -> bool {
+    if matches!(error, AppError::AiWorkerStalled(_)) || worker_exit_status(worker).is_some() {
+        return true;
+    }
+    let AppError::Http(http) = error else { return false; };
+    http.is_connect() || connection_interrupted(http) || (restart_on_timeout && http.is_timeout())
+        || !client.health_check().await.unwrap_or(false)
+}
+
+async fn request_ai_batch<T, F, Fut>(worker: &AiWorkerState, request: F) -> AppResult<AppResult<T>>
+where
+    F: FnMut(AiWorkerClient) -> Fut,
+    Fut: std::future::Future<Output = AppResult<T>>,
+{
+    request_worker_batch(worker, false, request, || {}).await
+}
+
+pub(super) async fn request_worker_batch<T, F, Fut>(
+    worker: &AiWorkerState,
+    restart_on_timeout: bool,
     mut request: F,
+    recovering: impl FnOnce(),
 ) -> AppResult<AppResult<T>>
 where
     F: FnMut(AiWorkerClient) -> Fut,
@@ -309,40 +345,34 @@ where
         Some(client) => client,
         None => ensure_ai_worker(worker.port, worker).await?.0,
     };
-    let port = client.port;
     let started = std::time::Instant::now();
-    let first_error = match request(client).await {
-        Err(error) if ai_service_unavailable(&error, worker) => error,
+    let first_error = match request(client.clone()).await {
+        Err(error) if ai_service_unavailable(&error, worker, &client, restart_on_timeout).await => error,
         result => return Ok(result),
     };
-    let detail = describe_ai_request_error(&first_error, worker, port, started.elapsed());
-    eprintln!("本地 AI 服务中断，正在恢复并重试当前批次：{detail}");
-    worker.diagnostics.record(
-        Source::Error,
-        None,
-        &format!("AI 服务中断，正在恢复并重试当前批次。\n{detail}"),
-    );
-    let (client, _) = ensure_ai_worker(worker.port, worker).await.map_err(|error| {
-        AppError::AiWorker(format!(
-            "本地 AI 服务恢复失败，照片仍待处理。\n{error}\n{detail}"
-        ))
-    })?;
+    let detail = format!("请求目标 PID {}\n{}", client.pid, describe_ai_request_error(&first_error, worker, client.port, started.elapsed()));
+    worker.diagnostics.record(Source::Error, Some(client.pid), &format!("AI 服务中断，正在重启并重试当前批次。\n{detail}"));
+    recovering();
+    let (client, _) = ensure_ai_worker_replacing(worker.port, worker, Some(&client))
+        .await.map_err(|error| AppError::AiWorker(format!(
+            "本地 AI 服务恢复失败，当前批次仍待处理。\n{error}\n首次请求：\n{detail}"
+        )))?;
     let started = std::time::Instant::now();
-    match request(client).await {
-        Err(error) if ai_service_unavailable(&error, worker) => {
-            let detail = describe_ai_request_error(&error, worker, port, started.elapsed());
-            worker.diagnostics.record(Source::Error, None, &detail);
+    match request(client.clone()).await {
+        Err(error) if ai_service_unavailable(&error, worker, &client, restart_on_timeout).await => {
+            let retry = describe_ai_request_error(&error, worker, client.port, started.elapsed());
+            discard_failed_worker(worker, &client).await;
+            worker.diagnostics.record(Source::Error, Some(client.pid), &retry);
             Err(AppError::AiWorker(format!(
-                "本地 AI 服务重试后仍不可用，照片仍待处理。\n{detail}"
+                "本地 AI 服务重试后仍不可用，当前批次仍待处理。\n重试：\n{retry}\n首次请求：\n{detail}"
             )))
         }
+        Err(error) if restart_on_timeout => Ok(Err(AppError::AiWorker(format!(
+            "AI 服务重启后仍未能处理本批：{error}\n首次请求：\n{detail}"
+        )))),
         result => {
             if result.is_ok() {
-                worker.diagnostics.record(
-                    Source::Service,
-                    None,
-                    "AI 服务恢复后，当前批次已返回结果。",
-                );
+                worker.diagnostics.record(Source::Service, None, "AI 服务恢复后，当前批次已返回结果。");
             }
             Ok(result)
         }
@@ -416,8 +446,14 @@ fn read_pipeline_status(conn: &rusqlite::Connection) -> AppResult<AiPipelineStat
 }
 
 #[tauri::command]
-pub async fn cmd_start_ai_worker(port: u16, state: State<'_, AiWorkerState>) -> AppResult<String> {
-    ensure_ai_worker(port, &state)
+pub async fn cmd_start_ai_worker(port: u16, restart: Option<bool>, state: State<'_, AiWorkerState>) -> AppResult<String> {
+    let rejected = if restart.unwrap_or(false) {
+        state.diagnostics.record(Source::Service, None, "收到手动重启本地 AI 服务的请求。");
+        state.client.lock().unwrap().clone()
+    } else {
+        None
+    };
+    ensure_ai_worker_replacing(port, &state, rejected.as_ref())
         .await
         .map(|(_, message)| message)
 }
@@ -551,6 +587,30 @@ fn stop_managed_worker(child: &mut std::process::Child) {
 }
 
 async fn ensure_ai_worker(port: u16, state: &AiWorkerState) -> AppResult<(AiWorkerClient, String)> {
+    ensure_ai_worker_replacing(port, state, None).await
+}
+
+async fn discard_failed_worker(state: &AiWorkerState, failed: &AiWorkerClient) {
+    let _starting = state.start_lock.lock().await;
+    {
+        let mut current = state.client.lock().unwrap();
+        if !current.as_ref().is_some_and(|client| client.same_instance(failed)) {
+            return;
+        }
+        *current = None;
+    }
+    let child = state.process.lock().unwrap().take();
+    if let Some(mut child) = child {
+        stop_managed_worker(&mut child);
+    }
+    state.diagnostics.status(WorkerStatus::Failed, failed.port, Some(failed.pid), "AI 服务重试后仍不可用，已关闭本程序启动的服务进程。");
+}
+
+async fn ensure_ai_worker_replacing(
+    port: u16,
+    state: &AiWorkerState,
+    rejected: Option<&AiWorkerClient>,
+) -> AppResult<(AiWorkerClient, String)> {
     // Startup and recovery can be requested by more than one screen or task.
     let _starting = state.start_lock.lock().await;
     if state.shutting_down.load(Ordering::Acquire) {
@@ -559,6 +619,7 @@ async fn ensure_ai_worker(port: u16, state: &AiWorkerState) -> AppResult<(AiWork
     let existing = state.client.lock().unwrap().clone();
     if let Some(client) = existing {
         if (client.port == port || port == state.port)
+            && !rejected.is_some_and(|failed| failed.same_instance(&client))
             && worker_exit_status(state).is_none()
             && client.health_check().await.unwrap_or(false)
         {
@@ -567,18 +628,28 @@ async fn ensure_ai_worker(port: u16, state: &AiWorkerState) -> AppResult<(AiWork
         }
     }
     *state.client.lock().unwrap() = None;
-    state
-        .diagnostics
-        .status(WorkerStatus::Starting, port, None, "正在启动本地 AI 服务。");
+    state.diagnostics.set_port_conflict(None);
+    state.diagnostics.status(WorkerStatus::Starting, port, None, "正在启动本地 AI 服务。");
+    let first = match start_ai_worker_process(port, state).await {
+        Ok(result) => return Ok(result),
+        Err(error) => error,
+    };
+    if state.shutting_down.load(Ordering::Acquire) {
+        return Err(first);
+    }
+    state.diagnostics.record(Source::Error, None, &format!("首次启动失败，将再启动一次。\n{first}"));
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    if state.shutting_down.load(Ordering::Acquire) {
+        return Err(first);
+    }
     match start_ai_worker_process(port, state).await {
         Ok(result) => Ok(result),
-        Err(error) => {
+        Err(second) => {
+            let message = format!("本地 AI 服务两次启动失败。\n首次：{first}\n重试：{second}");
             if !state.shutting_down.load(Ordering::Acquire) {
-                state
-                    .diagnostics
-                    .status(WorkerStatus::Failed, port, None, &error.to_string());
+                state.diagnostics.status(WorkerStatus::Failed, port, None, &message);
             }
-            Err(error)
+            Err(AppError::AiWorker(message))
         }
     }
 }
@@ -708,14 +779,15 @@ async fn start_ai_worker_process(
             ))
         })?;
         if actual_port != port {
-            state.diagnostics.status(
-                WorkerStatus::Starting,
-                actual_port,
-                Some(pid),
-                &format!("端口 {port} 已占用，AI 服务改用本地端口 {actual_port}。"),
-            );
+            let owner = crate::ai_worker::port_owner::describe(port).await
+                .unwrap_or_else(|| "未查到监听进程，端口可能被系统保留或监听进程已退出".into());
+            let detail = format!("本地端口 {port} 无法绑定。监听进程：{owner}。AI 服务改用 {actual_port}。");
+            state.diagnostics.set_port_conflict(Some(detail));
+            state.diagnostics.status(WorkerStatus::Starting, actual_port, Some(pid), "正在检查备用端口上的 AI 服务。");
+        } else {
+            state.diagnostics.set_port_conflict(None);
         }
-        let client = AiWorkerClient::new(actual_port, instance_id);
+        let client = AiWorkerClient::new(actual_port, pid, instance_id);
         wait_for_health(&client, state).await?;
         Ok::<_, AppError>(client)
     })
@@ -728,10 +800,16 @@ async fn start_ai_worker_process(
     let client = match ready {
         Ok(client) => client,
         Err(error) => {
-            if let Some(mut child) = state.process.lock().unwrap().take() {
+            let child = state.process.lock().unwrap().take();
+            let mut detail = error.to_string();
+            if let Some(mut child) = child {
+                if let Ok(Some(status)) = child.try_wait() {
+                    state.diagnostics.exited(pid, &status.to_string());
+                    detail.push_str(&format!("\n进程 PID {pid} 已退出（{status}）。"));
+                }
                 stop_managed_worker(&mut child);
             }
-            return Err(error);
+            return Err(AppError::AiWorker(detail));
         }
     };
     let port = client.port;
@@ -1354,7 +1432,7 @@ pub async fn cmd_auto_ai_pipeline(
         .unwrap_or(false);
     if !healthy {
         let port = worker_state.port;
-        match cmd_start_ai_worker(port, worker_state.clone()).await {
+        match cmd_start_ai_worker(port, None, worker_state.clone()).await {
             Ok(msg) => {
                 messages.push(msg);
             }
@@ -1591,6 +1669,202 @@ async fn wait_for_pipeline_permission(
     }
 }
 
+fn emit_face_clustering_phase(
+    app: &tauri::AppHandle,
+    project: &crate::models::Project,
+    batch: usize,
+    phase: crate::models::AutomaticFaceMergeProgress,
+) {
+    let _ = app.emit(
+        "face_clustering_progress",
+        serde_json::json!({
+            "project_path": project.root_path,
+            "batch": batch,
+            "phase": phase,
+        }),
+    );
+}
+
+async fn group_pending_faces(
+    project: &crate::models::Project,
+    worker: &AiWorkerState,
+    app: &tauri::AppHandle,
+    stage: &str,
+    total: i64,
+) -> Result<bool, String> {
+    let db_path = project.db_path();
+    let conn = crate::db::connection::init_db(&db_path).map_err(|error| error.to_string())?;
+    let mut remaining = total;
+    let mut batch = 0;
+    while remaining > 0 {
+        if !wait_for_pipeline_permission(&db_path, app).await? {
+            return Ok(false);
+        }
+        batch += 1;
+        emit_face_clustering_phase(
+            app,
+            project,
+            batch,
+            crate::models::AutomaticFaceMergeProgress {
+                stage: "read_database".into(),
+                done: 0,
+                total: 0,
+                skipped: 0,
+            },
+        );
+        publish_ai_progress(
+            &conn,
+            app,
+            "running",
+            stage,
+            total,
+            (total - remaining).max(0),
+            0,
+            None,
+        )?;
+        let report = |phase| emit_face_clustering_phase(app, project, batch, phase);
+        let batch_started = std::time::Instant::now();
+        let result =
+            crate::commands::faces::cluster_face_batch(project, worker, Some(&report)).await;
+        let current =
+            face_dao::get_unassigned_face_count(&conn).map_err(|error| error.to_string())?;
+        let error = match result {
+            Err(error @ (AppError::Http(_) | AppError::AiWorker(_))) => {
+                let port = worker
+                    .client
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map_or(worker.port, |client| client.port);
+                Some(describe_ai_request_error(&error, worker, port, batch_started.elapsed()))
+            }
+            Err(error) => Some(error.to_string()),
+            Ok(_) if current >= remaining => Some(format!(
+                "还有 {current} 张人脸未归组，本批没有可用的人脸特征。请检查照片库的人脸特征缓存。"
+            )),
+            Ok(_) => None,
+        };
+        if let Some(error) = error {
+            publish_ai_progress(
+                &conn,
+                app,
+                "error",
+                "clustering_error",
+                total,
+                (total - current).max(0),
+                current,
+                Some(&error),
+            )?;
+            return Err(error);
+        }
+        remaining = current;
+        publish_ai_progress(
+            &conn,
+            app,
+            "running",
+            if remaining == 0 {
+                "clustering_done"
+            } else {
+                stage
+            },
+            total,
+            (total - remaining).max(0),
+            0,
+            None,
+        )?;
+    }
+    wait_for_pipeline_permission(&db_path, app).await
+}
+
+pub(super) struct AiPipelineLease<'a>(&'a AtomicBool);
+
+impl<'a> AiPipelineLease<'a> {
+    pub(super) fn acquire(running: &'a AtomicBool) -> AppResult<Self> {
+        if running.swap(true, Ordering::SeqCst) {
+            return Err(AppError::Project("已有智能分析正在处理，请等待任务结束。".into()));
+        }
+        Ok(Self(running))
+    }
+}
+
+impl Drop for AiPipelineLease<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+pub async fn run_manual_face_clustering(
+    project: crate::models::Project,
+    worker: State<'_, AiWorkerState>,
+    app: tauri::AppHandle,
+    rebuild: bool,
+) -> AppResult<String> {
+    let _lease = AiPipelineLease::acquire(&worker.pipeline_running)?;
+    let conn = crate::db::connection::init_db(&project.db_path())?;
+    if rebuild {
+        ensure_ai_worker(worker.port, &worker).await?;
+        face_dao::reset_automatic_clusters(&conn)?;
+        let cache = project.faces_cache_path().parent().unwrap().join("face_thumbnails");
+        if let Err(error) = std::fs::remove_dir_all(cache) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("重建时无法清理人物缩略图缓存：{error}");
+            }
+        }
+    }
+    let total = face_dao::get_unassigned_face_count(&conn)?;
+    if total == 0 {
+        return Ok("没有待分组的人脸。".into());
+    }
+    ai_task_dao::set_pipeline_control(&conn, "running")?;
+    emit_face_clustering_phase(
+        &app,
+        &project,
+        0,
+        crate::models::AutomaticFaceMergeProgress {
+            stage: "start_worker".into(),
+            done: 0,
+            total: 0,
+            skipped: 0,
+        },
+    );
+    publish_ai_progress(&conn, &app, "running", "clustering", total, 0, 0, None)
+        .map_err(AppError::Internal)?;
+    if !cmd_worker_health(worker.clone()).await.unwrap_or(false) {
+        if let Err(error) = cmd_start_ai_worker(worker.port, None, worker.clone()).await {
+            publish_ai_progress(
+                &conn,
+                &app,
+                "error",
+                "clustering_error",
+                total,
+                0,
+                total,
+                Some(&error.to_string()),
+            )
+            .map_err(AppError::Internal)?;
+            return Err(error);
+        }
+    }
+    let completed = group_pending_faces(&project, &worker, &app, "clustering", total)
+        .await
+        .map_err(AppError::Internal)?;
+    if !completed {
+        return Ok("人脸整理已停止，已完成的分组已保存。".into());
+    }
+    publish_ai_progress(
+        &conn,
+        &app,
+        "done",
+        "clustering_done",
+        total,
+        total,
+        0,
+        None,
+    )
+    .map_err(AppError::Internal)?;
+    Ok(format!("已整理 {total} 张待分组人脸。"))
+}
+
 async fn finish_ai_tags(
     db_path: std::path::PathBuf,
     app_handle: &tauri::AppHandle,
@@ -1790,54 +2064,58 @@ pub async fn run_auto_ai_pipeline_inner(
 
     // 1. Ensure the stored client still points at a live worker. Merely having a
     // client object is insufficient after an interrupted/abnormal shutdown.
+    if unassigned_before > 0 {
+        emit_face_clustering_phase(
+            &app_handle,
+            &project,
+            0,
+            crate::models::AutomaticFaceMergeProgress {
+                stage: "start_worker".into(),
+                done: 0,
+                total: 0,
+                skipped: 0,
+            },
+        );
+        publish_ai_progress(
+            &conn, &app_handle, "running", "recovering_faces", unassigned_before as i64, 0, 0, None,
+        )?;
+    }
     let healthy = cmd_worker_health(worker_state.clone())
         .await
         .unwrap_or(false);
     if !healthy {
         let port = worker_state.port;
-        if let Err(e) = cmd_start_ai_worker(port, worker_state.clone()).await {
-            emit("error", 0, 0);
-            return Err(format!("Failed to start AI worker: {}", e));
+        if let Err(e) = cmd_start_ai_worker(port, None, worker_state.clone()).await {
+            let error = format!("无法启动本地 AI 服务：{e}");
+            if unassigned_before > 0 {
+                publish_ai_progress(
+                    &conn, &app_handle, "error", "clustering_error", unassigned_before as i64, 0,
+                    unassigned_before as i64, Some(&error),
+                )?;
+            } else {
+                emit("error", 0, 0);
+            }
+            return Err(error);
         }
     }
 
     if unassigned_before > 0 {
-        publish_ai_progress(
-            &conn,
+        match group_pending_faces(
+            &project,
+            &worker_state,
             &app_handle,
-            "running",
             "recovering_faces",
             unassigned_before as i64,
-            0,
-            0,
-            None,
-        )?;
-        match crate::commands::faces::cmd_run_face_clustering_inner(
-            state.clone(),
-            worker_state.clone(),
         )
         .await
         {
-            Ok(_) => {
-                let remaining = face_dao::get_unassigned_face_count(&conn)
-                    .map_err(|error| error.to_string())?;
-                if remaining == 0 {
-                    publish_ai_progress(
-                        &conn,
-                        &app_handle,
-                        "running",
-                        "clustering_done",
-                        unassigned_before as i64,
-                        unassigned_before as i64,
-                        0,
-                        None,
-                    )?;
-                    if total_pending == 0 {
-                        return finish_ai_tags(project.db_path(), &app_handle).await;
-                    }
-                }
+            Ok(false) => return Ok(()),
+            Ok(true) if total_pending == 0 => {
+                return finish_ai_tags(project.db_path(), &app_handle).await;
             }
+            Err(error) if total_pending == 0 => return Err(error),
             Err(error) => eprintln!("Interrupted face clustering recovery failed: {error}"),
+            Ok(true) => {}
         }
     }
 
@@ -1989,69 +2267,12 @@ pub async fn run_auto_ai_pipeline_inner(
     let clustering_conn = init_db(&project.db_path()).map_err(|error| error.to_string())?;
     let total =
         face_dao::get_unassigned_face_count(&clustering_conn).map_err(|error| error.to_string())?;
-    let mut remaining = total;
-    if total > 0 {
-        publish_ai_progress(
-            &clustering_conn,
-            &app_handle,
-            "running",
-            "clustering",
-            total,
-            0,
-            0,
-            None,
-        )?;
-        while remaining > 0 {
-            if !wait_for_pipeline_permission(&project.db_path(), &app_handle).await? {
-                return Ok(());
-            }
-            let result = crate::commands::faces::cmd_run_face_clustering_inner(
-                state.clone(),
-                worker_state.clone(),
-            )
-            .await;
-            if !wait_for_pipeline_permission(&project.db_path(), &app_handle).await? {
-                return Ok(());
-            }
-            let current = face_dao::get_unassigned_face_count(&clustering_conn)
-                .map_err(|error| error.to_string())?;
-            let error = match result {
-                Err(error) => Some(error.to_string()),
-                Ok(_) if current >= remaining => Some(format!(
-                    "还有 {current} 张人脸未归组，可能缺少可用的人脸特征文件。"
-                )),
-                Ok(_) => None,
-            };
-            if let Some(error) = error {
-                return publish_ai_progress(
-                    &clustering_conn,
-                    &app_handle,
-                    "error",
-                    "clustering_error",
-                    total,
-                    (total - current).max(0),
-                    current,
-                    Some(&error),
-                );
-            }
-            remaining = current;
-            let stage = if remaining == 0 {
-                "clustering_done"
-            } else {
-                "clustering"
-            };
-            publish_ai_progress(
-                &clustering_conn,
-                &app_handle,
-                "running",
-                stage,
-                total,
-                (total - remaining).max(0),
-                0,
-                None,
-            )?;
-        }
+    if total > 0
+        && !group_pending_faces(&project, &worker_state, &app_handle, "clustering", total).await?
+    {
+        return Ok(());
     }
+
     finish_ai_tags(project.db_path(), &app_handle).await
 }
 

@@ -191,6 +191,12 @@ export interface AiProcessingStatus {
   updated_at?: number;
 }
 
+export interface FaceClusteringProgress {
+  project_path: string;
+  batch: number;
+  phase: { stage: string; done: number; total: number; skipped: number };
+}
+
 // Layered thumbnail types
 export type ThumbnailSize = "small" | "medium" | "large";
 export type ThumbnailState = "placeholder" | "loading" | "loaded" | "upgrading";

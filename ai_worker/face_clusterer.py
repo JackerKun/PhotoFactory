@@ -1,14 +1,10 @@
 # ai_worker/face_clusterer.py
-"""Face clustering using DBSCAN on face embeddings."""
+"""Group faces using their embeddings and saved constraints."""
 
 import json
 import os
 from typing import List, Dict
 import numpy as np
-from sklearn.cluster import DBSCAN
-from sklearn.cluster import AgglomerativeClustering
-from sklearn.neighbors import NearestNeighbors
-from sklearn.metrics.pairwise import cosine_similarity as cosine_sim_matrix
 
 def cluster_faces(
     embeddings_dir: str,
@@ -29,6 +25,8 @@ def cluster_faces(
         vectors.append(vec)
 
     X = np.array(vectors)
+    from sklearn.cluster import DBSCAN
+
     clustering = DBSCAN(eps=eps, min_samples=min_samples, metric="cosine").fit(X)
     labels = clustering.labels_
 
@@ -70,6 +68,8 @@ def compute_adaptive_eps(
         return min_eps
 
     k = min(10, n_samples - 1)
+    from sklearn.neighbors import NearestNeighbors
+
     neighbors = NearestNeighbors(n_neighbors=k, metric='cosine').fit(embeddings)
     distances, _ = neighbors.kneighbors(embeddings)
 
@@ -116,6 +116,8 @@ def compute_face_quality(
     if len(all_embeddings) < 2:
         return 0.5
 
+    from sklearn.metrics.pairwise import cosine_similarity as cosine_sim_matrix
+
     similarities = cosine_sim_matrix(
         embedding.reshape(1, -1), all_embeddings
     )[0]
@@ -142,6 +144,7 @@ def plan_automatic_cluster_merges(
     cannot_links: list = None,
     return_details: bool = False,
     named_cluster_ids: list = None,
+    progress=None,
 ) -> list:
     """Find merge groups with at most one named person as a destination.
 
@@ -150,35 +153,49 @@ def plan_automatic_cluster_merges(
     same photo are incompatible, which prevents two people standing next to
     each other from being collapsed by a visually similar pair.
     """
+    def report(stage, done, total, skipped=0):
+        if progress is not None:
+            progress(stage, done, total, skipped)
+
     named = set(named_cluster_ids or [])
     safe_threshold = float(max(0.35, min(0.90, threshold)))
     support_threshold = max(min(0.54, safe_threshold - 0.06), safe_threshold - 0.14)
 
     members = {}
     photo_ids = {}
-    for filename, cluster_id in assignments.items():
+    skipped = 0
+    dimensions = None
+    total = len(assignments)
+    report("read_embeddings", 0, total)
+    for index, (filename, cluster_id) in enumerate(assignments.items(), 1):
         photo_id = _photo_id_from_embedding_name(filename)
         if photo_id is not None:
             photo_ids.setdefault(int(cluster_id), set()).add(photo_id)
-        path = os.path.join(embeddings_dir, filename)
         try:
-            vector = np.asarray(np.load(path), dtype=np.float32)
-        except Exception:
-            continue
-        norm = np.linalg.norm(vector)
-        if not np.isfinite(norm) or norm <= 0:
-            continue
-        members.setdefault(int(cluster_id), []).append(vector / norm)
+            vector = np.asarray(np.load(os.path.join(embeddings_dir, filename)), dtype=np.float32)
+            norm = np.linalg.norm(vector)
+            if (vector.ndim != 1 or not np.isfinite(norm) or norm <= 0
+                    or (dimensions is not None and vector.size != dimensions)):
+                raise ValueError("Invalid embedding")
+            dimensions = vector.size
+            members.setdefault(int(cluster_id), []).append(vector / norm)
+        except (OSError, ValueError, EOFError):
+            skipped += 1
+        if index % 16 == 0 or index == total:
+            report("read_embeddings", index, total, skipped)
 
+    if total and skipped == total:
+        raise ValueError(f"无法读取全部 {total} 份人脸特征文件，请检查照片库的 AI 缓存")
     cluster_ids = sorted(members)
     if len(cluster_ids) < 2:
         return []
 
+    report("prepare_groups", 0, len(cluster_ids), skipped)
     matrices = {cluster_id: np.stack(members[cluster_id]) for cluster_id in cluster_ids}
     centroids = {}
     compactness = {}
     prototypes = {}
-    for cluster_id, matrix in matrices.items():
+    for index, (cluster_id, matrix) in enumerate(matrices.items(), 1):
         centroid = matrix.mean(axis=0)
         norm = np.linalg.norm(centroid)
         centroids[cluster_id] = centroid / norm if norm > 0 else centroid
@@ -193,6 +210,8 @@ def plan_automatic_cluster_merges(
                 break
             chosen.append(next_index)
         prototypes[cluster_id] = matrix[chosen]
+        if index % 16 == 0 or index == len(cluster_ids):
+            report("prepare_groups", index, len(cluster_ids), skipped)
 
     blocked_pairs = set()
     for left_key, right_key in cannot_links or []:
@@ -207,20 +226,25 @@ def plan_automatic_cluster_merges(
     centroid_similarities = {}
     photo_conflicts = set()
     candidates = []
-    # Comparing every pair becomes expensive for very large libraries.  An ANN-
-    # ready nearest-neighbour stage limits expensive face-to-face checks to the
-    # 50 closest people per cluster while preserving deterministic behaviour.
+    # Search the closest 50 other centroids in blocks to bound peak memory.
     centroid_matrix = np.stack([centroids[cluster_id] for cluster_id in cluster_ids])
-    neighbor_count = min(51, len(cluster_ids))
-    neighbors = NearestNeighbors(n_neighbors=neighbor_count, metric="cosine").fit(centroid_matrix)
-    _, neighbor_indices = neighbors.kneighbors(centroid_matrix)
+    neighbor_count = min(50, len(cluster_ids) - 1)
     candidate_pairs = set()
-    for left_pos, positions in enumerate(neighbor_indices):
-        for right_pos in positions:
-            if right_pos != left_pos:
-                candidate_pairs.add(tuple(sorted((cluster_ids[left_pos], cluster_ids[int(right_pos)]))))
+    report("find_neighbors", 0, len(cluster_ids), skipped)
+    for start in range(0, len(cluster_ids), 128):
+        end = min(start + 128, len(cluster_ids))
+        scores = centroid_matrix[start:end] @ centroid_matrix.T
+        scores[np.arange(end - start), np.arange(start, end)] = -np.inf
+        positions = np.argpartition(-scores, neighbor_count - 1, axis=1)[:, :neighbor_count]
+        for left_pos, neighbors in enumerate(positions, start):
+            for right_pos in neighbors:
+                candidate_pairs.add(tuple(sorted((cluster_ids[left_pos], cluster_ids[right_pos]))))
+        report("find_neighbors", end, len(cluster_ids), skipped)
 
-    for left_id, right_id in sorted(candidate_pairs):
+    report("compare_pairs", 0, len(candidate_pairs), skipped)
+    for index, (left_id, right_id) in enumerate(sorted(candidate_pairs)):
+        if index % 128 == 0:
+            report("compare_pairs", index, len(candidate_pairs), skipped)
         if (left_id, right_id) in blocked_pairs or (left_id in named and right_id in named):
             compatible[(left_id, right_id)] = False
             continue
@@ -255,12 +279,15 @@ def plan_automatic_cluster_merges(
 
     # Greedy complete-link over *person centroids*.  This permits pose/expression
     # outliers within a person while still preventing transitive A-B-C chains.
-    groups = [{cluster_id} for cluster_id in cluster_ids]
+    groups = {cluster_id: {cluster_id} for cluster_id in cluster_ids}
     candidates.sort(reverse=True)
-    for _, left_id, right_id in candidates:
-        left_group = next((group for group in groups if left_id in group), None)
-        right_group = next((group for group in groups if right_id in group), None)
-        if left_group is None or right_group is None or left_group is right_group:
+    report("build_candidates", 0, len(candidates), skipped)
+    for index, (_, left_id, right_id) in enumerate(candidates):
+        if index % 32 == 0:
+            report("build_candidates", index, len(candidates), skipped)
+        left_group = groups[left_id]
+        right_group = groups[right_id]
+        if left_group is right_group:
             continue
         cross_keys = [
             tuple(sorted((a, b)))
@@ -282,9 +309,12 @@ def plan_automatic_cluster_merges(
         )
         if can_merge_groups:
             left_group.update(right_group)
-            groups.remove(right_group)
+            for member in right_group:
+                groups[member] = left_group
 
-    merge_groups = [sorted(group) for group in groups if len(group) > 1]
+    merge_groups = [sorted(group) for cluster_id, group in groups.items()
+                    if len(group) > 1 and cluster_id == min(group)]
+    report("build_candidates", len(candidates), len(candidates), skipped)
     if not return_details:
         return merge_groups
     details = []
@@ -302,6 +332,46 @@ def plan_automatic_cluster_merges(
     return details
 
 
+def _complete_link_labels(distances, cutoff, report):
+    """Merge the closest groups while every cross-group pair is below cutoff."""
+    count = len(distances)
+    rows = np.arange(count)
+    parents = rows.copy()
+    active = np.ones(count, dtype=bool)
+    np.fill_diagonal(distances, np.inf)
+    nearest = distances.argmin(axis=1)
+    nearest_distance = distances[rows, nearest]
+
+    for merged in range(count - 1):
+        if merged % 16 == 0:
+            report(merged, count - 1)
+        left = int(nearest_distance.argmin())
+        if float(nearest_distance[left]) >= cutoff:
+            break
+        right = nearest[left]
+        parents[right] = left
+        active[right] = False
+
+        combined = np.maximum(distances[left], distances[right])
+        distances[left, :] = distances[:, left] = combined
+        distances[right, :] = distances[:, right] = np.inf
+        nearest_distance[right] = np.inf
+
+        # Complete linkage can only increase distances. Rows with another
+        # nearest group keep their minimum, so only affected rows need a scan.
+        affected = active & ((nearest == left) | (nearest == right))
+        affected[left] = True
+        changed = rows[affected]
+        nearest[changed] = distances[changed].argmin(axis=1)
+        nearest_distance[changed] = distances[changed, nearest[changed]]
+
+    roots = parents[parents]
+    while not np.array_equal(roots, parents):
+        parents = roots
+        roots = parents[parents]
+    return roots
+
+
 def cluster_faces_v2(
     embeddings_dir: str,
     existing_clusters: dict = None,
@@ -312,8 +382,13 @@ def cluster_faces_v2(
     memberships: dict = None,
     qualities: dict = None,
     review_files: list = None,
+    progress=None,
 ) -> dict:
     """Compare against bounded prototypes; enforce constraints using all memberships."""
+    def report(stage, done=0, total=0, skipped=0):
+        if progress is not None:
+            progress(stage, done, total, skipped)
+
     prototypes = existing_clusters or {}
     results = dict(prototypes)
     occupied = {}
@@ -349,7 +424,10 @@ def cluster_faces_v2(
 
     files = candidate_files if candidate_files is not None else os.listdir(embeddings_dir)
     vectors = {}
-    for filename in sorted(set(files) | set(prototypes)):
+    embedding_files = sorted(set(files) | set(prototypes))
+    skipped = 0
+    report("read_embeddings", 0, len(embedding_files))
+    for index, filename in enumerate(embedding_files, 1):
         if not filename.endswith(".npy") or (filename in members and filename not in prototypes):
             continue
         try:
@@ -358,7 +436,12 @@ def cluster_faces_v2(
             if vector.ndim == 1 and np.isfinite(norm) and norm > 0:
                 vectors[filename] = vector / norm
         except (ValueError, OSError):
-            continue
+            pass
+        if filename not in vectors:
+            skipped += 1
+        if index % 16 == 0 or index == len(embedding_files):
+            report("read_embeddings", index, len(embedding_files), skipped)
+    report("compare_people", skipped=skipped)
     candidates = [filename for filename in vectors if filename not in members]
     pending = set()
     seeds = {}
@@ -393,7 +476,9 @@ def cluster_faces_v2(
         nearest = np.maximum.reduceat(matrix @ np.stack(references).T, starts, axis=1)
         scores = 0.72 * (matrix @ np.stack(centers).T) + 0.28 * nearest
         # Give the strongest face first choice when a photo has competing faces.
-        for row in np.argsort(-scores.max(axis=1), kind="stable"):
+        for index, row in enumerate(np.argsort(-scores.max(axis=1), kind="stable")):
+            if index % 16 == 0:
+                report("compare_people", index, len(remaining), skipped)
             name = remaining[row]
             ranked = np.argsort(-scores[row], kind="stable")
             viable = []
@@ -422,6 +507,7 @@ def cluster_faces_v2(
                 pending.add(name)
 
     remaining = [name for name in candidates if name not in members]
+    report("prepare_distances", skipped=skipped)
     seed_names = [name for name in remaining if name not in pending]
     labels = []
     if len(seed_names) > 1:
@@ -453,14 +539,14 @@ def cluster_faces_v2(
             for name in pending.intersection(positions):
                 i = positions[name]
                 distances[i, :] = distances[:, i] = 2
-        np.fill_diagonal(distances, 0)
-        labels = AgglomerativeClustering(
-            n_clusters=None, metric="precomputed", linkage="complete",
-            distance_threshold=1 - threshold,
-        ).fit_predict(distances)
+        labels = _complete_link_labels(
+            distances, 1 - threshold,
+            lambda done, total: report("run_linkage", done, total, skipped),
+        )
     elif seed_names:
         labels = [0]
 
+    report("form_groups", skipped=skipped)
     next_id = max(members.values(), default=-1) + 1
     new_labels = {}
     label_counts = dict(zip(*np.unique(labels, return_counts=True)))

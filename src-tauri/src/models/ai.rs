@@ -163,6 +163,7 @@ pub struct ClusterFaceResponse {
 /// Request for v2 clustering with constraints.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterFaceV2Request {
+    pub request_id: Option<String>,
     pub embeddings_dir: String,
     pub existing_clusters: Option<std::collections::HashMap<String, i64>>,
     pub threshold: Option<f64>,
@@ -183,6 +184,7 @@ pub struct ClusterFaceV2Response {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutomaticFaceMergeRequest {
+    pub request_id: Option<String>,
     pub embeddings_dir: String,
     pub unnamed_clusters: std::collections::HashMap<String, i64>,
     pub named_cluster_ids: Vec<i64>,
@@ -202,4 +204,14 @@ pub struct AutomaticFaceMergeCandidate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutomaticFaceMergeResponse {
     pub candidates: Vec<AutomaticFaceMergeCandidate>,
+    #[serde(default)]
+    pub skipped: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutomaticFaceMergeProgress {
+    pub stage: String,
+    pub done: usize,
+    pub total: usize,
+    pub skipped: usize,
 }

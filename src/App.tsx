@@ -15,7 +15,7 @@ import Lightbox from "./components/Lightbox";
 import { useStore, photoFilterKey, type LightboxSource } from "./hooks/usePhotos";
 import { usePreparePhotoMemories } from "./hooks/usePhotoMemories";
 import { useKeyboardNavigation } from "./hooks/useKeyboardNavigation";
-import type { AiProcessingStatus, ViewMode } from "./types";
+import type { AiProcessingStatus, FaceClusteringProgress, ViewMode } from "./types";
 import * as api from "./api/tauri";
 import { photoFilterFromSearchParams, photoRouteForTag, photoSearchParamsFromFilter } from "./utils/photoRoutes";
 
@@ -209,6 +209,18 @@ function AppLayout({ children, viewMode }: { children: React.ReactNode; viewMode
   }, [hasStandalonePhotoDetail, lightboxPhotoId, selectedPhotoId, setSelectedPhotoId]);
 
   // Listen for AI status events
+  useEffect(() => {
+    let disposed = false;
+    let stop: (() => void) | undefined;
+    listen<FaceClusteringProgress>("face_clustering_progress", ({ payload }) => {
+      const store = useStore.getState();
+      if (payload.project_path === store.project?.root_path) {
+        useStore.setState({ faceClusteringProgress: { ...payload, updatedAt: Date.now() } });
+      }
+    }).then((unsubscribe) => { if (disposed) unsubscribe(); else stop = unsubscribe; }).catch(console.error);
+    return () => { disposed = true; stop?.(); };
+  }, []);
+
   useEffect(() => {
     let unsub: (() => void) | undefined;
     listen("ai_status_changed", (event) => {

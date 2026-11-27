@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { queueFaceThumbnail } from "../utils/photoRequests";
+import { createFaceThumbnailQueue } from "../utils/photoRequests";
 import type {
   Photo, PhotoPage, PhotoCursor, PhotoFilter, AiClassification,
   FaceDetection, FaceCluster, CustomAttribute, Project,
@@ -147,6 +147,20 @@ export async function getClusterPage(tab: "named" | "unnamed" | "review", offset
 
 export async function renameCluster(clusterId: number, name: string): Promise<void> {
   return invoke("cmd_rename_cluster", { clusterId, name });
+}
+
+export interface PersonAvatarPage {
+  items: { face_id: number; filename: string }[];
+  selected_face_id: number | null;
+  next_after: number | null;
+}
+
+export function getPersonAvatarChoices(personId: number, after: number | null) {
+  return invoke<PersonAvatarPage>("cmd_get_person_avatar_choices", { personId, after });
+}
+
+export function savePersonProfile(personId: number, name: string, avatarFaceId: number | null) {
+  return invoke<void>("cmd_save_person_profile", { personId, name, avatarFaceId });
 }
 
 export async function confirmFaceCluster(clusterId: number): Promise<void> {
@@ -365,8 +379,8 @@ export async function workerHealth(): Promise<boolean> {
   return invoke<boolean>("cmd_worker_health");
 }
 
-export async function startAiWorker(port?: number): Promise<string> {
-  return invoke<string>("cmd_start_ai_worker", { port: port ?? 9876 });
+export async function startAiWorker(port?: number, restart = false): Promise<string> {
+  return invoke<string>("cmd_start_ai_worker", { port: port ?? 9876, restart });
 }
 
 export async function runAiClassification(batchSize?: number): Promise<number> {
@@ -401,8 +415,15 @@ export interface AutomaticFaceMergeCandidate {
   named_target_name?: string | null;
 }
 
-export async function previewAutoMergeUnnamedFaces(threshold: number): Promise<AutomaticFaceMergeCandidate[]> {
-  return invoke<AutomaticFaceMergeCandidate[]>("cmd_preview_auto_merge_unnamed_faces", { threshold });
+export interface AutomaticFaceMergeProgress {
+  stage: string;
+  done: number;
+  total: number;
+  skipped: number;
+}
+
+export async function previewAutoMergeUnnamedFaces(threshold: number, requestId: string) {
+  return invoke<{ candidates: AutomaticFaceMergeCandidate[]; skipped: number }>("cmd_preview_auto_merge_unnamed_faces", { threshold, requestId });
 }
 
 export async function applyAutoMergeUnnamedFaces(mergeGroups: number[][], threshold: number, namedTargetIds: number[]): Promise<string> {
@@ -421,8 +442,25 @@ export async function hasAutomaticFaceMergeToUndo(): Promise<boolean> {
   return invoke<boolean>("cmd_has_automatic_face_merge_to_undo");
 }
 
-export async function getClusterFaceThumbnail(clusterId: number, signal?: AbortSignal): Promise<string> {
-  return queueFaceThumbnail(() => invoke<string>("cmd_get_cluster_face_thumbnail", { clusterId }), signal);
+type FaceThumbnailRequest =
+  | { kind: "cluster"; id: number; usePersonAvatar: boolean }
+  | { kind: "face"; id: number };
+
+const queueFaceThumbnail = createFaceThumbnailQueue<FaceThumbnailRequest>(async (requests, cacheOnly, signal) => {
+  const batchId = crypto.randomUUID();
+  const cancel = () => { void invoke("cmd_cancel_face_thumbnail_batch", { batchId }).catch(() => {}); };
+  signal.addEventListener("abort", cancel, { once: true });
+  try {
+    return await invoke<{ url: string | null; error: string | null }[]>(
+      "cmd_get_face_thumbnail_batch", { requests, cacheOnly, batchId },
+    );
+  } finally {
+    signal.removeEventListener("abort", cancel);
+  }
+});
+
+export async function getClusterFaceThumbnail(clusterId: number, signal?: AbortSignal, usePersonAvatar = true): Promise<string> {
+  return queueFaceThumbnail({ kind: "cluster", id: clusterId, usePersonAvatar }, signal);
 }
 
 export interface SuspectedFace {
@@ -453,7 +491,7 @@ export async function restoreAllIgnoredFaces(): Promise<string> {
 }
 
 export async function getFaceThumbnail(faceId: number, signal?: AbortSignal): Promise<string> {
-  return queueFaceThumbnail(() => invoke<string>("cmd_get_face_thumbnail", { faceId }), signal);
+  return queueFaceThumbnail({ kind: "face", id: faceId }, signal);
 }
 
 export async function keepSuspectedFace(faceId: number): Promise<void> {
@@ -532,6 +570,7 @@ export interface AiWorkerDiagnostics {
   status: "idle" | "starting" | "ready" | "exited" | "failed";
   port: number;
   pid: number | null;
+  port_conflict?: string | null;
   entries: {
     id: number;
     occurred_at: number;

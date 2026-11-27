@@ -9,7 +9,7 @@ import faulthandler
 import logging
 import subprocess
 import tempfile
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from concurrent.futures import ThreadPoolExecutor
 
 if __name__ == "__main__" and sys.stderr is not None:
@@ -147,6 +147,7 @@ class ClusterFaceResponse(BaseModel):
     assignments: List[ClusterAssignment]
 
 class ClusterFacesV2Request(BaseModel):
+    request_id: Optional[str] = None
     embeddings_dir: str
     existing_clusters: Optional[Dict[str, int]] = None
     threshold: Optional[float] = 0.6
@@ -157,6 +158,7 @@ class ClusterFacesV2Request(BaseModel):
     qualities: Optional[Dict[str, float]] = None
 
 class AutomaticMergeRequest(BaseModel):
+    request_id: Optional[str] = None
     embeddings_dir: str
     unnamed_clusters: Dict[str, int]
     named_cluster_ids: Optional[List[int]] = None
@@ -474,10 +476,49 @@ async def cluster_faces(req: ClusterFaceRequest) -> ClusterFaceResponse:
     return ClusterFaceResponse(assignments=assignments)
 
 
+_clustering_progress = {}
+
+
+class ProgressAccessFilter(logging.Filter):
+    def filter(self, record):
+        if isinstance(record.args, tuple) and len(record.args) == 5:
+            _, method, path, _, status = record.args
+            if method == "GET" and status == 200 and isinstance(path, str):
+                return path not in ("/health", "/runtime") and not path.startswith((
+                    "/cluster_faces_v2/progress/", "/plan_automatic_face_merges/progress/",
+                ))
+        return True
+
+
+@app.get("/cluster_faces_v2/progress/{request_id}")
+async def face_clustering_progress(request_id: str):
+    return _clustering_progress.get(request_id)
+
+
 @app.post("/cluster_faces_v2")
 def cluster_faces_v2(req: ClusterFacesV2Request):
-    """Enhanced clustering with adaptive eps and constraints."""
-    from face_clusterer import cluster_faces_v2 as cluster_v2
+    """Group detected faces using existing features and constraints."""
+    finished = Event()
+    context = req.request_id or "background"
+    current_stage = "load_worker"
+    updated = time.monotonic()
+
+    def progress(stage, done, total, skipped=0):
+        nonlocal current_stage, updated
+        if stage != current_stage:
+            logger.info("人脸分组 %s · %s · 跳过 %d 份特征", context, stage, skipped)
+        current_stage = stage
+        updated = time.monotonic()
+        if req.request_id is not None:
+            _clustering_progress[req.request_id] = dict(stage=stage, done=done, total=total, skipped=skipped)
+
+    def watch_stall():
+        while not finished.wait(45):
+            idle_seconds = time.monotonic() - updated
+            if idle_seconds >= 45:
+                logger.warning("人脸分组 %s · %s 已 %.0f 秒未更新。以下是当前线程栈。", context, current_stage, idle_seconds)
+                if sys.stderr is not None:
+                    faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
 
     embeddings_dir = req.embeddings_dir
     if not os.path.exists(embeddings_dir):
@@ -487,17 +528,29 @@ def cluster_faces_v2(req: ClusterFacesV2Request):
     global _last_cluster_ms
     start = time.perf_counter()
     review_files = []
-    results = cluster_v2(
-        embeddings_dir,
-        existing_clusters=req.existing_clusters or {},
-        threshold=req.threshold or 0.6,
-        must_links=req.must_links or [],
-        cannot_links=req.cannot_links or [],
-        candidate_files=req.candidate_files,
-        memberships=req.memberships,
-        qualities=req.qualities,
-        review_files=review_files,
-    )
+    Thread(target=watch_stall, daemon=True).start()
+    try:
+        progress("load_worker", 0, 0)
+        from face_clusterer import cluster_faces_v2 as cluster_v2
+
+        results = cluster_v2(
+            embeddings_dir,
+            existing_clusters=req.existing_clusters or {},
+            threshold=req.threshold or 0.6,
+            must_links=req.must_links or [],
+            cannot_links=req.cannot_links or [],
+            candidate_files=req.candidate_files,
+            memberships=req.memberships,
+            qualities=req.qualities,
+            review_files=review_files,
+            progress=progress,
+        )
+    except Exception as error:
+        logger.exception("人脸分组 %s 在阶段 %s 失败", context, current_stage)
+        raise HTTPException(status_code=500, detail=f"{current_stage}: {type(error).__name__}: {error}") from error
+    finally:
+        finished.set()
+        _clustering_progress.pop(req.request_id, None)
     # Convert numpy ints to plain Python ints for JSON serialization
     _last_cluster_ms = 1000 * (time.perf_counter() - start)
     plain_results = {k: int(v) for k, v in results.items()}
@@ -505,22 +558,49 @@ def cluster_faces_v2(req: ClusterFacesV2Request):
     return {"clusters": plain_results, "review_files": review_files}
 
 
+_merge_progress = {}
+_merge_preview_lock = Lock()
+
+
+@app.get("/plan_automatic_face_merges/progress/{request_id}")
+async def automatic_merge_progress(request_id: str):
+    return _merge_progress.get(request_id)
+
+
 @app.post("/plan_automatic_face_merges")
 def plan_automatic_face_merges(req: AutomaticMergeRequest):
     """Suggest merges with an optional named destination."""
-    from face_clusterer import plan_automatic_cluster_merges
+    if not _merge_preview_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="已有相似人物分析在运行，请稍后重试")
 
-    if not os.path.exists(req.embeddings_dir):
-        raise HTTPException(status_code=400, detail="Embeddings directory not found")
-    candidates = plan_automatic_cluster_merges(
-        req.embeddings_dir,
-        req.unnamed_clusters,
-        threshold=req.threshold,
-        cannot_links=req.cannot_links or [],
-        return_details=True,
-        named_cluster_ids=req.named_cluster_ids,
-    )
-    return {"candidates": candidates}
+    def progress(stage, done, total, skipped=0):
+        if req.request_id is not None:
+            _merge_progress[req.request_id] = dict(
+                stage=stage, done=done, total=total, skipped=skipped
+            )
+
+    try:
+        progress("load_worker", 0, 0)
+        from face_clusterer import plan_automatic_cluster_merges
+
+        if not os.path.isdir(req.embeddings_dir):
+            raise HTTPException(status_code=400, detail="找不到人脸特征缓存目录")
+        candidates = plan_automatic_cluster_merges(
+            req.embeddings_dir,
+            req.unnamed_clusters,
+            threshold=req.threshold,
+            cannot_links=req.cannot_links or [],
+            return_details=True,
+            named_cluster_ids=req.named_cluster_ids,
+            progress=progress,
+        )
+        skipped = _merge_progress.get(req.request_id, {}).get("skipped", 0)
+        return {"candidates": candidates, "skipped": skipped}
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    finally:
+        _merge_progress.pop(req.request_id, None)
+        _merge_preview_lock.release()
 
 
 @app.post("/compute_face_quality")
@@ -562,9 +642,10 @@ def _bind_managed_listener(port: int) -> socket.socket:
             return listener
         except OSError as error:
             listener.close()
-            in_use = error.errno == errno.EADDRINUSE or getattr(error, "winerror", None) == 10048
-            if not candidate or not in_use:
+            unavailable = error.errno == errno.EADDRINUSE or getattr(error, "winerror", None) in (10013, 10048)
+            if not candidate or not unavailable:
                 raise
+            print(f"WARNING: Cannot bind 127.0.0.1:{candidate}: {error}; trying an available port", file=sys.stderr, flush=True)
 
 
 def main():
@@ -573,6 +654,7 @@ def main():
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     port = int(os.environ.get("AI_WORKER_PORT", "9876"))
+    logging.getLogger("uvicorn.access").addFilter(ProgressAccessFilter())
     print(
         f"Models directory: {os.environ.get('AI_MODELS_DIR', os.path.join(os.path.dirname(__file__), 'models'))}",
         flush=True,

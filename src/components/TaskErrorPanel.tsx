@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   clearTaskErrorHistory, getIgnoredTaskPhotos, getTaskErrorPhotos, getTaskErrors, ignoreTaskErrorPhotos, restoreTaskPhoto,
-  checkAiPhoto, clearAiWorkerDiagnostics, getAiWorkerDiagnostics, startAiWorker,
+  checkAiPhoto, clearAiWorkerDiagnostics, getAiWorkerDiagnostics, startAiWorker, workerHealth,
   type AiWorkerDiagnostics, type IgnoredTaskPhotos, type TaskErrorGroup, type TaskErrorGroupPhotos, type TaskErrorPage,
 } from "../api/tauri";
 import Icon from "./Icon";
@@ -50,7 +50,7 @@ function groupId(group: TaskErrorGroup) {
 }
 
 const workerStatuses: Record<AiWorkerDiagnostics["status"], string> = {
-  idle: "尚未启动", starting: "正在启动", ready: "已就绪", exited: "进程已退出", failed: "启动失败",
+  idle: "尚未启动", starting: "正在启动", ready: "已就绪", exited: "进程已退出", failed: "服务失败",
 };
 
 const logSources: Record<AiWorkerDiagnostics["entries"][number]["source"], string> = {
@@ -204,21 +204,26 @@ export default function TaskErrorPanel({ projectPath, current, stages, runtime }
     }, (count) => `已清空 ${count} 条历史错误记录`, "没有可清空的历史错误记录");
   }
 
-  async function runWorkerCheck(withPhoto = false) {
+  async function runWorkerCheck(action: "check" | "restart" | "photo" = "check") {
     setCheckingWorker(true);
     setActionError("");
     setWorkerCheckResult("");
     try {
-      if (withPhoto) {
+      if (action === "photo") {
         const path = await open({ title: "选择一张照片测试 AI", multiple: false });
         if (typeof path !== "string") return;
         const { faces, tags } = await checkAiPhoto(path);
         const faceResult = "Ok" in faces ? `人脸检测成功，找到 ${faces.Ok} 张人脸` : `人脸检测失败\n${faces.Err}`;
         const sceneResult = "Ok" in tags ? `场景分类成功，返回 ${tags.Ok} 个标签` : `场景分类失败\n${tags.Err}`;
         setWorkerCheckResult(`${faceResult}\n${sceneResult}`);
+      } else if (action === "restart") {
+        await startAiWorker(undefined, true);
+        setWorkerCheckResult("本地 AI 服务已重启。");
       } else {
-        await startAiWorker(worker?.port);
-        setWorkerCheckResult("本地 AI 服务已通过启动检查");
+        const healthy = await workerHealth();
+        setWorkerCheckResult(healthy
+          ? "本地 AI 服务已响应。任务进度请查看任务概览。"
+          : "本地 AI 服务未通过健康检查。可查看服务日志和任务状态。");
       }
     } catch (error) {
       setWorkerCheckResult(String(error));
@@ -231,7 +236,8 @@ export default function TaskErrorPanel({ projectPath, current, stages, runtime }
   const workerStatus = worker ? `${workerStatuses[worker.status]} · 127.0.0.1:${worker.port}${worker.pid ? ` · PID ${worker.pid}` : ""}` : "";
   const workerEntries = worker?.entries ?? [];
   const latestWorkerEntries = [...workerEntries].reverse();
-  const lastWorkerError = latestWorkerEntries.find((entry) => entry.source === "error" || entry.source === "warning");
+  const latestWorkerStart = latestWorkerEntries.find((entry) => entry.source === "service" && entry.message === "正在启动本地 AI 服务。");
+  const lastWorkerError = latestWorkerEntries.find((entry) => entry.source === "error" && (!latestWorkerStart || entry.id >= latestWorkerStart.id));
 
   function clearWorkerHistory() {
     if (clearWorkerThrough == null) return;
@@ -245,6 +251,7 @@ export default function TaskErrorPanel({ projectPath, current, stages, runtime }
   async function copy() {
     const serviceReport = worker ? [
       `本地 AI 服务 · ${workerStatus}`,
+      ...(worker.port_conflict ? [worker.port_conflict] : []),
       ...(worker.log_error ? [`日志文件错误\n${worker.log_error}`] : []),
       ...workerEntries.map((entry) =>
         `${errorTime(entry.occurred_at)} · ${logSources[entry.source]}${entry.pid ? ` · PID ${entry.pid}` : ""}\n${entry.message}`),
@@ -286,15 +293,17 @@ export default function TaskErrorPanel({ projectPath, current, stages, runtime }
               <p className="mt-1 text-text-secondary">{workerStatus || (workerReadError ? "状态读取失败" : "正在读取服务状态…")}</p>
             </div>
             <div className="ui-toolbar">
-              <button type="button" className="ui-button" disabled={checkingWorker || worker?.status === "starting"} onClick={() => void runWorkerCheck()}>检查 AI 服务</button>
-              <button type="button" className="ui-button" disabled={checkingWorker || worker?.status === "starting"} onClick={() => void runWorkerCheck(true)}>测试单张照片</button>
+              <button type="button" className="ui-button" disabled={checkingWorker} title="只查看服务是否响应" onClick={() => void runWorkerCheck()}>检查 AI 服务</button>
+              <button type="button" className="ui-button" disabled={checkingWorker || worker?.status === "starting"} onClick={() => void runWorkerCheck("restart")}>重启 AI 服务</button>
+              <button type="button" className="ui-button" disabled={checkingWorker || worker?.status === "starting"} onClick={() => void runWorkerCheck("photo")}>测试单张照片</button>
             </div>
           </div>
           {workerReadError && <p className="mt-2 break-words text-red-500">{workerReadError}</p>}
           {worker?.log_error && <p className="mt-2 break-words text-red-500">日志文件错误 · {worker.log_error}</p>}
+          {worker?.port_conflict && <p className="mt-2 break-words text-amber-700 dark:text-amber-300">{worker.port_conflict}</p>}
           {lastWorkerError && <div className="mt-2 text-red-500">
             <ErrorTimestamp timestamp={lastWorkerError.occurred_at} />
-            <p className="mt-1 break-words">{lastWorkerError.message.split("\n")[0]}</p>
+            <p className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap break-words">{lastWorkerError.message}</p>
           </div>}
           {checkingWorker && <p role="status" className="mt-2 text-text-secondary">正在检查 AI 服务…</p>}
           {workerCheckResult && <p role="status" className="mt-2 whitespace-pre-wrap break-words text-text-secondary">{workerCheckResult}</p>}

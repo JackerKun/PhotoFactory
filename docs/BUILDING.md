@@ -117,6 +117,27 @@ src-tauri\target\release\bundle\nsis\*-setup.exe
 
 Windows Git Bash 也可以运行 `RUN_TESTS=1 ./build.sh windows`，但推荐使用 PowerShell 脚本。
 
+### 5.3 Mac 上改代码，在内网 Windows 验证
+
+1. 通过远程桌面连接一台内网 Windows 电脑。用 SMB 共享或远程桌面的文件夹重定向传输源码，包括还未提交的修改。
+2. 把源码放到 Windows 本地磁盘，例如 `E:\PhotoFactory`。在固定目录反复构建，可以复用 Windows 机器上的 `node_modules`、`ai_worker/.venv`、模型和 Rust 构建缓存。
+3. 只验证界面和 AI 功能时，在该目录的 **Git Bash** 运行：
+
+   ```bash
+   bash start.sh
+   ```
+
+   首次运行会准备依赖和模型，并打开 PhotoFactory。开发版可用于验证相似人物分析和进度显示。
+4. 需要验证安装或把安装包复制到另一台电脑时，在该目录的 **PowerShell** 运行：
+
+   ```powershell
+   .\build-windows.ps1 -SkipTests -Installer NSIS -Target x86_64-pc-windows-msvc
+   ```
+
+   安装包位于 `src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis\`。Windows ARM64 构建机可用 `-Target aarch64-pc-windows-msvc`，仍需 x64 Python 和 ARM64 C++ 工具链。首次下载依赖、模型与打包工具仍需要联网。
+
+通过 RemoteAgent 构建时，任务在接收端登记的 Windows 项目根目录执行。接收端只接收缺少的文件内容，只覆盖本次同步范围内发生变化的文件，保留目标机的依赖和构建缓存。脚本会复用通过 DirectML 检查且与当前 AI 源码匹配的 Worker 和模型。也可用 `-ReusePreparedFrom` 手动指定已准备的项目目录。前端依赖首次建立记录或清单变化时从锁文件安装，会优先读取本机缓存。需要重新下载 Python 依赖时，脚本会延长超时并重试。
+
 ## 6. GitHub Actions 四架构构建与 Release
 
 工作流：`.github/workflows/release.yml`，名称 **Build desktop installers**。推送稳定版本标签 `vX.Y.Z` 后触发；在 Actions 页面手动运行分支只构建 artifact，不创建 Release。手动选择版本标签运行则按标签发布。
@@ -276,7 +297,7 @@ Get-FileHash src-tauri\target\release\bundle\nsis\*-setup.exe -Algorithm SHA256
 确认企业代理允许 Tauri 获取 WiX 工具；也可以暂时只构建 NSIS：
 
 ```powershell
-npm run tauri -- build --bundles nsis --config src-tauri/tauri.bundle-ai.conf.json
+.\build-windows.ps1 -SkipTests -Installer NSIS
 ```
 
 ### AI Worker 体积较大

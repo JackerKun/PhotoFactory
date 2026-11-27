@@ -3,6 +3,7 @@ import * as api from "../api/tauri";
 import { useStore } from "../hooks/usePhotos";
 import type { LibraryJob, ThumbnailPerformance } from "../types";
 import Icon from "./Icon";
+import FaceClusteringStatus, { isGroupingFaces } from "./FaceClusteringStatus";
 import TaskErrorPanel, { type CurrentTaskError } from "./TaskErrorPanel";
 
 const stages: Record<string, string> = {
@@ -206,17 +207,17 @@ export default function TaskCenter() {
           {hasAi && ai && <section className="task-card task-card-padding">
             <div className="flex justify-between gap-3 font-medium"><h3>{stages[ai.stage!] ?? "智能分析"}</h3><span className={`text-sm ${ai.status === "error" ? "text-red-500" : "text-text-secondary"}`}>{ai.status === "error" ? "任务中断" : ai.status === "done" && (ai.failed ?? 0) > 0 ? "部分失败" : statuses[ai.status ?? ai.stage!] ?? "进行中"}</span></div>
             {ai.stage === "geo_tagging" && <p className="mt-1 text-xs text-text-secondary">正在联网查找照片的 GPS 地点名称。</p>}
-            {(ai.stage === "clustering" || ai.stage === "recovering_faces") && ai.processed === 0 &&
-              <p className="mt-1 text-xs text-text-secondary">正在整理第一批人脸，完成后更新计数。</p>}
-            {(ai.status !== "done" || ai.total > 0) && <Progress value={ai.processed} total={ai.total} />}
-            <p className="mt-2 text-sm text-text-secondary">已标记失败 {ai.failed ?? 0}{ai.eta_seconds != null && ai.status === "running" ? ` · 预计剩余 ${Math.ceil(ai.eta_seconds / 60)} 分钟` : ""}</p>
+            {isGroupingFaces(ai)
+              ? <div className="mt-1"><FaceClusteringStatus ai={ai} /></div>
+              : (ai.status !== "done" || ai.total > 0) && <Progress value={ai.processed} total={ai.total} />}
+            <p className="mt-2 text-sm text-text-secondary">{ai.stage === "clustering_error" ? `仍待分组 ${(ai.failed ?? 0).toLocaleString()} 张` : `已标记失败 ${ai.failed ?? 0}`}{ai.eta_seconds != null && ai.status === "running" ? ` · 预计剩余 ${Math.ceil(ai.eta_seconds / 60)} 分钟` : ""}</p>
             {ai.status === "running" && (ai.stage === "face_detection" || ai.stage === "classification") && (ai.failed ?? 0) > 0 &&
               <p className="mt-1 text-xs text-text-secondary">已跳过失败的照片，正在处理其余照片。可查看错误记录，本轮结束后重试。</p>}
-            {ai.status === "error" && <p className="mt-1 text-xs text-text-secondary">继续处理未完成的任务。已标记失败的照片可单独重试。</p>}
+            {ai.status === "error" && <p className="mt-1 text-xs text-text-secondary">{ai.stage === "clustering_error" ? "查看错误详情，处理后可继续归组。" : "继续处理未完成的任务。已标记失败的照片可单独重试。"}</p>}
             <div className="ui-toolbar mt-2 empty:hidden">
               {ai.status === "running" && <><button disabled={busy} onClick={() => void act(() => api.controlAiPipeline("pause"))} className="ui-button">暂停</button><button disabled={busy} onClick={() => void act(() => api.controlAiPipeline("cancel"))} className="ui-button">停止</button></>}
               {["paused", "canceled", "error"].includes(ai.status ?? ai.stage!) && <button disabled={busy} onClick={() => void act(() => api.controlAiPipeline("resume"))} className="ui-button">继续</button>}
-              {(ai.failed ?? 0) > 0 && <button disabled={busy || ai.status === "running"} onClick={() => void act(() => api.controlAiPipeline("retry"))} className="ui-button">重试失败</button>}
+              {ai.stage !== "clustering_error" && (ai.failed ?? 0) > 0 && <button disabled={busy || ai.status === "running"} onClick={() => void act(() => api.controlAiPipeline("retry"))} className="ui-button">重试失败</button>}
             </div>
           </section>}
           {runtime && <section className="task-card task-card-padding text-sm">

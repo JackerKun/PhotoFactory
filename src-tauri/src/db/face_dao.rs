@@ -211,9 +211,17 @@ pub fn get_faces_for_photo(
     conn: &rusqlite::Connection,
     photo_id: i64,
 ) -> AppResult<Vec<FaceDetection>> {
-    let mut stmt = conn.prepare("SELECT id, photo_id, bbox_x, bbox_y, bbox_w, bbox_h, embedding_path, person_id, created_at FROM face_detections WHERE photo_id = ?")?;
+    photo_faces(conn, photo_id, true)
+}
+
+pub fn get_visible_faces_for_photo(conn: &rusqlite::Connection, photo_id: i64) -> AppResult<Vec<FaceDetection>> {
+    photo_faces(conn, photo_id, false)
+}
+
+fn photo_faces(conn: &rusqlite::Connection, photo_id: i64, include_ignored: bool) -> AppResult<Vec<FaceDetection>> {
+    let mut stmt = conn.prepare("SELECT id, photo_id, bbox_x, bbox_y, bbox_w, bbox_h, embedding_path, person_id, created_at FROM face_detections WHERE photo_id = ?1 AND (?2 OR COALESCE(review_status, 'active') <> 'ignored')")?;
     let rows = stmt
-        .query_map([photo_id], |r| {
+        .query_map(params![photo_id, include_ignored], |r| {
             Ok(FaceDetection {
                 id: r.get(0)?,
                 photo_id: r.get(1)?,
@@ -426,7 +434,13 @@ pub fn reset_automatic_clusters(conn: &rusqlite::Connection) -> AppResult<usize>
 
 pub fn rename_cluster(conn: &rusqlite::Connection, cluster_id: i64, name: &str) -> AppResult<()> {
     let tx = conn.unchecked_transaction()?;
-    let updated = tx.execute(
+    rename_cluster_rows(&tx, cluster_id, name)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn rename_cluster_rows(conn: &rusqlite::Connection, cluster_id: i64, name: &str) -> AppResult<()> {
+    let updated = conn.execute(
         "UPDATE face_clusters SET name = ? WHERE id = ?",
         params![name, cluster_id],
     )?;
@@ -435,12 +449,78 @@ pub fn rename_cluster(conn: &rusqlite::Connection, cluster_id: i64, name: &str) 
             "Person {cluster_id} not found"
         )));
     }
-    tx.execute(
+    conn.execute(
         "UPDATE face_detections SET review_status = 'active' WHERE person_id = ?1 AND review_status = 'identity_review'",
         [cluster_id],
     )?;
+    Ok(())
+}
+
+pub fn save_person_profile(conn: &rusqlite::Connection, person_id: i64, name: &str, avatar_face_id: Option<i64>) -> AppResult<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(crate::error::AppError::Project("请输入人物姓名。".into()));
+    }
+    let tx = conn.unchecked_transaction()?;
+    rename_cluster_rows(&tx, person_id, name)?;
+    set_cluster_confidence(&tx, person_id, "high")?;
+    if let Some(face_id) = avatar_face_id {
+        let updated = tx.execute(
+            "INSERT INTO person_avatars(person_id, face_id)
+             SELECT fd.person_id, fd.id FROM face_detections fd JOIN photos p ON p.id = fd.photo_id
+             WHERE fd.id = ?2 AND fd.person_id = ?1 AND p.deleted = 0
+               AND COALESCE(fd.review_status, 'active') <> 'ignored'
+             ON CONFLICT(person_id) DO UPDATE SET face_id = excluded.face_id",
+            params![person_id, face_id],
+        )?;
+        if updated == 0 {
+            return Err(crate::error::AppError::Project("这张人脸已不属于该人物，或照片已移除。请重新选择头像。".into()));
+        }
+    } else {
+        tx.execute("DELETE FROM person_avatars WHERE person_id = ?1", [person_id])?;
+    }
     tx.commit()?;
     Ok(())
+}
+
+pub fn person_avatar_face_id(conn: &rusqlite::Connection, person_id: i64) -> AppResult<Option<i64>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT a.face_id FROM person_avatars a
+         JOIN face_detections fd ON fd.id = a.face_id AND fd.person_id = a.person_id
+         JOIN photos p ON p.id = fd.photo_id
+         WHERE a.person_id = ?1 AND p.deleted = 0 AND COALESCE(fd.review_status, 'active') <> 'ignored'",
+        [person_id], |row| row.get(0),
+    ).optional().map_err(Into::into)
+}
+
+#[derive(serde::Serialize)]
+pub struct AvatarChoice {
+    face_id: i64,
+    filename: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct AvatarChoicePage {
+    items: Vec<AvatarChoice>,
+    selected_face_id: Option<i64>,
+    next_after: Option<i64>,
+}
+
+pub fn person_avatar_choices(conn: &rusqlite::Connection, person_id: i64, after: Option<i64>) -> AppResult<AvatarChoicePage> {
+    const PAGE: usize = 24;
+    let mut stmt = conn.prepare(
+        "SELECT fd.id, p.filename FROM face_detections fd JOIN photos p ON p.id = fd.photo_id
+         WHERE fd.person_id = ?1 AND fd.id > ?2 AND p.deleted = 0
+           AND COALESCE(fd.review_status, 'active') <> 'ignored'
+         ORDER BY fd.id LIMIT ?3",
+    )?;
+    let mut items = stmt.query_map(params![person_id, after.unwrap_or(i64::MIN), PAGE + 1], |row| {
+        Ok(AvatarChoice { face_id: row.get(0)?, filename: row.get(1)? })
+    })?.collect::<Result<Vec<_>, _>>()?;
+    let next_after = (items.len() > PAGE).then(|| items[PAGE - 1].face_id);
+    items.truncate(PAGE);
+    Ok(AvatarChoicePage { items, selected_face_id: person_avatar_face_id(conn, person_id)?, next_after })
 }
 
 /// Persist a user's review decision for an automatically created person.
@@ -1225,7 +1305,7 @@ pub fn ignore_automatic_clusters(
     let mut ignored_faces = 0usize;
     for id in ids {
         let name = match tx.query_row(
-            "SELECT TRIM(COALESCE(fc.name, pm.user_name, ''))
+            "SELECT COALESCE(NULLIF(TRIM(fc.name), ''), NULLIF(TRIM(pm.user_name), ''), '')
              FROM face_clusters fc LEFT JOIN person_metadata pm ON pm.person_id = fc.id
              WHERE fc.id = ?1",
             [id],
@@ -1997,6 +2077,42 @@ mod merge_tests {
     }
 
     #[test]
+    fn custom_avatar_uses_owned_faces_and_survives_maintenance() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::db::schema::CREATE_TABLES).unwrap();
+        conn.execute_batch("INSERT INTO face_clusters (id, name, face_count, created_at) VALUES (1, '甲', 25, 1), (2, NULL, 1, 1);").unwrap();
+        for id in 1..=26 {
+            conn.execute(
+                "INSERT INTO photos (id, path, filename, file_size, file_mtime, imported_at) VALUES (?1, ?2, ?3, 1, 1, 1)",
+                params![id, format!("/{id}.jpg"), format!("{id}.jpg")],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO face_detections (id, photo_id, person_id, created_at) VALUES (?1, ?1, ?2, 1)",
+                params![id, if id == 26 { 2 } else { 1 }],
+            ).unwrap();
+        }
+        save_person_profile(&conn, 1, "甲", Some(25)).unwrap();
+        let first = person_avatar_choices(&conn, 1, None).unwrap();
+        assert_eq!(first.items.len(), 24);
+        assert_eq!(first.selected_face_id, Some(25));
+        let last = person_avatar_choices(&conn, 1, first.next_after).unwrap();
+        assert_eq!(last.items.len(), 1);
+        assert_eq!(last.items[0].filename, "25.jpg");
+        assert_eq!(last.next_after, None);
+        assert!(save_person_profile(&conn, 1, "不该保存", Some(26)).is_err());
+        let name: String = conn.query_row("SELECT name FROM face_clusters WHERE id = 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(name, "甲");
+        reset_automatic_clusters(&conn).unwrap();
+        prepare_face_reanalysis(&conn).unwrap();
+        assert_eq!(person_avatar_face_id(&conn, 1).unwrap(), Some(25));
+        save_person_profile(&conn, 1, "甲", None).unwrap();
+        assert_eq!(person_avatar_face_id(&conn, 1).unwrap(), None);
+        save_person_profile(&conn, 1, "甲", Some(25)).unwrap();
+        conn.execute("DELETE FROM face_detections WHERE id = 25", []).unwrap();
+        assert_eq!(person_avatar_face_id(&conn, 1).unwrap(), None);
+    }
+
+    #[test]
     fn ignored_automatic_people_stay_ignored_across_reanalysis() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(crate::db::schema::CREATE_TABLES)
@@ -2011,7 +2127,7 @@ mod merge_tests {
                 params![id, if id == 2 { Some("已命名") } else { None }],
             ).unwrap();
             conn.execute(
-                "INSERT INTO face_detections (id, photo_id, person_id, review_status, created_at) VALUES (?1, ?1, ?1, 'active', 1)",
+                "INSERT INTO face_detections (id, photo_id, person_id, bbox_x, bbox_y, bbox_w, bbox_h, review_status, created_at) VALUES (?1, ?1, ?1, 10, 10, 40, 40, 'active', 1)",
                 [id],
             ).unwrap();
         }
@@ -2025,6 +2141,8 @@ mod merge_tests {
             )
             .unwrap();
         assert_eq!(ignored, (None, "ignored".into()));
+        assert!(get_visible_faces_for_photo(&conn, 1).unwrap().is_empty());
+        assert_eq!(get_faces_for_photo(&conn, 1).unwrap().len(), 1);
         assert_eq!(get_ignored_face_count(&conn).unwrap(), 1);
         assert!(ignore_automatic_clusters(&conn, &[2]).is_err());
 

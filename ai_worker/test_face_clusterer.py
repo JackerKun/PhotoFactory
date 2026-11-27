@@ -1,13 +1,36 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
-from face_clusterer import cluster_faces_v2, plan_automatic_cluster_merges
+from face_clusterer import _complete_link_labels, cluster_faces_v2, plan_automatic_cluster_merges
 
 
 class FaceClustererTests(unittest.TestCase):
+    def test_complete_link_keeps_pairs_at_the_cutoff_separate(self):
+        distances = np.array([[0, 0.125, 0.25], [0.125, 0, 0.25], [0.25, 0.25, 0]])
+        labels = _complete_link_labels(distances, 0.25, lambda *_: None)
+        np.testing.assert_array_equal(labels, [0, 0, 2])
+
+    def test_first_batch_groups_without_loading_scipy_or_sklearn(self):
+        from builtins import __import__ as import_module
+
+        def checked_import(name, *args, **kwargs):
+            if name.split(".", 1)[0] in ("scipy", "sklearn"):
+                raise AssertionError(f"Incremental grouping loaded {name}")
+            return import_module(name, *args, **kwargs)
+
+        vectors = {index << 8: [1, 0] if index % 2 else [0, 1] for index in range(1, 1001)}
+        phases = []
+        with patch("builtins.__import__", side_effect=checked_import):
+            result = self.run_cluster(vectors, progress=lambda *event: phases.append(event))
+
+        self.assertEqual(len(result), 1000)
+        self.assertEqual(len(set(result.values())), 2)
+        self.assertIn(("run_linkage", 992, 999, 0), phases)
+
     def test_complete_link_does_not_chain_different_people(self):
         # A-B and B-C are near neighbours, but A-C are not. DBSCAN merged this
         # kind of chain; complete linkage must keep C separate.
@@ -51,6 +74,20 @@ class FaceClustererTests(unittest.TestCase):
 
         self.assertEqual(set(result), {"00000100.npy", "00000200.npy"})
         self.assertEqual(result["00000200.npy"], 9)
+
+    def test_incremental_progress_reports_unreadable_features_and_keeps_valid_faces(self):
+        phases = []
+        result = self.run_cluster(
+            {0x100: [1, 0], 0x200: [1, 0]},
+            existing_clusters={"00000100.npy": 9},
+            candidate_files=["00000200.npy", "00000300.npy"],
+            progress=lambda *event: phases.append(event),
+        )
+        self.assertIn(("read_embeddings", 3, 3, 1), phases)
+        self.assertIn(("compare_people", 0, 1, 1), phases)
+        self.assertEqual(phases[-1][0], "form_groups")
+        self.assertEqual(result["00000200.npy"], 9)
+        self.assertNotIn("00000300.npy", result)
 
     def run_cluster(self, vectors, **kwargs):
         with tempfile.TemporaryDirectory() as directory:
@@ -141,6 +178,22 @@ class FaceClustererTests(unittest.TestCase):
                 plan_automatic_cluster_merges(directory, assignments, 0.72, named_cluster_ids=[10, 20, 30]),
                 [],
             )
+
+    def test_merge_progress_reports_missing_embeddings_and_rejects_an_empty_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            assignments = {"00000100.npy": 10, "00000200.npy": 20, "00000300.npy": 30}
+            for name in list(assignments)[:2]:
+                np.save(os.path.join(directory, name), np.array([1.0, 0.0]))
+            updates = []
+            groups = plan_automatic_cluster_merges(
+                directory, assignments, progress=lambda *update: updates.append(update)
+            )
+            self.assertEqual(groups, [[10, 20]])
+            self.assertIn(("read_embeddings", 3, 3, 1), updates)
+            self.assertIn(("find_neighbors", 2, 2, 1), updates)
+            self.assertEqual(updates[-1], ("build_candidates", 1, 1, 1))
+            with self.assertRaisesRegex(ValueError, "无法读取全部"):
+                plan_automatic_cluster_merges(directory, {"00000300.npy": 30})
 
     def test_post_merge_can_find_pairs_below_the_old_cutoff(self):
         with tempfile.TemporaryDirectory() as directory:

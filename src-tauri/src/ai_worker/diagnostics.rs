@@ -46,6 +46,7 @@ pub struct Snapshot {
     status: WorkerStatus,
     port: u16,
     pid: Option<u32>,
+    port_conflict: Option<String>,
     entries: Vec<Entry>,
     log_error: Option<String>,
 }
@@ -55,6 +56,7 @@ struct Journal {
     status: WorkerStatus,
     port: u16,
     pid: Option<u32>,
+    port_conflict: Option<String>,
     entries: VecDeque<Entry>,
     next_id: u64,
     path: Option<PathBuf>,
@@ -97,6 +99,7 @@ impl WorkerDiagnostics {
                 journal.port
             },
             pid: journal.pid,
+            port_conflict: journal.port_conflict.clone(),
             entries: journal.entries.iter().cloned().collect(),
             log_error: journal.log_error.clone(),
         }
@@ -112,6 +115,14 @@ impl WorkerDiagnostics {
             _ => Source::Service,
         };
         journal.append(source, pid, message);
+    }
+
+    pub fn set_port_conflict(&self, message: Option<String>) {
+        let mut journal = self.0.lock().unwrap();
+        if let Some(detail) = &message {
+            journal.append(Source::Warning, None, detail);
+        }
+        journal.port_conflict = message;
     }
 
     pub fn exited(&self, pid: u32, detail: &str) {

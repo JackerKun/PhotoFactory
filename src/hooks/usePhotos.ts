@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { AiProcessingStatus, Photo, PhotoCursor, PhotoFilter, Project, ThumbnailProcessingStatus } from "../types";
+import type { AiProcessingStatus, FaceClusteringProgress, Photo, PhotoCursor, PhotoFilter, Project, ThumbnailProcessingStatus } from "../types";
 import * as api from "../api/tauri";
 import { readPhotoData } from "../utils/photoRequests";
 
@@ -55,6 +55,7 @@ interface AppState {
   requestMapFocus: (lat: number, lng: number, photoId: number) => void;
   clearMapFocusRequest: () => void;
   aiProcessingStatus: AiProcessingStatus | null;
+  faceClusteringProgress: (FaceClusteringProgress & { updatedAt: number }) | null;
   thumbnailProcessingStatus: ThumbnailProcessingStatus | null;
   setThumbnailProcessingStatus: (status: ThumbnailProcessingStatus | null) => void;
   preloadQueue: number[];
@@ -96,6 +97,7 @@ export const useStore = create<AppState>((set, get) => ({
       loading: false, photoLoadError: null, photoGridScrollOffsets: { square: 0, proportional: 0 },
       lightboxPhotoId: null, lightboxSource: null, selectedPhotoId: null, selectedLightboxSource: null,
       gpsBatchSession: null, batchGpsPending: new Map(),
+      faceClusteringProgress: null,
       _photoRequestGeneration: state._photoRequestGeneration + 1,
     };
   }),
@@ -194,6 +196,7 @@ export const useStore = create<AppState>((set, get) => ({
   }),
   clearMapFocusRequest: () => set({ mapFocusRequest: null }),
   aiProcessingStatus: null,
+  faceClusteringProgress: null,
   thumbnailProcessingStatus: null,
   preloadQueue: [],
   _photoRequestGeneration: 0,
@@ -349,6 +352,7 @@ export const useStore = create<AppState>((set, get) => ({
       mapFocusRequest: null,
       photoRoute: "/", photoGridScrollOffsets: { square: 0, proportional: 0 },
       aiProcessingStatus: null,
+      faceClusteringProgress: null,
       _photoRequestGeneration: state._photoRequestGeneration + 1,
       loading: false,
       photoLoadError: null,

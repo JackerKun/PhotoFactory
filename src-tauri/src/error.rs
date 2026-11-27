@@ -28,6 +28,9 @@ pub enum AppError {
     AiWorker(String),
 
     #[error("{0}")]
+    AiWorkerStalled(String),
+
+    #[error("{0}")]
     LocationLookup(String),
 
     #[error("Not found: {0}")]

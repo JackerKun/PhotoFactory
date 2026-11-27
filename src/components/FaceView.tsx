@@ -1,14 +1,31 @@
-import React, { useEffect, useState, useCallback, useRef } from "react";
+import React, { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { listen } from "@tauri-apps/api/event";
 import type { FaceCluster } from "../types";
 import * as api from "../api/tauri";
 import { useStore } from "../hooks/usePhotos";
 import GroupPhotosView from "./GroupPhotosView";
+import FaceClusteringStatus, { isGroupingFaces } from "./FaceClusteringStatus";
+import Icon from "./Icon";
 
 interface Props { active?: boolean }
 
+const mergeStageLabels: Record<string, string> = {
+  start_worker: "检查本地 AI 服务",
+  read_database: "读取人物分组",
+  load_worker: "等待 AI Worker 开始分析",
+  read_embeddings: "读取人脸特征",
+  prepare_groups: "整理人物特征",
+  find_neighbors: "查找相似人物",
+  compare_pairs: "比较人物组合",
+  build_candidates: "生成合并候选",
+  done: "分析完成",
+};
+
 const FACE_PAGE_SIZE = 96;
+const MERGE_PAGE_SIZE = 24;
+
+const candidateKey = (candidate: api.AutomaticFaceMergeCandidate) => candidate.cluster_ids.join("-");
 
 function selectableMergeMembers(candidate: api.AutomaticFaceMergeCandidate) {
   return candidate.cluster_ids.filter((id) => id !== candidate.named_target_id);
@@ -16,33 +33,79 @@ function selectableMergeMembers(candidate: api.AutomaticFaceMergeCandidate) {
 
 const faceThumbCache = new Map<string, string>();
 const FACE_THUMB_CACHE_MAX = 512;
+const EMPTY_MERGE_SELECTION: readonly number[] = [];
 
-const FaceThumb = React.memo(function FaceThumb({ clusterId, scope, active }: {
-  clusterId: number;
+const faceThumbnailObservers = new WeakMap<Element, {
+  observer: IntersectionObserver;
+  listeners: Map<Element, (visible: boolean) => void>;
+}>();
+
+function observeFaceThumbnail(root: Element, node: Element, onVisibility: (visible: boolean) => void) {
+  let tasks = faceThumbnailObservers.get(root);
+  if (!tasks) {
+    const listeners = new Map<Element, (visible: boolean) => void>();
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        listeners.get(entry.target)?.(entry.isIntersecting);
+      }
+    }, { root });
+    tasks = { observer, listeners };
+    faceThumbnailObservers.set(root, tasks);
+  }
+  const { observer, listeners } = tasks;
+  listeners.set(node, onVisibility);
+  observer.observe(node);
+  return () => { listeners.delete(node); observer.unobserve(node); };
+}
+
+const FaceThumb = React.memo(function FaceThumb({ clusterId, faceId, scope, active, scrollRoot, usePersonAvatar = true }: ({ clusterId: number; faceId?: never } | { faceId: number; clusterId?: never }) & {
   scope: string;
   active: boolean;
+  scrollRoot?: React.RefObject<HTMLDivElement>;
+  usePersonAvatar?: boolean;
 }) {
-  const cacheKey = JSON.stringify([scope, clusterId]);
+  const cacheKey = JSON.stringify([scope, clusterId ?? `face-${faceId}`, clusterId != null && usePersonAvatar]);
   const [result, setResult] = useState<{ key: string; src?: string; error?: string }>();
+  const hasResult = useRef(false);
   const ref = useRef<HTMLSpanElement>(null);
   const current = result?.key === cacheKey ? result : undefined;
-  const thumb = current?.src ?? (!current?.error ? faceThumbCache.get(cacheKey) : undefined);
+  const thumb = current?.src;
 
   useEffect(() => {
     const node = ref.current;
-    if (!node || !active || current) return;
-    if (thumb) {
-      faceThumbCache.delete(cacheKey);
-      faceThumbCache.set(cacheKey, thumb);
-      setResult({ key: cacheKey, src: thumb });
-      return;
-    }
+    if (!node || !active) return;
 
-    const controller = new AbortController();
-    const observer = new IntersectionObserver(([entry]) => {
-      if (!entry?.isIntersecting || controller.signal.aborted) return;
-      observer.disconnect();
-      api.getClusterFaceThumbnail(clusterId, controller.signal)
+    let inFlight: AbortController | undefined;
+    let releaseImage: ReturnType<typeof setTimeout> | undefined;
+    const onVisibility = (visible: boolean) => {
+      clearTimeout(releaseImage);
+      if (!visible) {
+        inFlight?.abort();
+        inFlight = undefined;
+        // Keep decoded images briefly for quick reverse scrolling.
+        if (hasResult.current) {
+          releaseImage = setTimeout(() => {
+            hasResult.current = false;
+            setResult(undefined);
+          }, 300);
+        }
+        return;
+      }
+      if (inFlight) return;
+      const cached = faceThumbCache.get(cacheKey);
+      if (cached) {
+        faceThumbCache.delete(cacheKey);
+        faceThumbCache.set(cacheKey, cached);
+        hasResult.current = true;
+        setResult({ key: cacheKey, src: cached });
+        return;
+      }
+      const controller = new AbortController();
+      inFlight = controller;
+      const request = faceId == null
+        ? api.getClusterFaceThumbnail(clusterId!, controller.signal, usePersonAvatar)
+        : api.getFaceThumbnail(faceId, controller.signal);
+      request
         .then((src) => {
           if (controller.signal.aborted) return;
           if (!src) throw new Error("缩略图为空");
@@ -51,15 +114,31 @@ const FaceThumb = React.memo(function FaceThumb({ clusterId, scope, active }: {
             const oldest = faceThumbCache.keys().next().value;
             if (oldest !== undefined) faceThumbCache.delete(oldest);
           }
+          hasResult.current = true;
           setResult({ key: cacheKey, src });
         })
         .catch((error) => {
-          if (!controller.signal.aborted) setResult({ key: cacheKey, error: String(error) });
+          if (!controller.signal.aborted) {
+            hasResult.current = true;
+            setResult({ key: cacheKey, error: String(error) });
+          }
         });
+    };
+    const cleanup = () => {
+      inFlight?.abort();
+      clearTimeout(releaseImage);
+    };
+    const root = scrollRoot?.current;
+    if (root) {
+      const stop = observeFaceThumbnail(root, node, onVisibility);
+      return () => { cleanup(); stop(); };
+    }
+    const observer = new IntersectionObserver(([entry]) => {
+      if (entry) onVisibility(entry.isIntersecting);
     }, { rootMargin: "120px" });
     observer.observe(node);
-    return () => { controller.abort(); observer.disconnect(); };
-  }, [active, cacheKey, clusterId, current, thumb]);
+    return () => { cleanup(); observer.disconnect(); };
+  }, [active, cacheKey, clusterId, faceId, scrollRoot, usePersonAvatar]);
 
   return (
     <span ref={ref} className="flex h-full w-full items-center justify-center">
@@ -71,10 +150,247 @@ const FaceThumb = React.memo(function FaceThumb({ clusterId, scope, active }: {
         }} />
         : current?.error
           ? <span title={current.error} className="px-1 text-center text-xs text-text-muted">头像不可用</span>
-          : <span className="h-full w-full rounded bg-bg-secondary/30 motion-safe:animate-pulse" aria-label="正在加载头像" />}
+          : <span className={`h-full w-full rounded bg-bg-secondary/30 ${scrollRoot ? "" : "motion-safe:animate-pulse"}`} aria-label="正在加载头像" />}
     </span>
   );
 });
+
+const MergeCandidateCard = React.memo(function MergeCandidateCard({
+  candidate, index, expanded, selected, busy, previewId, scope, active, scrollRoot,
+  onToggle, onSelect, onReject, onPreview,
+}: {
+  candidate: api.AutomaticFaceMergeCandidate;
+  index: number;
+  expanded: boolean;
+  selected: readonly number[];
+  busy: boolean;
+  previewId?: number;
+  scope: string;
+  active: boolean;
+  scrollRoot: React.RefObject<HTMLDivElement>;
+  onToggle: (key: string) => void;
+  onSelect: (key: string, selected: number[]) => void;
+  onReject: (candidate: api.AutomaticFaceMergeCandidate) => void;
+  onPreview: (id: number) => void;
+}) {
+  const key = candidateKey(candidate);
+  const members = useMemo(() => selectableMergeMembers(candidate), [candidate]);
+  const targetId = candidate.named_target_id;
+  const targetName = candidate.named_target_name;
+  const people = targetId == null ? members : [targetId, ...members];
+  const allSelected = selected.length === members.length;
+  const ready = selected.length >= (targetId == null ? 2 : 1);
+  const avatars = useRef<HTMLDivElement>(null);
+  const [avatarEdges, setAvatarEdges] = useState({ start: true, end: false });
+
+  const scrollAvatars = (direction: number) => {
+    const row = avatars.current;
+    if (row) row.scrollBy({ left: direction * row.clientWidth });
+  };
+
+  return (
+    <article className={`flex min-w-0 flex-col rounded-xl border px-3 py-2.5 ${ready
+      ? "border-accent-primary/40 bg-accent-primary/5" : "border-surface-secondary bg-bg-secondary"}`}>
+      <div className="flex min-w-0 items-start justify-between gap-2">
+        <div className="min-w-0">
+          <button type="button"
+            className="inline-flex items-center gap-1 rounded text-left text-sm font-semibold text-text-primary hover:text-accent-link focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent-primary"
+            aria-expanded={expanded} aria-controls={`merge-candidate-${key}`}
+            aria-label={`${expanded ? "收起" : "展开"}候选组 ${index}`}
+            onClick={() => {
+              if (expanded) setAvatarEdges({ start: true, end: false });
+              onToggle(key);
+            }}>
+            <Icon name="chevronUp" size={13} className={expanded ? "rotate-180" : "rotate-90"} />
+            候选组 {index}
+          </button>
+          <div className="mt-0.5 flex flex-wrap gap-x-1.5 text-xs tabular-nums text-text-muted">
+            <span>{people.length} 人</span><span aria-hidden="true">·</span><span>{candidate.face_count} 张人脸</span>
+          </div>
+        </div>
+        <span className="shrink-0 rounded-md bg-surface-primary px-1.5 py-1 text-xs tabular-nums text-text-secondary">
+          相似度 <strong className="font-semibold text-text-primary">{(candidate.similarity * 100).toFixed(1)}%</strong>
+        </span>
+      </div>
+
+      <div id={`merge-candidate-${key}`} hidden={!expanded} className="mt-2.5 border-t border-surface-secondary pt-2.5">
+        {expanded && <div ref={avatars}
+          className="grid grid-flow-col auto-cols-[calc((100%_-_1.5rem)/4)] gap-2 overflow-x-auto pb-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          role="group" aria-label={`候选组 ${index} 的头像`}
+          onScroll={({ currentTarget: row }) => {
+            const start = row.scrollLeft < 1;
+            const end = row.scrollLeft + row.clientWidth >= row.scrollWidth - 1;
+            setAvatarEdges((edges) => edges.start === start && edges.end === end ? edges : { start, end });
+          }}>
+          {people.map((id) => (
+            <div key={id} className="flex min-w-0 flex-col items-center gap-1">
+              <button type="button"
+                className="relative aspect-square w-14 max-w-full overflow-hidden rounded-md bg-surface-secondary focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent-primary"
+                aria-label={`查看人物 ${id} 的大图`} title="查看大图" disabled={previewId != null}
+                onClick={() => onPreview(id)}>
+                <FaceThumb clusterId={id} scope={scope} active={active} scrollRoot={scrollRoot} usePersonAvatar={id === targetId} />
+                {id === targetId && <span className="absolute left-0.5 top-0.5 rounded bg-accent-primary px-0.5 text-[10px] leading-4 text-white" aria-hidden="true">合入</span>}
+                <span className="absolute bottom-0.5 right-0.5 grid place-items-center rounded bg-black/65 p-0.5 text-white"
+                  aria-hidden="true"><Icon name={previewId === id ? "activity" : "photos"} size={12} /></span>
+              </button>
+              {id === targetId
+                ? <span className="w-full truncate text-center text-xs font-semibold leading-5 text-accent-link"
+                    title={`合入：${targetName ?? `人物 ${id}`}`}>{targetName ?? `人物 ${id}`}</span>
+                : <label className="flex w-full cursor-pointer items-center justify-center gap-0.5 text-xs leading-5">
+                  <input type="checkbox" className="shrink-0 accent-accent-primary" checked={selected.includes(id)} disabled={busy}
+                    aria-label={`人物 ${id}`}
+                    onChange={(event) => onSelect(key, event.target.checked ? [...selected, id] : selected.filter((value) => value !== id))} />
+                  <span className="truncate tabular-nums" title={`人物 ${id}`}>{id}</span>
+                </label>}
+            </div>
+          ))}
+        </div>}
+      </div>
+
+      <div className="mt-auto flex min-w-0 items-center justify-between gap-1 pt-2.5 text-xs">
+        <label className="flex cursor-pointer items-center gap-1">
+          <input type="checkbox" className="accent-accent-primary" checked={allSelected} disabled={busy}
+            aria-label={`整组选中候选组 ${index}`}
+            ref={(input) => { if (input) input.indeterminate = selected.length > 0 && !allSelected; }}
+            onChange={(event) => onSelect(key, event.target.checked ? members : [])} />
+          整组
+          <span className="tabular-nums text-text-muted">{selected.length}/{members.length}</span>
+        </label>
+        {expanded && people.length > 4 && <div className="flex">
+          <button type="button" aria-label={`上一组头像（候选组 ${index}）`} title="上一组头像" disabled={avatarEdges.start}
+            className="rounded px-0.5 py-1 text-text-secondary hover:bg-surface-primary disabled:opacity-30" onClick={() => scrollAvatars(-1)}>
+            <Icon name="chevronUp" size={15} className="-rotate-90" />
+          </button>
+          <button type="button" aria-label={`下一组头像（候选组 ${index}）`} title="下一组头像" disabled={avatarEdges.end}
+            className="rounded px-0.5 py-1 text-text-secondary hover:bg-surface-primary disabled:opacity-30" onClick={() => scrollAvatars(1)}>
+            <Icon name="chevronUp" size={15} className="rotate-90" />
+          </button>
+        </div>}
+        <button type="button" disabled={busy} onClick={() => onReject(candidate)}
+          className="shrink-0 rounded px-1 py-1 text-orange-700 hover:bg-surface-primary dark:text-orange-300">不是同一人</button>
+      </div>
+    </article>
+  );
+});
+
+function PersonProfileDialog({ person, scope, onClose, onSaved }: {
+  person: FaceCluster;
+  scope: string;
+  onClose: () => void;
+  onSaved: (person: FaceCluster, name: string, avatarChanged: boolean) => void;
+}) {
+  const personId = person.id!;
+  const named = !!person.name?.trim();
+  const [name, setName] = useState(person.name ?? "");
+  const [items, setItems] = useState<api.PersonAvatarPage["items"]>([]);
+  const [initialAvatar, setInitialAvatar] = useState<number | null | undefined>(named ? undefined : null);
+  const [avatar, setAvatar] = useState<number | null>(null);
+  const [nextAfter, setNextAfter] = useState<number | null>(null);
+  const [after, setAfter] = useState<number | null>(null);
+  const [retry, setRetry] = useState(0);
+  const [loading, setLoading] = useState(named);
+  const [loadError, setLoadError] = useState("");
+  const [saveError, setSaveError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const choices = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!named) return;
+    let current = true;
+    setLoading(true);
+    setLoadError("");
+    api.getPersonAvatarChoices(personId, after).then((page) => {
+      if (!current) return;
+      setItems((existing) => after == null ? page.items : [...existing, ...page.items]);
+      setNextAfter(page.next_after);
+      if (after == null) {
+        setInitialAvatar(page.selected_face_id);
+        setAvatar(page.selected_face_id);
+      }
+    }).catch((error) => {
+      if (current) setLoadError(String(error));
+    }).finally(() => {
+      if (current) setLoading(false);
+    });
+    return () => { current = false; };
+  }, [after, named, personId, retry]);
+
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!name.trim() || initialAvatar === undefined || saving) return;
+    setSaving(true);
+    setSaveError("");
+    try {
+      await api.savePersonProfile(personId, name.trim(), avatar);
+      onSaved(person, name.trim(), avatar !== initialAvatar);
+    } catch (error) {
+      setSaveError(String(error));
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-[1200] grid place-items-center bg-black/40 p-3"
+      onMouseDown={() => { if (!saving) onClose(); }}>
+      <form role="dialog" aria-modal="true" aria-labelledby="person-profile-title" onSubmit={save}
+        className={`flex max-h-[92vh] min-w-0 flex-col rounded-2xl border border-surface-secondary bg-bg-secondary p-4 shadow-2xl sm:p-5 ${named ? "w-full max-w-xl" : "w-full max-w-[360px]"}`}
+        onMouseDown={(event) => event.stopPropagation()}
+        onKeyDown={(event) => { if (event.key === "Escape" && !saving) { event.stopPropagation(); onClose(); } }}>
+        <h3 id="person-profile-title" className="text-lg font-semibold text-text-primary">{named ? "编辑人物" : "命名人物"}</h3>
+        <label className="mt-3 block text-xs font-medium text-text-secondary">
+          人物姓名
+          <input className="ui-input mt-1 w-full" value={name} onChange={(event) => setName(event.target.value)}
+            placeholder="输入人物姓名" autoFocus disabled={saving} />
+        </label>
+        {named && <section className="mt-4 flex min-h-0 flex-col" aria-labelledby="person-avatar-heading">
+          <div className="flex shrink-0 items-center justify-between gap-3 border-t border-surface-secondary pt-3">
+            <div>
+              <h4 id="person-avatar-heading" className="text-sm font-semibold">人物头像</h4>
+              <p className="mt-0.5 text-xs text-text-muted">{avatar == null ? "当前使用自动选图" : "已选自定义头像"}</p>
+            </div>
+            {avatar != null && !items.some((item) => item.face_id === avatar) && <div className="h-12 w-12 shrink-0 overflow-hidden rounded-md bg-surface-secondary">
+              <FaceThumb faceId={avatar} scope={scope} active />
+            </div>}
+          </div>
+          <div ref={choices} className="mt-2 min-h-0 overflow-y-auto overscroll-contain pr-1" aria-busy={loading}>
+            {initialAvatar !== undefined && (
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(75px,1fr))] gap-2 pb-1">
+                <button type="button" disabled={saving} aria-pressed={avatar == null} onClick={() => setAvatar(null)}
+                  className={`relative grid aspect-square place-content-center justify-items-center gap-1 rounded-lg border text-xs ${avatar == null ? "border-accent-primary bg-accent-primary/10 text-accent-link" : "border-surface-secondary bg-surface-primary text-text-secondary"}`}>
+                  <Icon name="photos" size={20} /> 自动选图
+                </button>
+                {items.map((item) => (
+                  <button key={item.face_id} type="button" disabled={saving} aria-label={`使用 ${item.filename} 中的人脸作为头像`}
+                    title={item.filename} aria-pressed={avatar === item.face_id} onClick={() => setAvatar(item.face_id)}
+                    className={`relative aspect-square overflow-hidden rounded-lg border-2 bg-surface-secondary ${avatar === item.face_id ? "border-accent-primary" : "border-transparent hover:border-accent-primary/40"}`}>
+                    <FaceThumb faceId={item.face_id} scope={scope} active scrollRoot={choices} />
+                    {avatar === item.face_id && <span aria-hidden="true" className="absolute bottom-0.5 right-0.5 rounded bg-accent-primary px-1 text-xs text-white">✓</span>}
+                  </button>
+                ))}
+              </div>
+            )}
+            {loading && <p className="py-3 text-xs text-text-muted" role="status">正在读取可选头像…</p>}
+            {loadError && <div className="py-2 text-xs">
+              <p role="alert" className="break-words text-red-600">读取头像失败：{loadError}</p>
+              <button className="ui-button mt-1" type="button" onClick={() => setRetry((value) => value + 1)}>重试读取</button>
+            </div>}
+            {!loading && !loadError && initialAvatar !== undefined && items.length === 0 &&
+              <p className="py-2 text-xs text-text-muted">此人物暂无可用的人脸照片。</p>}
+            {!loading && !loadError && nextAfter !== null && <button className="ui-button mt-2" type="button" disabled={saving}
+              onClick={() => setAfter(nextAfter)}>加载更多头像</button>}
+          </div>
+        </section>}
+        {saveError && <p role="alert" className="mt-2 break-words text-xs text-red-600">保存失败：{saveError}</p>}
+        <div className="mt-4 flex shrink-0 justify-end gap-2 border-t border-surface-secondary pt-3">
+          <button type="button" disabled={saving} onClick={onClose} className="ui-button">取消</button>
+          <button type="submit" className="ui-button-primary" disabled={saving || !name.trim() || initialAvatar === undefined}>
+            {saving ? "保存中…" : "保存"}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
 
 const SuspectedFaceThumb: React.FC<{ faceId: number }> = React.memo(function SuspectedFaceThumb({ faceId }) {
   const [thumb, setThumb] = useState<string | null>(null);
@@ -126,16 +442,16 @@ export default React.memo(function FaceView({ active = true }: Props) {
     }
   }, [active, searchParams.get("tab")]);
 
-  const [editingId, setEditingId] = useState<number | null>(null);
-  const [editName, setEditName] = useState("");
-  const [renameSaving, setRenameSaving] = useState(false);
+  const [editingPerson, setEditingPerson] = useState<FaceCluster | null>(null);
+  const [profileAvatarRevisions, setProfileAvatarRevisions] = useState<Map<number, number>>(new Map());
   const [aiRunning, setAiRunning] = useState(false);
   const [clustering, setClustering] = useState(false);
   const [workerHealthy, setWorkerHealthy] = useState(false);
   const [operationMessage, setOperationMessage] = useState<string | null>(null);
   const faceActions = useRef<HTMLDetailsElement>(null);
   const faceActionsTrigger = useRef<HTMLElement>(null);
-  const aiStatus = useStore((state) => state.aiProcessingStatus?.status);
+  const ai = useStore((state) => state.aiProcessingStatus);
+  const aiStatus = ai?.status;
   const aiBusy = aiRunning || aiStatus === "running" || aiStatus === "paused";
 
   // Face detection stats
@@ -157,15 +473,30 @@ export default React.memo(function FaceView({ active = true }: Props) {
   const lightboxPhotoId = useStore((state) => state.lightboxPhotoId);
   const [autoMergeThreshold, setAutoMergeThreshold] = useState(0.72);
   const [autoMergeRunning, setAutoMergeRunning] = useState(false);
+  const [analysisError, setAnalysisError] = useState("");
+  const [analysisSkipped, setAnalysisSkipped] = useState(0);
+  const [analysisStarted, setAnalysisStarted] = useState<number>();
+  const [analysisClock, setAnalysisClock] = useState(Date.now);
+  const [analysisProgress, setAnalysisProgress] = useState<(api.AutomaticFaceMergeProgress & { updatedAt: number })>();
+  const activeAnalysis = useRef<string>();
+
+  useEffect(() => {
+    if (analysisStarted == null) return;
+    const timer = window.setInterval(() => setAnalysisClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [analysisStarted]);
   const [autoMergeCandidates, setAutoMergeCandidates] = useState<api.AutomaticFaceMergeCandidate[]>([]);
   const [autoMergeSelected, setAutoMergeSelected] = useState<Map<string, number[]>>(new Map());
-  const [expandedMergeGroups, setExpandedMergeGroups] = useState<Set<string>>(new Set());
+  const [collapsedMergeGroups, setCollapsedMergeGroups] = useState<Set<string>>(new Set());
+  const [mergePage, setMergePage] = useState(1);
+  const mergeResults = useRef<HTMLDivElement>(null);
   const [autoMergePreviewed, setAutoMergePreviewed] = useState(false);
   const [hasMergeUndo, setHasMergeUndo] = useState(false);
   const [suspectedFaceCount, setSuspectedFaceCount] = useState(0);
   const [suspectedFaces, setSuspectedFaces] = useState<api.SuspectedFace[]>([]);
   const [suspectedOpen, setSuspectedOpen] = useState(false);
   const [canReanalyzeFaces, setCanReanalyzeFaces] = useState(false);
+  const [maintenanceAction, setMaintenanceAction] = useState<"rebuild" | "reanalyze" | null>(null);
   const [ignoredFaceCount, setIgnoredFaceCount] = useState(0);
   const navigate = useNavigate();
   const maintenanceDisabled = aiBusy || clustering || autoMergeRunning;
@@ -180,13 +511,13 @@ export default React.memo(function FaceView({ active = true }: Props) {
         ? Math.max(FACE_PAGE_SIZE, loadedClusters.current.count)
         : FACE_PAGE_SIZE;
       const [page, nextFaceCount, nextUnassignedCount] = await Promise.all([
-        api.getClusterPage(requestedTab, 0, FACE_PAGE_SIZE, clusterIdFilter),
+        api.getClusterPage(requestedTab, 0, Math.min(count, 200), clusterIdFilter),
         api.getFaceDetectionCount().catch(() => 0),
         api.getUnassignedFaceCount().catch(() => 0),
       ]);
       const items = page.items;
       for (let offset = items.length; isCurrent() && offset < Math.min(count, page.total); offset = items.length) {
-        const next = await api.getClusterPage(requestedTab, offset, FACE_PAGE_SIZE, clusterIdFilter);
+        const next = await api.getClusterPage(requestedTab, offset, Math.min(count - offset, 200), clusterIdFilter);
         if (!next.items.length) break;
         items.push(...next.items);
       }
@@ -227,6 +558,8 @@ export default React.memo(function FaceView({ active = true }: Props) {
       });
       setPageTotal(page.total);
       setTabCounts({ named: page.named_count, unnamed: page.unnamed_count, review: page.review_count });
+    } catch (error) {
+      if (isCurrent()) setOperationMessage(`加载更多人物失败：${String(error)}`);
     } finally {
       if (isCurrent()) setPageLoading(false);
     }
@@ -299,17 +632,11 @@ export default React.memo(function FaceView({ active = true }: Props) {
 
   const handleRunClustering = async () => {
     setClustering(true);
-    setOperationMessage("正在重新整理人物…");
+    setOperationMessage(null);
     try {
-      const healthy = await api.workerHealth();
-      if (!healthy) {
-        const msg = await api.startAiWorker();
-        console.log(msg);
-        await new Promise(r => setTimeout(r, 2000));
-      }
       const result = await api.runFaceClustering();
-      setOperationMessage(result || "人物已重新整理。");
-      refreshData();
+      setOperationMessage(result);
+      await refreshData();
     } catch (err) {
       console.error("Clustering failed:", err);
       setOperationMessage("人物整理暂时无法完成：" + err);
@@ -319,15 +646,9 @@ export default React.memo(function FaceView({ active = true }: Props) {
   };
 
   const handleFullRecluster = async () => {
-    if (!window.confirm("将用已有的人脸特征重建自动分组。已命名和人工确认的人物会保留。继续吗？")) return;
     setClustering(true);
     setOperationMessage("正在用已有的人脸特征重建人物分组…");
     try {
-      const healthy = await api.workerHealth();
-      if (!healthy) {
-        await api.startAiWorker();
-        await new Promise(r => setTimeout(r, 2000));
-      }
       const result = await api.rebuildFaceClusters();
       setAvatarRevision((revision) => revision + 1);
       setOperationMessage(result || "人物分组已完整重建。");
@@ -339,51 +660,117 @@ export default React.memo(function FaceView({ active = true }: Props) {
     }
   };
 
-  const candidateKey = (candidate: api.AutomaticFaceMergeCandidate) => candidate.cluster_ids.join("-");
-
-  const openAutoMerge = () => {
+  const resetMergeResults = () => {
     setAutoMergeCandidates([]);
     setAutoMergeSelected(new Map());
-    setExpandedMergeGroups(new Set());
+    setCollapsedMergeGroups(new Set());
+    setMergePage(1);
     setAutoMergePreviewed(false);
+  };
+
+  const openAutoMerge = () => {
+    resetMergeResults();
     setPreviewClusterId(undefined);
     setPreviewError("");
+    setAnalysisError("");
+    setAnalysisProgress(undefined);
     setAutoMergeOpen(true);
   };
 
   const handlePreviewAutoMerge = async () => {
+    if (activeAnalysis.current || autoMergeRunning) return;
+    const requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) =>
+      byte.toString(16).padStart(2, "0")).join("");
+    const started = Date.now();
+    activeAnalysis.current = requestId;
+    setAnalysisStarted(started);
+    setAnalysisClock(started);
+    setAnalysisProgress({ stage: "start_worker", done: 0, total: 0, skipped: 0, updatedAt: started });
+    setAnalysisError("");
+    resetMergeResults();
     setAutoMergeRunning(true);
-    setOperationMessage("正在查找相似的未命名分组及可合入的已命名人物…");
+    let unlisten: (() => void) | undefined;
     try {
+      unlisten = await listen<{ requestId: string; progress: api.AutomaticFaceMergeProgress }>(
+        "automatic-face-merge-progress",
+        ({ payload }) => {
+          if (payload.requestId === requestId) {
+            setAnalysisProgress({ ...payload.progress, updatedAt: Date.now() });
+          }
+        },
+      );
       const healthy = await api.workerHealth();
-      if (!healthy) {
-        await api.startAiWorker();
-        await new Promise(r => setTimeout(r, 2000));
-      }
-      const candidates = await api.previewAutoMergeUnnamedFaces(autoMergeThreshold);
-      setAutoMergeCandidates(candidates);
-      setAutoMergeSelected(new Map());
-      setExpandedMergeGroups(new Set());
+      if (!healthy) await api.startAiWorker();
+      const { candidates, skipped } = await api.previewAutoMergeUnnamedFaces(autoMergeThreshold, requestId);
+      setAutoMergeCandidates([...candidates].sort((left, right) =>
+        Number(right.named_target_id != null) - Number(left.named_target_id != null)
+        || right.face_count - left.face_count
+        || right.similarity - left.similarity,
+      ));
+      setAnalysisSkipped(skipped);
       setAutoMergePreviewed(true);
-      setOperationMessage(candidates.length > 0
-        ? `找到 ${candidates.length} 组可能是同一人的候选，请预览后确认。`
-        : "当前阈值下没有发现可靠的合并候选。");
     } catch (error) {
-      setOperationMessage(`候选分析失败：${String(error)}`);
+      setAnalysisError(String(error));
     } finally {
+      unlisten?.();
+      activeAnalysis.current = undefined;
+      setAnalysisStarted(undefined);
       setAutoMergeRunning(false);
     }
   };
 
-  const selectedMergeGroups = autoMergeCandidates.flatMap<{ ids: number[]; target: number | null }>((candidate) => {
+  const selectedMergeGroups = useMemo(() => autoMergeCandidates.flatMap<{ ids: number[]; target: number | null }>((candidate) => {
     const selected = autoMergeSelected.get(candidateKey(candidate)) ?? [];
     const target = candidate.named_target_id;
     if (target != null && selected.length) return [{ ids: [target, ...selected], target }];
     return selected.length >= 2 ? [{ ids: selected, target: null }] : [];
-  });
-  const allMergeCandidatesSelected = autoMergeCandidates.every((candidate) =>
+  }), [autoMergeCandidates, autoMergeSelected]);
+
+  const mergePageCount = Math.max(1, Math.ceil(autoMergeCandidates.length / MERGE_PAGE_SIZE));
+  const currentMergePage = Math.min(mergePage, mergePageCount);
+  const firstMergeIndex = (currentMergePage - 1) * MERGE_PAGE_SIZE;
+  const visibleMergeCandidates = autoMergeCandidates.slice(firstMergeIndex, firstMergeIndex + MERGE_PAGE_SIZE);
+  const allVisibleMergeCandidatesSelected = visibleMergeCandidates.every((candidate) =>
     autoMergeSelected.get(candidateKey(candidate))?.length === selectableMergeMembers(candidate).length,
   );
+
+  const goToMergePage = (page: number) => {
+    setMergePage(Math.min(mergePageCount, Math.max(1, page)));
+    if (mergeResults.current) mergeResults.current.scrollTop = 0;
+  };
+
+  const toggleMergeCandidate = useCallback((key: string) => {
+    setCollapsedMergeGroups((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  }, []);
+
+  const selectMergeCandidate = useCallback((key: string, selected: number[]) => {
+    setAutoMergeSelected((current) => {
+      const next = new Map(current);
+      if (selected.length) next.set(key, selected); else next.delete(key);
+      return next;
+    });
+  }, []);
+
+  const previewMergeCandidate = useCallback((id: number) => {
+    setPreviewError("");
+    setPreviewClusterId(id);
+  }, []);
+
+  const toggleMergePageSelection = () => {
+    setAutoMergeSelected((current) => {
+      const next = new Map(current);
+      for (const candidate of visibleMergeCandidates) {
+        const key = candidateKey(candidate);
+        if (allVisibleMergeCandidatesSelected) next.delete(key);
+        else next.set(key, selectableMergeMembers(candidate));
+      }
+      return next;
+    });
+  };
 
   useEffect(() => {
     if (!active || !autoMergeOpen || previewClusterId == null) return;
@@ -443,7 +830,7 @@ export default React.memo(function FaceView({ active = true }: Props) {
     }
   };
 
-  const handleRejectAutoMergeCandidate = async (candidate: api.AutomaticFaceMergeCandidate) => {
+  const handleRejectAutoMergeCandidate = useCallback(async (candidate: api.AutomaticFaceMergeCandidate) => {
     try {
       await api.rejectAutoMergeCandidate(candidate.cluster_ids);
       const key = candidateKey(candidate);
@@ -453,7 +840,7 @@ export default React.memo(function FaceView({ active = true }: Props) {
     } catch (error) {
       setOperationMessage(`保存排除关系失败：${String(error)}`);
     }
-  };
+  }, []);
 
   const handleUndoAutomaticMerge = async () => {
     try {
@@ -496,8 +883,6 @@ export default React.memo(function FaceView({ active = true }: Props) {
   };
 
   const handleFaceReanalysis = async () => {
-    const undoNotice = hasMergeUndo ? "重新分析后，上次自动合并的撤销记录会清除。" : "";
-    if (!window.confirm(`将用当前算法重新读取照片、检测人脸并重建自动分组。已命名和人工确认的人物会保留。${undoNotice}操作可能耗时，继续吗？`)) return;
     setAiRunning(true);
     try {
       const prepared = await api.prepareFaceAiReanalysis();
@@ -512,20 +897,18 @@ export default React.memo(function FaceView({ active = true }: Props) {
     }
   };
 
-  const handleIgnoreSelectedPeople = async () => {
-    const ids = Array.from(mergeSelected);
+  const handleCancelRecognition = async (ids: number[]) => {
     if (ids.length === 0) return;
-    if (!window.confirm(`确定忽略选中的 ${ids.length} 个人物分组吗？\n\n这些人脸将从“未命名”和“待审核”中移除，后续 AI 也不会再次标记；原始照片不会删除。`)) return;
+    if (!window.confirm(`取消识别这 ${ids.length} 个人物分组？\n\n这些人脸将从人物页移除。原始照片会保留，可以从人物操作菜单恢复。`)) return;
     setMergeSaving(true);
     try {
       const result = await api.ignoreFaceClusters(ids);
-      setAvatarRevision((revision) => revision + 1);
       setMergeSelected(new Set());
       setMergeMode(false);
-      await refreshData();
+      useStore.getState().markFaceDataChanged();
       setOperationMessage(result);
     } catch (error) {
-      setOperationMessage(`忽略人物失败：${String(error)}`);
+      setOperationMessage(`取消识别失败：${String(error)}`);
     } finally {
       setMergeSaving(false);
     }
@@ -535,27 +918,26 @@ export default React.memo(function FaceView({ active = true }: Props) {
     if (!window.confirm(`恢复全部 ${ignoredFaceCount} 张已忽略人脸吗？它们会在下次人物整理时重新出现。`)) return;
     try {
       const result = await api.restoreAllIgnoredFaces();
-      await refreshData();
+      useStore.getState().markFaceDataChanged();
       setOperationMessage(result);
     } catch (error) {
       setOperationMessage(`恢复已忽略人脸失败：${String(error)}`);
     }
   };
 
-  const handleRename = async (clusterId: number) => {
-    if (!editName.trim()) return;
-    setRenameSaving(true);
-    try {
-      await api.renameCluster(clusterId, editName.trim());
-      await api.confirmFaceCluster(clusterId);
-      await refreshData();
-      setEditingId(null);
-      setOperationMessage(`已将人物命名为“${editName.trim()}”。`);
-    } catch (error) {
-      setOperationMessage(`保存人物名称失败：${String(error)}`);
-    } finally {
-      setRenameSaving(false);
+  const handleProfileSaved = (person: FaceCluster, name: string, avatarChanged: boolean) => {
+    setEditingPerson(null);
+    if (avatarChanged) {
+      faceThumbCache.delete(JSON.stringify([avatarScope, person.id, true]));
+      setProfileAvatarRevisions((current) => {
+        const next = new Map(current);
+        next.set(person.id!, (next.get(person.id!) ?? 0) + 1);
+        return next;
+      });
     }
+    if (person.name !== name) useStore.getState().markFaceDataChanged();
+    else if (activeTab === "review" || person.confidence === "low") void refreshData();
+    setOperationMessage(avatarChanged ? "已更新人物头像。" : `已保存人物“${name}”。`);
   };
 
   const handleConfirmCluster = async (clusterId: number) => {
@@ -689,7 +1071,10 @@ export default React.memo(function FaceView({ active = true }: Props) {
                 <div role="group" aria-label="分析与分组" className="py-1.5">
                   <p className={faceActionHeadingClass}>分析与分组</p>
                   <button type="button" onClick={() => runFaceAction(handleRunFaceDetection)} disabled={aiBusy} className={faceActionClass}>分析待处理照片</button>
-                  <button type="button" onClick={() => runFaceAction(handleRunClustering)} disabled={clustering} className={faceActionClass}>整理待分组人脸</button>
+                  <button type="button" onClick={() => runFaceAction(handleRunClustering)} disabled={maintenanceDisabled} className={faceActionClass}>
+                    <span className="block">整理待分组人脸</span>
+                    <span className="mt-0.5 block text-xs text-text-secondary">把已识别的人脸归到人物分组</span>
+                  </button>
                 </div>
                 <div role="group" aria-label="合并人物" className="py-1.5">
                   <p className={faceActionHeadingClass}>合并人物</p>
@@ -703,11 +1088,11 @@ export default React.memo(function FaceView({ active = true }: Props) {
                 </div>}
                 <div role="group" aria-label="高级维护" className="py-1.5">
                   <p className={faceActionHeadingClass}>高级维护</p>
-                  <button type="button" onClick={() => runFaceAction(handleFullRecluster)} disabled={maintenanceDisabled} className={faceActionClass}>
+                  <button type="button" onClick={() => runFaceAction(() => setMaintenanceAction("rebuild"))} disabled={maintenanceDisabled} className={faceActionClass}>
                     <span className="block">重建自动分组…</span>
                     <span className="mt-0.5 block text-xs text-text-secondary">用已有的人脸特征重新分组</span>
                   </button>
-                  {canReanalyzeFaces && <button type="button" onClick={() => runFaceAction(handleFaceReanalysis)} disabled={maintenanceDisabled} className={faceActionClass}>
+                  {canReanalyzeFaces && <button type="button" onClick={() => runFaceAction(() => setMaintenanceAction("reanalyze"))} disabled={maintenanceDisabled} className={faceActionClass}>
                     <span className="block">重新分析人脸…</span>
                     <span className="mt-0.5 block text-xs text-text-secondary">重新读取照片并检测人脸</span>
                   </button>}
@@ -718,6 +1103,12 @@ export default React.memo(function FaceView({ active = true }: Props) {
           </div>
         </div>
 
+        {ai && isGroupingFaces(ai) && <div className="mb-4 rounded-xl border border-text-primary/5 bg-bg-secondary px-4 py-2.5">
+          <FaceClusteringStatus ai={ai} />
+        </div>}
+        {ai?.status === "error" && ai.stage === "clustering_error" && ai.last_error && !operationMessage && (
+          <p role="alert" className="mb-4 break-words rounded-xl border border-text-primary/5 bg-bg-secondary px-4 py-2.5 text-sm text-red-600">{ai.last_error}</p>
+        )}
         {operationMessage && (
           <div className="mb-4 flex items-center justify-between rounded-xl bg-bg-secondary/70 border border-text-primary/5 px-4 py-2.5 text-sm text-text-secondary">
             <span>{operationMessage}</span>
@@ -837,11 +1228,11 @@ export default React.memo(function FaceView({ active = true }: Props) {
               )}
               {(activeTab === "unnamed" || activeTab === "review") && (
                 <button
-                  onClick={handleIgnoreSelectedPeople}
+                  onClick={() => void handleCancelRecognition(Array.from(mergeSelected))}
                   disabled={mergeSelected.size < 1 || mergeSaving || confirmingReview}
                   className="bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300 px-4 py-1.5 rounded-lg text-sm disabled:opacity-50 disabled:cursor-not-allowed border border-red-100"
                 >
-                  删除所选人物标记 ({mergeSelected.size})
+                  取消识别所选 ({mergeSelected.size})
                 </button>
               )}
             </>
@@ -886,13 +1277,16 @@ export default React.memo(function FaceView({ active = true }: Props) {
               onDoubleClick={(e) => {
                 if (!mergeMode) {
                   e.preventDefault();
-                  setEditingId(cluster.id!);
-                  setEditName(cluster.name || "");
+                  setEditingPerson(cluster);
                 }
               }}
             >
               <div className="w-full aspect-square overflow-hidden rounded-lg bg-surface-secondary relative">
-                <FaceThumb clusterId={cluster.id!} scope={avatarScope} active={active && !groupPhotosOpen && !autoMergeOpen && !suspectedOpen} />
+                <FaceThumb clusterId={cluster.id!}
+                  scope={profileAvatarRevisions.has(cluster.id!) ? `${avatarScope}:${profileAvatarRevisions.get(cluster.id!)}` : avatarScope}
+                  scrollRoot={peopleResults}
+                  usePersonAvatar={!!cluster.name?.trim()}
+                  active={active && !groupPhotosOpen && !autoMergeOpen && !suspectedOpen && !editingPerson} />
                 {mergeMode && activeTab === "review" && (
                   <input type="checkbox" className="absolute top-2 right-2 h-5 w-5 accent-accent-primary"
                     aria-label={`选择${cluster.name || `人物 ${cluster.id}`}`}
@@ -917,8 +1311,7 @@ export default React.memo(function FaceView({ active = true }: Props) {
                     type="button"
                     onClick={(e) => {
                       e.stopPropagation();
-                      setEditingId(cluster.id!);
-                      setEditName(cluster.name || "");
+                      setEditingPerson(cluster);
                     }}
                     className="shrink-0 whitespace-nowrap text-xs text-text-muted opacity-0 hover:text-text-primary focus-visible:opacity-100 group-hover:opacity-100"
                   >
@@ -930,7 +1323,7 @@ export default React.memo(function FaceView({ active = true }: Props) {
                 照片 {cluster.photo_count} · 人脸 {cluster.face_count}
               </p>
               {activeTab === "review" && !mergeMode && (
-                <div className="mt-2 grid grid-cols-3 gap-1 px-1 pb-1">
+                <div className={`mt-2 grid gap-1 px-1 pb-1 ${cluster.name?.trim() ? "grid-cols-3" : "grid-cols-2"}`}>
                   <button
                     type="button"
                     onClick={(event) => { event.stopPropagation(); void handleConfirmCluster(cluster.id!); }}
@@ -939,7 +1332,7 @@ export default React.memo(function FaceView({ active = true }: Props) {
                   >确认</button>
                   <button
                     type="button"
-                    onClick={(event) => { event.stopPropagation(); setEditingId(cluster.id!); setEditName(cluster.name || ""); }}
+                    onClick={(event) => { event.stopPropagation(); setEditingPerson(cluster); }}
                     className="rounded-lg bg-black/[0.045] px-1 py-1.5 text-xs text-text-secondary hover:bg-text-primary/[0.08]"
                   >命名</button>
                   <button
@@ -947,14 +1340,20 @@ export default React.memo(function FaceView({ active = true }: Props) {
                     onClick={(event) => { event.stopPropagation(); startMergeMode("review", cluster.id!); }}
                     className="rounded-lg bg-orange-50 dark:bg-orange-950/40 px-1 py-1.5 text-xs text-orange-700 dark:text-orange-300 hover:bg-orange-100"
                   >合并</button>
+                  {!cluster.name?.trim() && <button type="button" disabled={mergeSaving}
+                    className="rounded-lg px-1 py-1.5 text-xs text-red-700 hover:bg-surface-primary dark:text-red-300"
+                    onClick={(event) => { event.stopPropagation(); void handleCancelRecognition([cluster.id!]); }}>取消识别</button>}
                 </div>
               )}
+              {activeTab === "unnamed" && !mergeMode && <button type="button" disabled={mergeSaving}
+                className="mt-1 rounded px-1 py-1 text-xs text-text-muted hover:bg-surface-primary hover:text-red-700"
+                onClick={(event) => { event.stopPropagation(); void handleCancelRecognition([cluster.id!]); }}>取消识别</button>}
             </div>
           ))}
         </div>
 
         {clusters.length < pageTotal && (
-          <div className="flex justify-center py-8">
+          <div className="flex justify-center py-8 [overflow-anchor:none]">
             <button
               type="button"
               onClick={() => { void loadMoreClusters(); }}
@@ -972,7 +1371,11 @@ export default React.memo(function FaceView({ active = true }: Props) {
             {unassignedCount > 0 ? (
               <div>
                 <p className="mb-1 font-medium">{`${unassignedCount} 张人脸正在等待整理`}</p>
-                <p className="text-sm">后台分析会自动完成，你无需停留在此页面。</p>
+                <p className="text-sm">{isGroupingFaces(ai)
+                  ? "可以离开此页面，在后台任务里查看进度。"
+                  : aiStatus === "error" || aiStatus === "paused"
+                    ? "可在后台任务查看状态并继续处理。"
+                    : "可从人物操作菜单开始整理。"}</p>
               </div>
             ) : activeTab === "named"
               ? "暂无已命名的人物。"
@@ -985,27 +1388,49 @@ export default React.memo(function FaceView({ active = true }: Props) {
 
       </div>
 
-      {editingId !== null && (
-        <div className="fixed inset-0 z-[1200] bg-black/30 backdrop-blur-sm flex items-center justify-center" onMouseDown={() => !renameSaving && setEditingId(null)}>
-          <div className="w-[360px] rounded-2xl bg-bg-secondary p-5 shadow-2xl border border-text-primary/10" onMouseDown={(event) => event.stopPropagation()}>
-            <h3 className="text-lg font-semibold text-text-primary">命名人物</h3>
-            <p className="text-xs text-text-muted mt-1 mb-4">这个名称会应用到该人物的全部照片。</p>
-            <input
-              value={editName}
-              onChange={(event) => setEditName(event.target.value)}
-              onKeyDown={(event) => { if (event.key === "Enter") handleRename(editingId); if (event.key === "Escape") setEditingId(null); }}
-              className="w-full rounded-xl border border-text-primary/10 bg-black/[0.035] px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-accent-primary/30"
-              placeholder="输入人物姓名"
-              autoFocus
-            />
-            <div className="mt-5 flex justify-end gap-2">
-              <button disabled={renameSaving} onClick={() => setEditingId(null)} className="px-4 py-2 rounded-lg text-sm text-text-secondary hover:bg-text-primary/5 disabled:opacity-50">取消</button>
-              <button disabled={renameSaving || !editName.trim()} onClick={() => handleRename(editingId)} className="px-4 py-2 rounded-lg bg-accent-primary text-white text-sm font-medium disabled:opacity-50">
-                {renameSaving ? "保存中…" : "保存"}
-              </button>
+      {maintenanceAction && (
+        <div className="fixed inset-0 z-[1200] grid place-items-center bg-black/40 p-3"
+          onMouseDown={() => setMaintenanceAction(null)}>
+          <div role="alertdialog" aria-modal="true" aria-labelledby="people-maintenance-title" aria-describedby="people-maintenance-impact"
+            className="w-full max-w-md rounded-2xl border border-surface-secondary bg-bg-secondary p-5 shadow-2xl"
+            onMouseDown={(event) => event.stopPropagation()}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") setMaintenanceAction(null);
+              if (event.key !== "Tab") return;
+              const buttons = event.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)");
+              const first = buttons[0];
+              const last = buttons[buttons.length - 1];
+              if (event.shiftKey ? document.activeElement === first : document.activeElement === last) {
+                event.preventDefault();
+                (event.shiftKey ? last : first)?.focus();
+              }
+            }}>
+            <h3 id="people-maintenance-title" className="text-lg font-semibold">
+              {maintenanceAction === "rebuild" ? "确认重建自动分组？" : "确认重新分析人脸？"}
+            </h3>
+            <div id="people-maintenance-impact" className="mt-3 space-y-2 text-sm leading-6 text-text-secondary">
+              <p>原始照片、已命名和已人工确认的人物分组、已设置的头像及已忽略的人脸会保留。</p>
+              {maintenanceAction === "rebuild"
+                ? <p className="font-medium text-text-primary">使用已有特征清空并重算自动分组。尚未确认的未命名人物及待审核分组可能改变。重建后的自动分组无法恢复到重建前。</p>
+                : <p className="font-medium text-text-primary">重新读取照片并检测人脸，现有自动检测结果和自动分组可能改变。自动合并的撤销记录会被清除。</p>}
+              {maintenanceAction === "reanalyze" && <p>这个过程可能耗时，启动后可在后台任务查看进度。</p>}
+            </div>
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" className="ui-button" autoFocus onClick={() => setMaintenanceAction(null)}>取消</button>
+              <button type="button" className="ui-button rounded-lg border-red-700 bg-red-700 font-medium text-white hover:!bg-red-800"
+                disabled={maintenanceDisabled} onClick={() => {
+                  const action = maintenanceAction;
+                  setMaintenanceAction(null);
+                  void (action === "rebuild" ? handleFullRecluster() : handleFaceReanalysis());
+                }}>{maintenanceAction === "rebuild" ? "确认重建" : "确认重新分析"}</button>
             </div>
           </div>
         </div>
+      )}
+
+      {editingPerson && (
+        <PersonProfileDialog key={`${projectRoot}:${editingPerson.id}`} person={editingPerson} scope={avatarScope}
+          onClose={() => setEditingPerson(null)} onSaved={handleProfileSaved} />
       )}
 
       {mergeConfirmOpen && (
@@ -1043,16 +1468,18 @@ export default React.memo(function FaceView({ active = true }: Props) {
       )}
 
       {autoMergeOpen && (
-        <div className={`fixed inset-0 z-[1200] bg-black/30 backdrop-blur-sm flex items-center justify-center ${lightboxPhotoId ? "invisible pointer-events-none" : ""}`}
+        <div className={`fixed inset-0 z-[1200] bg-black/40 flex items-center justify-center ${lightboxPhotoId ? "invisible pointer-events-none" : ""}`}
           aria-hidden={lightboxPhotoId != null || undefined}
           onMouseDown={() => !autoMergeRunning && setAutoMergeOpen(false)}>
-          <div className="w-[680px] max-h-[86vh] overflow-y-auto rounded-2xl bg-bg-secondary p-6 shadow-2xl border border-text-primary/10" onMouseDown={(event) => event.stopPropagation()}>
-            <h3 className="text-lg font-semibold text-text-primary">自动合并相似人物</h3>
+          <div role="dialog" aria-modal="true" aria-labelledby="auto-merge-title"
+            className={`flex max-h-[94vh] w-[calc(100%_-_1.5rem)] max-w-[1440px] flex-col overflow-y-auto rounded-2xl border border-text-primary/10 bg-bg-secondary p-4 shadow-2xl sm:p-5 ${autoMergeCandidates.length > 0 ? "h-[94vh]" : ""}`}
+            onMouseDown={(event) => event.stopPropagation()}>
+            <h3 id="auto-merge-title" className="shrink-0 text-lg font-semibold text-text-primary">自动合并相似人物</h3>
             {previewError && <p role="alert" className="mt-2 text-sm text-red-600">打开大图失败：{previewError}</p>}
-            <p className="text-sm text-text-muted mt-2 leading-6">
+            <p className="mt-1 shrink-0 text-sm leading-6 text-text-muted">
               查找相似的未命名分组，也可将它们合入已命名人物。同一张照片中同时出现的人物会被排除。
             </p>
-            <div className="mt-5 rounded-xl bg-black/[0.035] p-4">
+            <div className="mt-3 shrink-0 rounded-xl bg-surface-primary px-4 py-2.5">
               <div className="flex items-center justify-between text-sm">
                 <span className="font-medium">相似度阈值</span>
                 <span className="font-semibold tabular-nums">{autoMergeThreshold.toFixed(2)}</span>
@@ -1067,17 +1494,14 @@ export default React.memo(function FaceView({ active = true }: Props) {
                 value={autoMergeThreshold}
                 onChange={(event) => {
                   setAutoMergeThreshold(Number(event.target.value));
-                  setAutoMergeCandidates([]);
-                  setAutoMergeSelected(new Map());
-                  setExpandedMergeGroups(new Set());
-                  setAutoMergePreviewed(false);
+                  resetMergeResults();
                 }}
-                className="mt-3 w-full accent-blue-600"
+                className="mt-2 w-full accent-accent-primary"
               />
               <div className="mt-1 flex justify-between text-xs text-text-muted">
                 <span>0.35 查找更多</span><span>0.72 平衡</span><span>0.90 更谨慎</span>
               </div>
-              <p className="mt-3 text-xs text-text-secondary">
+              <p className="mt-2 text-xs text-text-secondary">
                 {autoMergeThreshold < 0.60
                   ? "较低阈值可能找到更多侧脸，也会增加误匹配。请逐个勾选要合并的分组。"
                   : autoMergeThreshold < 0.68
@@ -1087,20 +1511,39 @@ export default React.memo(function FaceView({ active = true }: Props) {
                     : "谨慎模式：只合并非常相似的分组，误合风险最低。"}
               </p>
             </div>
+            {analysisStarted != null && analysisProgress && (
+              <div className="mt-4 space-y-2 rounded-xl border border-surface-secondary px-4 py-3" role="status">
+                <div className="flex justify-between gap-2 text-sm">
+                  <span>{mergeStageLabels[analysisProgress.stage] ?? "正在分析"}</span>
+                  <span className="text-text-muted tabular-nums">已用时 {Math.max(0, Math.floor((analysisClock - analysisStarted) / 1000))} 秒</span>
+                </div>
+                <progress className="h-2 w-full accent-accent-primary" aria-label="当前阶段进度"
+                  max={analysisProgress.total || 1}
+                  value={analysisProgress.total ? analysisProgress.done : undefined} />
+                {analysisProgress.total > 0 && <p className="text-xs text-text-muted tabular-nums">{analysisProgress.done.toLocaleString()} / {analysisProgress.total.toLocaleString()}</p>}
+                {analysisClock - analysisProgress.updatedAt >= 15_000 && (
+                  <p className="text-xs text-amber-700 dark:text-amber-300">本阶段已有 {Math.floor((analysisClock - analysisProgress.updatedAt) / 1000)} 秒没有新进度。</p>
+                )}
+              </div>
+            )}
+            {analysisError && <p className="mt-4 break-words text-sm text-red-600 dark:text-red-400" role="alert">
+              分析失败：{analysisError}
+            </p>}
+            {autoMergePreviewed && analysisSkipped > 0 && <p className="mt-4 text-sm text-amber-700 dark:text-amber-300">
+              跳过了 {analysisSkipped} 份缺失或无法读取的人脸特征。
+            </p>}
             {autoMergePreviewed && (
-              <div className="mt-4">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-sm font-medium">候选结果（{autoMergeCandidates.length} 组）</span>
+              <div className="mt-4 flex min-h-40 flex-1 flex-col">
+                <div className="mb-2 flex shrink-0 flex-wrap items-center justify-between gap-x-4 gap-y-2">
+                  <span className="text-sm font-medium">候选结果（{autoMergeCandidates.length.toLocaleString()} 组）</span>
                   {autoMergeCandidates.length > 0 && (
-                    <button
-                      className="text-xs text-accent-link"
-                      disabled={autoMergeRunning}
-                      onClick={() => setAutoMergeSelected(allMergeCandidatesSelected
-                        ? new Map()
-                        : new Map(autoMergeCandidates.map((candidate) => [candidateKey(candidate), selectableMergeMembers(candidate)])))}
-                    >
-                      {allMergeCandidatesSelected ? "全部取消" : "全部选择"}
-                    </button>
+                    <div className="flex flex-wrap items-center gap-3 text-xs">
+                      <button type="button" className="text-accent-link disabled:opacity-50" disabled={autoMergeRunning} onClick={toggleMergePageSelection}>
+                        {allVisibleMergeCandidatesSelected ? "取消本页选择" : "全选本页"}
+                      </button>
+                      {autoMergeSelected.size > 0 && <button type="button" className="text-accent-link disabled:opacity-50" disabled={autoMergeRunning}
+                        onClick={() => setAutoMergeSelected(new Map())}>清除所有选择</button>}
+                    </div>
                   )}
                 </div>
                 {autoMergeCandidates.length === 0 ? (
@@ -1108,96 +1551,66 @@ export default React.memo(function FaceView({ active = true }: Props) {
                     当前阈值下没有可靠候选。可以稍微降低阈值后重新分析。
                   </div>
                 ) : (
-                  <div className="space-y-2 max-h-[330px] overflow-y-auto pr-1">
-                    {autoMergeCandidates.map((candidate, index) => {
-                      const key = candidateKey(candidate);
-                      const expanded = expandedMergeGroups.has(key);
-                      const ids = autoMergeSelected.get(key) ?? [];
-                      const members = selectableMergeMembers(candidate);
-                      const targetId = candidate.named_target_id;
-                      const targetName = candidate.named_target_name;
-                      const allSelected = ids.length === members.length;
-                      const ready = ids.length >= (targetId != null ? 1 : 2);
-                      return (
-                        <div key={key} className={`rounded-xl border p-3 ${ready ? "border-accent-primary bg-accent-primary/5" : "border-text-primary/10 bg-bg-secondary"}`}>
-                          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-                            <button
-                              type="button"
-                              className="ui-button inline-flex items-center gap-2 text-sm"
-                              aria-expanded={expanded}
-                              aria-controls={`merge-candidate-${key}`}
-                              aria-label={`${expanded ? "收起" : "展开"}候选组 ${index + 1}`}
-                              onClick={() => setExpandedMergeGroups((current) => {
-                                const next = new Set(current);
-                                if (next.has(key)) next.delete(key); else next.add(key);
-                                return next;
-                              })}
-                            >
-                              <span aria-hidden="true">{expanded ? "▾" : "▸"}</span>
-                              候选组 {index + 1} · {candidate.cluster_ids.length} 人
-                            </button>
-                            <span className="text-xs tabular-nums text-text-muted">相似度 {(candidate.similarity * 100).toFixed(1)}%</span>
-                            <label className="ml-auto flex items-center gap-2 text-sm">
-                              <input type="checkbox" checked={allSelected} disabled={autoMergeRunning}
-                                aria-label={`整组选中候选组 ${index + 1}`}
-                                ref={(input) => { if (input) input.indeterminate = ids.length > 0 && !allSelected; }}
-                                onChange={(event) => {
-                                  const checked = event.target.checked;
-                                  setAutoMergeSelected((current) => new Map(current).set(key, checked ? members : []));
-                                }} />
-                              整组选择
-                              <span className="text-xs tabular-nums text-text-muted">（{ids.length}/{members.length}）</span>
-                            </label>
-                            <button disabled={autoMergeRunning} onClick={() => handleRejectAutoMergeCandidate(candidate)}
-                              className="shrink-0 rounded-lg px-2.5 py-1.5 text-xs text-orange-700 dark:text-orange-300 hover:bg-orange-50">不是同一人</button>
-                          </div>
-                          {targetId != null && <p className="mt-2 text-sm font-medium text-accent-link">合入已命名人物：{targetName ?? `人物 ${targetId}`}</p>}
-                          <div id={`merge-candidate-${key}`} className={expanded ? "mt-3 flex flex-wrap gap-2 border-t border-surface-secondary pt-3" : "hidden"}>
-                            {expanded && (targetId == null ? members : [targetId, ...members]).map((id) => (
-                              <div key={id} className="flex w-24 flex-col items-center gap-1 rounded-lg border border-surface-secondary p-1 text-xs">
-                                <button type="button" className="relative h-16 w-16 overflow-hidden rounded-lg bg-surface-secondary"
-                                  aria-label={`查看人物 ${id} 的大图`} title="查看大图" disabled={previewClusterId != null}
-                                  onClick={() => { setPreviewError(""); setPreviewClusterId(id); }}>
-                                  <FaceThumb clusterId={id} scope={avatarScope} active={active && lightboxPhotoId == null} />
-                                  <span className="absolute inset-x-0 bottom-0 bg-black/65 py-0.5 text-white">{previewClusterId === id ? "加载中…" : "看大图"}</span>
-                                </button>
-                                {id === targetId
-                                  ? <span className="max-w-full truncate text-accent-link" title={targetName ?? undefined}>{targetName ?? `人物 ${id}`}</span>
-                                  : <label className="flex cursor-pointer items-center gap-1">
-                                  <input type="checkbox" checked={ids.includes(id)} disabled={autoMergeRunning}
-                                    onChange={(event) => {
-                                      const checked = event.target.checked;
-                                      setAutoMergeSelected((current) => {
-                                        const selected = current.get(key) ?? [];
-                                        return new Map(current).set(key, checked ? [...selected, id] : selected.filter((value) => value !== id));
-                                      });
-                                    }} />
-                                  人物 {id}
-                                </label>}
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      );
-                    })}
+                  <div ref={mergeResults} className="min-h-0 flex-1 overflow-y-auto overscroll-contain pr-1">
+                    <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,18rem),1fr))] gap-2.5">
+                      {visibleMergeCandidates.map((candidate, pageIndex) => {
+                        const key = candidateKey(candidate);
+                        return <MergeCandidateCard
+                          key={key}
+                          candidate={candidate}
+                          index={firstMergeIndex + pageIndex + 1}
+                          expanded={!collapsedMergeGroups.has(key)}
+                          selected={autoMergeSelected.get(key) ?? EMPTY_MERGE_SELECTION}
+                          busy={autoMergeRunning}
+                          previewId={previewClusterId}
+                          scope={avatarScope}
+                          active={active && lightboxPhotoId == null}
+                          scrollRoot={mergeResults}
+                          onToggle={toggleMergeCandidate}
+                          onSelect={selectMergeCandidate}
+                          onReject={handleRejectAutoMergeCandidate}
+                          onPreview={previewMergeCandidate}
+                        />;
+                      })}
+                    </div>
                   </div>
                 )}
               </div>
             )}
-            <div className="mt-5 flex justify-end gap-2">
-              <button disabled={autoMergeRunning} onClick={() => setAutoMergeOpen(false)} className="px-4 py-2 rounded-lg text-sm text-text-secondary hover:bg-text-primary/5 disabled:opacity-50">取消</button>
-              {!autoMergePreviewed ? (
-                <button disabled={autoMergeRunning} onClick={handlePreviewAutoMerge} className="px-4 py-2 rounded-lg bg-accent-primary text-white text-sm font-medium disabled:opacity-50">
-                  {autoMergeRunning ? "正在分析…" : "查找合并候选"}
-                </button>
-              ) : (
-                <>
-                  <button disabled={autoMergeRunning} onClick={handlePreviewAutoMerge} className="px-3 py-2 rounded-lg text-sm text-text-secondary hover:bg-text-primary/5 disabled:opacity-50">重新分析</button>
-                  <button disabled={autoMergeRunning || selectedMergeGroups.length === 0} onClick={handleAutoMerge} className="px-4 py-2 rounded-lg bg-accent-primary text-white text-sm font-medium disabled:opacity-50">
-                    {autoMergeRunning ? "正在合并…" : `确认合并 ${selectedMergeGroups.length} 组`}
-                  </button>
-                </>
+            <div className="mt-4 flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-text-primary/10 pt-3">
+              {autoMergePreviewed && mergePageCount > 1 && (
+                <nav className="flex flex-wrap items-center gap-2 text-sm" aria-label="候选结果分页">
+                  <button type="button" className="ui-button" disabled={autoMergeRunning || currentMergePage === 1}
+                    onClick={() => goToMergePage(currentMergePage - 1)}>上一页</button>
+                  <span className="tabular-nums text-text-muted" aria-live="polite">第 {currentMergePage} / {mergePageCount} 页</span>
+                  <button type="button" className="ui-button" disabled={autoMergeRunning || currentMergePage === mergePageCount}
+                    onClick={() => goToMergePage(currentMergePage + 1)}>下一页</button>
+                  <form key={currentMergePage} className="flex items-center gap-1" onSubmit={(event) => {
+                    event.preventDefault();
+                    const page = Number(new FormData(event.currentTarget).get("page"));
+                    if (Number.isInteger(page)) goToMergePage(page);
+                  }}>
+                    <input className="ui-input w-20" name="page" type="number" min={1} max={mergePageCount}
+                      aria-label="跳转到页码" placeholder="页码" required disabled={autoMergeRunning} />
+                    <button type="submit" className="ui-button" disabled={autoMergeRunning}>跳转</button>
+                  </form>
+                </nav>
               )}
+              <div className="ml-auto flex flex-wrap justify-end gap-2">
+                <button disabled={autoMergeRunning} onClick={() => setAutoMergeOpen(false)} className="px-4 py-2 rounded-lg text-sm text-text-secondary hover:bg-text-primary/5 disabled:opacity-50">取消</button>
+                {!autoMergePreviewed ? (
+                  <button disabled={autoMergeRunning} onClick={handlePreviewAutoMerge} className="px-4 py-2 rounded-lg bg-accent-primary text-white text-sm font-medium disabled:opacity-50">
+                    {autoMergeRunning ? "正在分析…" : analysisError ? "重试分析" : "查找合并候选"}
+                  </button>
+                ) : (
+                  <>
+                    <button disabled={autoMergeRunning} onClick={handlePreviewAutoMerge} className="px-3 py-2 rounded-lg text-sm text-text-secondary hover:bg-text-primary/5 disabled:opacity-50">重新分析</button>
+                    <button disabled={autoMergeRunning || selectedMergeGroups.length === 0} onClick={handleAutoMerge} className="px-4 py-2 rounded-lg bg-accent-primary text-white text-sm font-medium disabled:opacity-50">
+                      {autoMergeRunning ? "正在合并…" : `确认合并 ${selectedMergeGroups.length} 组`}
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
           </div>
         </div>

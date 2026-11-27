@@ -1,13 +1,14 @@
 // src-tauri/src/commands/faces.rs
-use std::collections::HashMap;
-use tauri::State;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Mutex, OnceLock};
+use tauri::{Emitter, State};
+use tokio::sync::watch;
 
 use crate::commands::ai::AiWorkerState;
-use crate::commands::project::{current_project, get_conn, AppState};
+use crate::commands::project::{current_project, get_conn, read_project_db, AppState};
 use crate::db::face_dao;
-use crate::db::photo_dao;
 use crate::error::{AppError, AppResult};
-use crate::models::{FaceCluster, FaceClusterPage, FaceDetection};
+use crate::models::{AutomaticFaceMergeProgress, FaceCluster, FaceClusterPage, FaceDetection, Project};
 use crate::thumbnail::generator;
 
 const FACE_THUMBNAIL_CACHE_VERSION: &str = "context_v2";
@@ -24,8 +25,7 @@ pub async fn cmd_get_photo_faces(
     photo_id: i64,
     state: State<'_, AppState>,
 ) -> AppResult<Vec<FaceDetection>> {
-    let conn = get_conn(state.clone())?;
-    face_dao::get_faces_for_photo(&conn, photo_id)
+    read_project_db(current_project(&state)?, move |conn| face_dao::get_visible_faces_for_photo(conn, photo_id)).await
 }
 
 #[tauri::command]
@@ -42,8 +42,23 @@ pub async fn cmd_get_cluster_page(
     cluster_id: Option<i64>,
     state: State<'_, AppState>,
 ) -> AppResult<FaceClusterPage> {
-    let conn = get_conn(state)?;
-    face_dao::get_cluster_page(&conn, &tab, offset, limit, cluster_id)
+    read_project_db(current_project(&state)?, move |conn| {
+        face_dao::get_cluster_page(conn, &tab, offset, limit, cluster_id)
+    }).await
+}
+
+#[tauri::command]
+pub async fn cmd_get_person_avatar_choices(person_id: i64, after: Option<i64>, state: State<'_, AppState>) -> AppResult<face_dao::AvatarChoicePage> {
+    read_project_db(current_project(&state)?, move |conn| face_dao::person_avatar_choices(conn, person_id, after)).await
+}
+
+#[tauri::command]
+pub async fn cmd_save_person_profile(person_id: i64, name: String, avatar_face_id: Option<i64>, state: State<'_, AppState>) -> AppResult<()> {
+    let project = current_project(&state)?;
+    tokio::task::spawn_blocking(move || {
+        let conn = crate::db::connection::init_db(&project.db_path())?;
+        face_dao::save_person_profile(&conn, person_id, &name, avatar_face_id)
+    }).await.map_err(|error| AppError::Internal(format!("保存人物资料中断：{error}")))?
 }
 
 #[tauri::command]
@@ -176,17 +191,22 @@ pub async fn cmd_run_face_clustering_inner(
     state: State<'_, AppState>,
     worker_state: State<'_, AiWorkerState>,
 ) -> AppResult<String> {
-    let conn = get_conn(state.clone())?;
-    let project = {
-        let guard = state.project.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| crate::error::AppError::Project("No project open".into()))?
-            .clone()
-    };
+    cluster_face_batch(&current_project(&state)?, &worker_state, None).await
+}
 
-    // Get existing clusters
-    let clusters = face_dao::get_all_clusters(&conn)?;
+pub async fn cluster_face_batch(
+    project: &Project,
+    worker_state: &AiWorkerState,
+    progress: Option<&(dyn Fn(AutomaticFaceMergeProgress) + Sync)>,
+) -> AppResult<String> {
+    let conn = crate::db::connection::init_db(&project.db_path())?;
+
+    // Keep empty named groups reserved without recounting each group's photos.
+    let existing_ids: std::collections::HashSet<i64> = {
+        let mut statement = conn.prepare("SELECT id FROM face_clusters")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
 
     // One query instead of one query per cluster (the old N+1 path also silently
     // capped each person at 1000 faces, weakening centroids for large libraries).
@@ -219,17 +239,9 @@ pub async fn cmd_run_face_clustering_inner(
     let must_links = crate::db::constraint_dao::get_must_links(&conn)?;
     let cannot_links = crate::db::constraint_dao::get_cannot_links(&conn)?;
 
-    // Get AI worker client
-    let client = {
-        let worker = worker_state.client.lock().unwrap();
-        worker
-            .as_ref()
-            .ok_or_else(|| crate::error::AppError::AiWorker("AI worker not connected".into()))?
-            .clone()
-    };
-
     // Call v2 clustering endpoint with constraints
     let req = crate::models::ClusterFaceV2Request {
+        request_id: None,
         embeddings_dir: project.faces_cache_path().to_string_lossy().to_string(),
         existing_clusters: Some(existing),
         threshold: Some(0.6),
@@ -240,15 +252,62 @@ pub async fn cmd_run_face_clustering_inner(
         qualities: face_dao::get_unassigned_embedding_qualities(&conn, 1000)?,
     };
 
-    let response = client.cluster_faces_v2(&req).await?;
+    let report_stage = |stage: &str| {
+        if let Some(report) = progress {
+            report(AutomaticFaceMergeProgress { stage: stage.into(), done: 0, total: 0, skipped: 0 });
+        }
+    };
+    report_stage("load_worker");
+    let response = crate::commands::ai::request_worker_batch(
+        worker_state,
+        true,
+        |client| {
+            let mut req = req.clone();
+            req.request_id = Some(uuid::Uuid::new_v4().to_string());
+            async move {
+                let clustering = client.cluster_faces_v2(&req);
+                let request_id = req.request_id.as_deref().unwrap();
+                let poll = async {
+                    let mut last = None;
+                    let mut updated = std::time::Instant::now();
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        if let Ok(Some(current)) = client.face_progress("cluster_faces_v2", request_id).await {
+                            if last.as_ref() != Some(&current) {
+                                if let Some(report) = progress {
+                                    report(current.clone());
+                                }
+                                updated = std::time::Instant::now();
+                                last = Some(current);
+                            }
+                        }
+                        if let Some(phase) = &last {
+                            if matches!(phase.stage.as_str(), "load_clustering" | "run_linkage" | "form_groups")
+                                && updated.elapsed().as_secs() >= 120
+                            {
+                                return Err(AppError::AiWorkerStalled(format!(
+                                    "本批人脸分组在 {} 阶段 120 秒没有新进度（请求 {request_id}）",
+                                    phase.stage,
+                                )));
+                            }
+                        }
+                    }
+                };
+                tokio::select! {
+                    result = clustering => result,
+                    stalled = poll => stalled,
+                }
+            }
+        },
+        || report_stage("retry_batch"),
+    ).await??;
+    report_stage("save_groups");
 
     let mut assigned_count = 0;
 
     // Ensure all cluster IDs from the response exist in the database.
     // The Python worker assigns new IDs (e.g., 0, 1, 2...) but doesn't
     // create rows in face_clusters, so we must upsert them here.
-    let existing_ids: std::collections::HashSet<i64> =
-        clusters.iter().filter_map(|c| c.id).collect();
     // A named person can temporarily have no faces, so its id is absent from
     // `existing_clusters`. Avoid letting a newly generated automatic id collide
     // with that reserved user-owned cluster.
@@ -319,21 +378,9 @@ pub async fn cmd_run_face_clustering_inner(
 pub async fn cmd_run_face_clustering(
     state: State<'_, AppState>,
     worker_state: State<'_, AiWorkerState>,
+    app: tauri::AppHandle,
 ) -> AppResult<String> {
-    let mut total = 0i64;
-    loop {
-        let before = face_dao::get_unassigned_face_count(&get_conn(state.clone())?)?;
-        if before == 0 {
-            break;
-        }
-        cmd_run_face_clustering_inner(state.clone(), worker_state.clone()).await?;
-        let after = face_dao::get_unassigned_face_count(&get_conn(state.clone())?)?;
-        total += before - after;
-        if after == 0 || after >= before {
-            break;
-        }
-    }
-    Ok(format!("Clustered {total} pending faces incrementally"))
+    crate::commands::ai::run_manual_face_clustering(current_project(&state)?, worker_state, app, false).await
 }
 
 /// Rebuild automatic groups while preserving every user-named person.
@@ -341,71 +388,61 @@ pub async fn cmd_run_face_clustering(
 pub async fn cmd_rebuild_face_clusters(
     state: State<'_, AppState>,
     worker_state: State<'_, AiWorkerState>,
+    app: tauri::AppHandle,
 ) -> AppResult<String> {
-    let project = {
-        let guard = state.project.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| AppError::Project("No project open".into()))?
-            .clone()
-    };
-    let reset_count = {
-        let conn = get_conn(state.clone())?;
-        face_dao::reset_automatic_clusters(&conn)?
-    };
-
-    // Cluster ids can be reused, so old cached crops must not survive a rebuild.
-    let face_thumbnail_dir = project
-        .faces_cache_path()
-        .parent()
-        .unwrap()
-        .join("face_thumbnails");
-    match std::fs::remove_dir_all(&face_thumbnail_dir) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-
-    let result = cmd_run_face_clustering_inner(state, worker_state).await?;
-    Ok(format!(
-        "Reset {} automatic face assignments. {}",
-        reset_count, result
-    ))
+    crate::commands::ai::run_manual_face_clustering(current_project(&state)?, worker_state, app, true).await
 }
 
 async fn preview_automatic_merges(
     threshold: f64,
     state: State<'_, AppState>,
     worker_state: State<'_, AiWorkerState>,
-) -> AppResult<Vec<crate::models::AutomaticFaceMergeCandidate>> {
+    progress: Option<(&tauri::AppHandle, &str)>,
+) -> AppResult<crate::models::AutomaticFaceMergeResponse> {
     if !threshold.is_finite() || !(0.35..=0.90).contains(&threshold) {
         return Err(AppError::Project(
             "Automatic merge threshold must be between 0.35 and 0.90".into(),
         ));
     }
 
-    let project = {
-        let guard = state.project.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| AppError::Project("No project open".into()))?
-            .clone()
-    };
-    let (assignments, named, cannot_links) = {
-        let conn = get_conn(state.clone())?;
-        let mut assignments = HashMap::new();
-        let mut named = HashMap::new();
-        for (embedding, id, name) in face_dao::get_automatic_merge_assignments(&conn)? {
-            assignments.insert(embedding, id);
-            if let Some(name) = name {
-                named.entry(id).or_insert(name);
-            }
+    use crate::models::AutomaticFaceMergeProgress;
+    let emit = |value: &AutomaticFaceMergeProgress| {
+        if let Some((app, request_id)) = progress {
+            let _ = app.emit(
+                "automatic-face-merge-progress",
+                serde_json::json!({
+                    "requestId": request_id, "progress": value,
+                }),
+            );
         }
-        let cannot_links = crate::db::constraint_dao::get_cannot_links(&conn)?;
-        (assignments, named, cannot_links)
     };
+    emit(&AutomaticFaceMergeProgress {
+        stage: "read_database".into(),
+        done: 0,
+        total: 0,
+        skipped: 0,
+    });
+    let project = current_project(&state)?;
+    let embeddings_dir = project.faces_cache_path().to_string_lossy().to_string();
+    let (assignments, named, cannot_links) =
+        crate::commands::project::read_project_db(project, |conn| {
+            let mut assignments = HashMap::new();
+            let mut named = HashMap::new();
+            for (embedding, id, name) in face_dao::get_automatic_merge_assignments(conn)? {
+                assignments.insert(embedding, id);
+                if let Some(name) = name {
+                    named.entry(id).or_insert(name);
+                }
+            }
+            let cannot_links = crate::db::constraint_dao::get_cannot_links(conn)?;
+            Ok((assignments, named, cannot_links))
+        })
+        .await?;
     if assignments.len() < 2 || !assignments.values().any(|id| !named.contains_key(id)) {
-        return Ok(Vec::new());
+        return Ok(crate::models::AutomaticFaceMergeResponse {
+            candidates: Vec::new(),
+            skipped: 0,
+        });
     }
 
     let client = {
@@ -415,16 +452,48 @@ async fn preview_automatic_merges(
             .ok_or_else(|| AppError::AiWorker("AI worker not connected".into()))?
             .clone()
     };
-    let response = client
-        .plan_automatic_face_merges(&crate::models::AutomaticFaceMergeRequest {
-            embeddings_dir: project.faces_cache_path().to_string_lossy().to_string(),
-            unnamed_clusters: assignments,
-            named_cluster_ids: named.keys().copied().collect(),
-            threshold,
-            cannot_links,
-        })
-        .await?;
-    Ok(response
+    emit(&AutomaticFaceMergeProgress {
+        stage: "load_worker".into(),
+        done: 0,
+        total: 0,
+        skipped: 0,
+    });
+    let request = crate::models::AutomaticFaceMergeRequest {
+        request_id: progress.map(|(_, id)| id.to_owned()),
+        embeddings_dir,
+        unnamed_clusters: assignments,
+        named_cluster_ids: named.keys().copied().collect(),
+        threshold,
+        cannot_links,
+    };
+    let analysis = client.plan_automatic_face_merges(&request);
+    let response = if let Some(request_id) = &request.request_id {
+        let report_progress = async {
+            let mut last = None;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                if let Ok(Some(current)) = client.automatic_face_merge_progress(request_id).await {
+                    if last.as_ref() != Some(&current) {
+                        emit(&current);
+                        last = Some(current);
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            result = analysis => result?,
+            _ = report_progress => unreachable!(),
+        }
+    } else {
+        analysis.await?
+    };
+    emit(&AutomaticFaceMergeProgress {
+        stage: "done".into(),
+        done: 0,
+        total: 0,
+        skipped: response.skipped,
+    });
+    let candidates = response
         .candidates
         .into_iter()
         .filter_map(|mut candidate| {
@@ -442,16 +511,29 @@ async fn preview_automatic_merges(
             }
             Some(candidate)
         })
-        .collect())
+        .collect();
+    Ok(crate::models::AutomaticFaceMergeResponse {
+        candidates,
+        skipped: response.skipped,
+    })
 }
 
 #[tauri::command]
 pub async fn cmd_preview_auto_merge_unnamed_faces(
     threshold: f64,
+    request_id: Option<String>,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     worker_state: State<'_, AiWorkerState>,
-) -> AppResult<Vec<crate::models::AutomaticFaceMergeCandidate>> {
-    preview_automatic_merges(threshold, state, worker_state).await
+) -> AppResult<crate::models::AutomaticFaceMergeResponse> {
+    let request_id = request_id.filter(|id| uuid::Uuid::parse_str(id).is_ok());
+    preview_automatic_merges(
+        threshold,
+        state,
+        worker_state,
+        request_id.as_deref().map(|id| (&app, id)),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -514,8 +596,9 @@ pub async fn cmd_auto_merge_unnamed_faces(
     state: State<'_, AppState>,
     worker_state: State<'_, AiWorkerState>,
 ) -> AppResult<String> {
-    let candidates = preview_automatic_merges(threshold, state.clone(), worker_state).await?;
+    let candidates = preview_automatic_merges(threshold, state.clone(), worker_state, None).await?;
     let groups = candidates
+        .candidates
         .into_iter()
         .filter(|candidate| candidate.named_target_id.is_none())
         .map(|candidate| candidate.cluster_ids)
@@ -577,9 +660,8 @@ pub fn cmd_undo_last_automatic_face_merge(state: State<'_, AppState>) -> AppResu
 }
 
 #[tauri::command]
-pub fn cmd_has_automatic_face_merge_to_undo(state: State<'_, AppState>) -> AppResult<bool> {
-    let conn = get_conn(state)?;
-    face_dao::has_automatic_merge_to_undo(&conn)
+pub async fn cmd_has_automatic_face_merge_to_undo(state: State<'_, AppState>) -> AppResult<bool> {
+    read_project_db(current_project(&state)?, face_dao::has_automatic_merge_to_undo).await
 }
 
 /// Get a face thumbnail for a cluster, caching the JPEG to disk.
@@ -587,18 +669,153 @@ pub fn cmd_has_automatic_face_merge_to_undo(state: State<'_, AppState>) -> AppRe
 #[tauri::command]
 pub async fn cmd_get_cluster_face_thumbnail(
     cluster_id: i64,
+    use_person_avatar: Option<bool>,
     state: State<'_, AppState>,
 ) -> AppResult<String> {
+    cluster_face_thumbnail(current_project(&state)?, cluster_id, use_person_avatar.unwrap_or(true), false)
+        .await?
+        .ok_or_else(|| AppError::NotFound("头像缩略图不可用".into()))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FaceThumbnailRequest {
+    Cluster { id: i64, #[serde(rename = "usePersonAvatar")] use_person_avatar: bool },
+    Face { id: i64 },
+}
+
+#[derive(Clone, Default, serde::Serialize)]
+pub struct FaceThumbnailResult {
+    url: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Default)]
+struct FaceThumbnailBatches {
+    active: HashMap<String, watch::Sender<bool>>,
+    canceled_before_start: VecDeque<String>,
+}
+
+impl FaceThumbnailBatches {
+    fn start(&mut self, id: &str) -> Option<watch::Receiver<bool>> {
+        if let Some(index) = self.canceled_before_start.iter().position(|key| key == id) {
+            self.canceled_before_start.remove(index);
+            return None;
+        }
+        let (sender, receiver) = watch::channel(false);
+        self.active.insert(id.to_owned(), sender);
+        Some(receiver)
+    }
+
+    fn cancel(&mut self, id: String) {
+        if let Some(sender) = self.active.get(&id) {
+            let _ = sender.send(true);
+        } else {
+            // Async commands can be scheduled out of order, including around completion.
+            if self.canceled_before_start.len() >= 128 {
+                self.canceled_before_start.pop_front();
+            }
+            self.canceled_before_start.push_back(id);
+        }
+    }
+}
+
+fn face_thumbnail_batches() -> &'static Mutex<FaceThumbnailBatches> {
+    static BATCHES: OnceLock<Mutex<FaceThumbnailBatches>> = OnceLock::new();
+    BATCHES.get_or_init(|| Mutex::new(FaceThumbnailBatches::default()))
+}
+
+struct ActiveFaceThumbnailBatch(String);
+
+impl Drop for ActiveFaceThumbnailBatch {
+    fn drop(&mut self) {
+        face_thumbnail_batches().lock().unwrap().active.remove(&self.0);
+    }
+}
+
+#[tauri::command]
+pub fn cmd_cancel_face_thumbnail_batch(batch_id: String) {
+    face_thumbnail_batches().lock().unwrap().cancel(batch_id);
+}
+
+#[tauri::command]
+pub async fn cmd_get_face_thumbnail_batch(
+    requests: Vec<FaceThumbnailRequest>,
+    cache_only: bool,
+    batch_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<FaceThumbnailResult>> {
+    if requests.len() > 32 {
+        return Err(AppError::Project("单批最多读取 32 张头像。".into()));
+    }
+    let receiver = face_thumbnail_batches().lock().unwrap().start(&batch_id);
+    let Some(mut canceled) = receiver else {
+        return Ok(Vec::new());
+    };
+    let _active_batch = ActiveFaceThumbnailBatch(batch_id);
     let project = current_project(&state)?;
-    let cache_path = project
+    tokio::select! {
+        biased;
+        _ = canceled.changed() => Ok(Vec::new()),
+        results = read_face_thumbnail_batch(project, requests, cache_only) => results,
+    }
+}
+
+async fn read_face_thumbnail_batch(
+    project: Project,
+    requests: Vec<FaceThumbnailRequest>,
+    cache_only: bool,
+) -> AppResult<Vec<FaceThumbnailResult>> {
+    let mut results = vec![FaceThumbnailResult::default(); requests.len()];
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, request) in requests.into_iter().enumerate() {
+        let project = project.clone();
+        tasks.spawn(async move {
+            let result = match request {
+                FaceThumbnailRequest::Cluster { id, use_person_avatar } =>
+                    cluster_face_thumbnail(project, id, use_person_avatar, cache_only).await,
+                FaceThumbnailRequest::Face { id } => face_thumbnail(project, id, cache_only).await,
+            };
+            (index, result)
+        });
+    }
+    while let Some(task) = tasks.join_next().await {
+        let (index, result) = task.map_err(|error| AppError::Internal(format!("头像批次中断：{error}")))?;
+        results[index] = match result {
+            Ok(url) => FaceThumbnailResult { url, error: None },
+            Err(error) => FaceThumbnailResult { url: None, error: Some(error.to_string()) },
+        };
+    }
+    Ok(results)
+}
+
+async fn cluster_face_thumbnail(
+    project: Project,
+    cluster_id: i64,
+    use_person_avatar: bool,
+    cache_only: bool,
+) -> AppResult<Option<String>> {
+    let cache_dir = project
         .faces_cache_path()
         .parent()
         .unwrap()
-        .join("face_thumbnails")
-        .join(format!(
-            "cluster_{cluster_id}_{FACE_THUMBNAIL_CACHE_VERSION}.jpg"
-        ));
-    cached_face_thumbnail(project, cache_path, 160, move |conn| {
+        .join("face_thumbnails");
+    let preferred = if use_person_avatar {
+        read_project_db(project.clone(), move |conn| {
+            face_dao::person_avatar_face_id(conn, cluster_id)?
+                .map(|id| face_dao::get_face_by_id(conn, id))
+                .transpose()
+        }).await?
+    } else {
+        None
+    };
+    if let Some(face) = preferred {
+        if let Ok(url) = individual_face_thumbnail(project.clone(), face, 160, cache_only).await {
+            return Ok(url);
+        }
+    }
+    let cache_path = cache_dir.join(format!("cluster_{cluster_id}_{FACE_THUMBNAIL_CACHE_VERSION}.jpg"));
+    cached_face_thumbnail(project, cache_path, 160, cache_only, move |conn| {
         face_dao::get_faces_for_person(conn, cluster_id, 3)
     })
     .await
@@ -608,9 +825,11 @@ async fn cached_face_thumbnail(
     project: crate::models::Project,
     cache_path: std::path::PathBuf,
     size: u32,
+    cache_only: bool,
     faces: impl FnOnce(&rusqlite::Connection) -> AppResult<Vec<FaceDetection>> + Send + 'static,
-) -> AppResult<String> {
+) -> AppResult<Option<String>> {
     use base64::Engine;
+    use rusqlite::OptionalExtension;
     use std::io::Write;
 
     let data_url = |bytes: &[u8]| {
@@ -621,12 +840,20 @@ async fn cached_face_thumbnail(
     };
     if let Ok(bytes) = tokio::fs::read(&cache_path).await {
         if !bytes.is_empty() {
-            return Ok(data_url(&bytes));
+            return Ok(Some(data_url(&bytes)));
         }
     }
 
-    static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-    let permit = SLOTS
+    if cache_only {
+        return Ok(None);
+    }
+
+    static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    let slots = SLOTS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(4, |value| value.get());
+        tokio::sync::Semaphore::new((cores / 2).clamp(4, 6))
+    });
+    let permit = slots
         .acquire()
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
@@ -634,7 +861,7 @@ async fn cached_face_thumbnail(
         let _permit = permit;
         if let Ok(bytes) = std::fs::read(&cache_path) {
             if !bytes.is_empty() {
-                return Ok(data_url(&bytes));
+                return Ok(Some(data_url(&bytes)));
             }
         }
         let candidates = {
@@ -642,8 +869,12 @@ async fn cached_face_thumbnail(
             faces(&conn)?
                 .into_iter()
                 .map(|face| {
-                    let photo = photo_dao::get_photo_by_id(&conn, face.photo_id)?;
-                    Ok(photo.map(|photo| (face, photo.path)))
+                    let path = conn.query_row(
+                        "SELECT path FROM photos WHERE id = ?1 AND deleted = 0",
+                        [face.photo_id],
+                        |row| row.get::<_, String>(0),
+                    ).optional()?;
+                    Ok(path.map(|path| (face, path)))
                 })
                 .collect::<AppResult<Vec<_>>>()?
         };
@@ -663,7 +894,7 @@ async fn cached_face_thumbnail(
                     let mut temp = tempfile::NamedTempFile::new_in(directory)?;
                     temp.write_all(&bytes)?;
                     temp.persist(cache_path).map_err(|error| error.error)?;
-                    return Ok(data_url(&bytes));
+                    return Ok(Some(data_url(&bytes)));
                 }
                 Err(error) => last_error = error,
             }
@@ -746,15 +977,13 @@ pub async fn cmd_split_person(
 /// Get total face detection count (including unclustered faces).
 #[tauri::command]
 pub async fn cmd_get_face_detection_count(state: State<'_, AppState>) -> AppResult<i64> {
-    let conn = get_conn(state)?;
-    face_dao::get_face_detection_count(&conn)
+    read_project_db(current_project(&state)?, face_dao::get_face_detection_count).await
 }
 
 /// Get count of faces detected but not yet assigned to a person.
 #[tauri::command]
 pub async fn cmd_get_unassigned_face_count(state: State<'_, AppState>) -> AppResult<i64> {
-    let conn = get_conn(state)?;
-    face_dao::get_unassigned_face_count(&conn)
+    read_project_db(current_project(&state)?, face_dao::get_unassigned_face_count).await
 }
 
 #[tauri::command]
@@ -767,41 +996,32 @@ pub fn cmd_get_suspected_faces(
 }
 
 #[tauri::command]
-pub fn cmd_get_suspected_face_count(state: State<'_, AppState>) -> AppResult<i64> {
-    let conn = get_conn(state)?;
-    face_dao::get_suspected_face_count(&conn)
+pub async fn cmd_get_suspected_face_count(state: State<'_, AppState>) -> AppResult<i64> {
+    read_project_db(current_project(&state)?, face_dao::get_suspected_face_count).await
 }
 
 #[tauri::command]
-pub fn cmd_ignore_face_clusters(
+pub async fn cmd_ignore_face_clusters(
     cluster_ids: Vec<i64>,
     state: State<'_, AppState>,
 ) -> AppResult<String> {
-    let project = {
-        let guard = state.project.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| AppError::Project("No project open".into()))?
-            .clone()
-    };
-    let conn = get_conn(state)?;
-    let (groups, faces) = face_dao::ignore_automatic_clusters(&conn, &cluster_ids)?;
-    let cache_dir = project
-        .faces_cache_path()
-        .parent()
-        .unwrap()
-        .join("face_thumbnails");
-    let _ = std::fs::remove_dir_all(cache_dir);
-    Ok(format!(
-        "已忽略 {} 个人物分组、{} 张人脸；原始照片未删除，后续 AI 整理不会再次标记。",
-        groups, faces
-    ))
+    let project = current_project(&state)?;
+    tokio::task::spawn_blocking(move || {
+        let conn = crate::db::connection::init_db(&project.db_path())?;
+        let (groups, faces) = face_dao::ignore_automatic_clusters(&conn, &cluster_ids)?;
+        let cache_dir = project.faces_cache_path().parent().unwrap().join("face_thumbnails");
+        for id in cluster_ids {
+            let _ = std::fs::remove_file(cache_dir.join(format!("cluster_{id}_{FACE_THUMBNAIL_CACHE_VERSION}.jpg")));
+        }
+        Ok(format!(
+            "已取消识别 {groups} 个人物分组、{faces} 张人脸。原始照片保留，可从人物操作菜单恢复。"
+        ))
+    }).await.map_err(|error| AppError::Internal(format!("取消识别中断：{error}")))?
 }
 
 #[tauri::command]
-pub fn cmd_get_ignored_face_count(state: State<'_, AppState>) -> AppResult<i64> {
-    let conn = get_conn(state)?;
-    face_dao::get_ignored_face_count(&conn)
+pub async fn cmd_get_ignored_face_count(state: State<'_, AppState>) -> AppResult<i64> {
+    read_project_db(current_project(&state)?, face_dao::get_ignored_face_count).await
 }
 
 #[tauri::command]
@@ -828,42 +1048,47 @@ pub fn cmd_delete_all_suspected_faces(state: State<'_, AppState>) -> AppResult<u
 
 #[tauri::command]
 pub async fn cmd_get_face_thumbnail(face_id: i64, state: State<'_, AppState>) -> AppResult<String> {
-    let project = current_project(&state)?;
-    let cache_path = project
-        .faces_cache_path()
-        .join("thumbnails")
-        .join(format!("face_{face_id}_{FACE_THUMBNAIL_CACHE_VERSION}.jpg"));
-    cached_face_thumbnail(project, cache_path, 128, move |conn| {
-        face_dao::get_face_by_id(conn, face_id).map(|face| vec![face])
-    })
-    .await
+    face_thumbnail(current_project(&state)?, face_id, false)
+        .await?
+        .ok_or_else(|| AppError::NotFound("头像缩略图不可用".into()))
+}
+
+async fn face_thumbnail(project: Project, face_id: i64, cache_only: bool) -> AppResult<Option<String>> {
+    let face = read_project_db(project.clone(), move |conn| face_dao::get_face_by_id(conn, face_id)).await?;
+    individual_face_thumbnail(project, face, 128, cache_only).await
+}
+
+async fn individual_face_thumbnail(project: Project, face: FaceDetection, size: u32, cache_only: bool) -> AppResult<Option<String>> {
+    // A deleted face's SQLite row ID can be reused, and reanalysis can change a crop.
+    let key = format!("face_{}_{}_{}_{}_{}_{}_{}_{size}_{FACE_THUMBNAIL_CACHE_VERSION}.jpg",
+        face.id.unwrap_or_default(), face.photo_id, face.created_at, face.bbox_x, face.bbox_y, face.bbox_w, face.bbox_h);
+    let cache_path = project.faces_cache_path().join("thumbnails").join(key);
+    cached_face_thumbnail(project, cache_path, size, cache_only, move |_| Ok(vec![face])).await
 }
 
 #[tauri::command]
-pub fn cmd_get_face_ai_version_status(
+pub async fn cmd_get_face_ai_version_status(state: State<'_, AppState>) -> AppResult<FaceAiVersionStatus> {
+    read_project_db(current_project(&state)?, |conn| {
+        let stored = face_dao::get_ai_model_version(conn, "face_pipeline")?;
+        let face_count = face_dao::get_face_detection_count(conn)?;
+        Ok(FaceAiVersionStatus {
+            upgrade_available: face_count > 0
+                && stored.as_deref() != Some(crate::commands::ai::FACE_PIPELINE_VERSION),
+            current_version: crate::commands::ai::FACE_PIPELINE_VERSION.into(),
+            stored_version: stored,
+        })
+    }).await
+}
+
+#[tauri::command]
+pub async fn cmd_prepare_face_ai_reanalysis(
     state: State<'_, AppState>,
-) -> AppResult<FaceAiVersionStatus> {
-    let conn = get_conn(state)?;
-    let stored = face_dao::get_ai_model_version(&conn, "face_pipeline")?;
-    let face_count = face_dao::get_face_detection_count(&conn)?;
-    Ok(FaceAiVersionStatus {
-        upgrade_available: face_count > 0
-            && stored.as_deref() != Some(crate::commands::ai::FACE_PIPELINE_VERSION),
-        current_version: crate::commands::ai::FACE_PIPELINE_VERSION.into(),
-        stored_version: stored,
-    })
-}
-
-#[tauri::command]
-pub fn cmd_prepare_face_ai_reanalysis(state: State<'_, AppState>) -> AppResult<String> {
-    let project = {
-        let guard = state.project.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| AppError::Project("No project open".into()))?
-            .clone()
-    };
-    let conn = get_conn(state)?;
+    worker_state: State<'_, AiWorkerState>,
+) -> AppResult<String> {
+    let project = current_project(&state)?;
+    let _lease = crate::commands::ai::AiPipelineLease::acquire(&worker_state.pipeline_running)?;
+    crate::commands::ai::cmd_start_ai_worker(worker_state.port, None, worker_state.clone()).await?;
+    let conn = crate::db::connection::init_db(&project.db_path())?;
     let removed = face_dao::prepare_face_reanalysis(&conn)?;
     let cache_dir = project
         .faces_cache_path()
@@ -875,4 +1100,55 @@ pub fn cmd_prepare_face_ai_reanalysis(state: State<'_, AppState>) -> AppResult<S
         "已保留所有已命名人物，并将 {} 个自动检测结果加入重新分析队列。",
         removed
     ))
+}
+
+#[cfg(test)]
+mod face_thumbnail_batch_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancels_a_batch_before_or_after_native_registration() {
+        let mut registry = FaceThumbnailBatches::default();
+        registry.cancel("early".into());
+        assert!(registry.start("early").is_none());
+        let mut active = registry.start("active").unwrap();
+        let next = registry.start("next").unwrap();
+        registry.cancel("active".into());
+        active.changed().await.unwrap();
+        assert!(*active.borrow_and_update());
+        assert!(!*next.borrow());
+    }
+
+    #[tokio::test]
+    async fn returns_cached_and_generated_avatars_in_input_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = Project::new("fixture".into(), dir.path().to_string_lossy().into());
+        let source = dir.path().join("portrait.png");
+        image::RgbImage::from_pixel(80, 80, image::Rgb([40, 50, 200])).save(&source).unwrap();
+        let conn = crate::db::connection::init_db(&project.db_path()).unwrap();
+        conn.execute(
+            "INSERT INTO photos (id, path, filename, file_size, file_mtime, imported_at) VALUES (1, ?1, 'portrait.png', 1, 1, 1)",
+            [source.to_string_lossy().as_ref()],
+        ).unwrap();
+        conn.execute_batch(
+            "INSERT INTO face_clusters (id, face_count, created_at) VALUES (1, 1, 1);
+             INSERT INTO face_detections (id, photo_id, person_id, bbox_x, bbox_y, bbox_w, bbox_h, created_at)
+             VALUES (8, 1, 1, 10, 10, 40, 40, 1);",
+        ).unwrap();
+        let batch = || vec![
+            FaceThumbnailRequest::Cluster { id: 1, use_person_avatar: false },
+            FaceThumbnailRequest::Face { id: 8 },
+            FaceThumbnailRequest::Cluster { id: 999, use_person_avatar: false },
+        ];
+        let cold = read_face_thumbnail_batch(project.clone(), batch(), true).await.unwrap();
+        assert!(cold.iter().all(|result| result.url.is_none() && result.error.is_none()));
+        let generated = read_face_thumbnail_batch(project.clone(), batch(), false).await.unwrap();
+        assert!(generated[..2].iter().all(|result| result.url.as_deref().unwrap().starts_with("data:image/jpeg;base64,")));
+        assert!(generated[2].error.is_some());
+        std::fs::remove_file(source).unwrap();
+        let warm = read_face_thumbnail_batch(project, batch(), true).await.unwrap();
+        assert_eq!(warm[0].url, generated[0].url);
+        assert_eq!(warm[1].url, generated[1].url);
+        assert!(warm[2].url.is_none() && warm[2].error.is_none());
+    }
 }

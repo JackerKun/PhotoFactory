@@ -13,6 +13,7 @@ vi.mock("../api/tauri", () => ({
   getAiPipelineStatus: vi.fn(async () => ({ status: "error", stage: "error", processed: 3, total: 10, failed: 1, last_error: "模型无法加载" })),
   getAiRuntime: vi.fn(async () => ({ models: { face_detection: "DmlExecutionProvider" }, face_batch: { photos: 10, preview_hits: 4 } })),
   getAiWorkerDiagnostics: vi.fn(async () => ({ version: "0.1.7", platform: "windows", architecture: "x86_64", status: "idle", port: 9876, pid: null, entries: [], log_error: null })),
+  workerHealth: vi.fn(async () => true),
   startAiWorker: vi.fn(async () => "AI worker ready"),
   checkAiPhoto: vi.fn(),
   clearAiWorkerDiagnostics: vi.fn(),
@@ -139,6 +140,28 @@ it("clears the confirmed history snapshot and leaves the failed tasks available"
   expect(screen.getByRole("button", { name: "重试失败" })).toBeEnabled();
 });
 
+it("checks worker health without restarting it or changing a running grouping task", async () => {
+  vi.mocked(api.startAiWorker).mockClear();
+  vi.mocked(api.controlAiPipeline).mockClear();
+  vi.mocked(api.workerHealth).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+  useStore.setState({ project: { root_path: "/test" } as Project });
+  await vi.mocked(api.getAiPipelineStatus).withImplementation(async () => ({
+    status: "running", stage: "clustering", processed: 0, total: 1120, failed: 0, last_error: "",
+  }), async () => {
+    render(<TaskCenter />);
+    fireEvent.click(screen.getByRole("button", { name: "后台任务" }));
+    expect(await screen.findByText("整理人物分组")).toBeInTheDocument();
+    const check = screen.getByRole("button", { name: "检查 AI 服务" });
+    fireEvent.click(check);
+    expect(await screen.findByText(/未通过健康检查/)).toBeInTheDocument();
+    fireEvent.click(check);
+    expect(await screen.findByText(/本地 AI 服务已响应/)).toBeInTheDocument();
+    expect(api.startAiWorker).not.toHaveBeenCalled();
+    expect(api.controlAiPipeline).not.toHaveBeenCalled();
+    expect(useStore.getState().aiProcessingStatus?.status).toBe("running");
+  });
+});
+
 it("copies worker crash details and can test a photo without opening a library", async () => {
   const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
   const writeText = vi.fn(async () => {});
@@ -146,6 +169,7 @@ it("copies worker crash details and can test a photo without opening a library",
   vi.mocked(api.getAiWorkerDiagnostics).mockResolvedValueOnce({
     version: "0.1.7", platform: "windows", architecture: "x86_64",
     status: "exited", port: 9876, pid: 42, log_error: null,
+    port_conflict: "本地端口 9876 已占用。监听进程：python.exe（PID 8468）。AI 服务改用 19002。",
     entries: [{ id: 1, occurred_at: 1794510000, source: "error", pid: 42, message: "AI 服务进程已退出（exit code: 120）\n详细堆栈" }],
   });
   vi.mocked(open).mockResolvedValueOnce("D:\\测试.jpeg");
@@ -154,8 +178,13 @@ it("copies worker crash details and can test a photo without opening a library",
     render(<TaskCenter />);
     fireEvent.click(screen.getByRole("button", { name: "后台任务" }));
     expect(await screen.findByText("进程已退出 · 127.0.0.1:9876 · PID 42")).toBeInTheDocument();
+    expect(screen.getByText(/python.exe（PID 8468）/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "复制本页诊断" }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith(expect.stringContaining("详细堆栈")));
+    expect(writeText).toHaveBeenCalledWith(expect.stringContaining("python.exe（PID 8468）"));
+    fireEvent.click(screen.getByRole("button", { name: "重启 AI 服务" }));
+    await waitFor(() => expect(api.startAiWorker).toHaveBeenCalledWith(undefined, true));
+    expect(await screen.findByText(/本地 AI 服务已重启/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "测试单张照片" }));
     await waitFor(() => expect(api.checkAiPhoto).toHaveBeenCalledWith("D:\\测试.jpeg"));
     expect(await screen.findByText(/人脸检测成功，找到 2 张人脸/)).toHaveTextContent("broken data stream");
