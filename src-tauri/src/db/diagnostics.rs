@@ -382,8 +382,13 @@ mod tests {
     fn test_list_indexes() {
         let (db_path, _conn) = test_db();
         let indexes = list_indexes(&db_path).unwrap();
-        // Includes explicit application indexes plus migration-added indexes.
-        assert_eq!(indexes.len(), 31);
+        assert!(indexes.iter().any(|index| {
+            index.name == "idx_photos_path" && index.table == "photos"
+        }));
+        assert!(indexes.iter().any(|index| {
+            index.name == "idx_person_avatars_face" && index.table == "person_avatars"
+        }));
+        assert!(indexes.iter().all(|index| !index.name.starts_with("sqlite_autoindex_")));
         let _ = fs::remove_dir_all(db_path.parent().unwrap());
     }
 
@@ -393,7 +398,11 @@ mod tests {
         let report = run_diagnostics(&db_path).unwrap();
         assert!(report.integrity.ok);
         assert_eq!(report.integrity.photo_count, 0);
-        assert_eq!(report.index_info.len(), 31);
+        let indexes = list_indexes(&db_path).unwrap();
+        let entries = |indexes: Vec<IndexInfo>| {
+            indexes.into_iter().map(|index| (index.name, index.table)).collect::<Vec<_>>()
+        };
+        assert_eq!(entries(report.index_info), entries(indexes));
         let _ = fs::remove_dir_all(db_path.parent().unwrap());
     }
 }

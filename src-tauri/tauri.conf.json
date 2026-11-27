@@ -1,6 +1,6 @@
 {
   "productName": "PhotoFactory",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "identifier": "com.photofactory.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
